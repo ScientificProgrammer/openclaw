@@ -11,7 +11,6 @@ import { channelBlockedPatch, channelReadyPatch } from "openclaw/plugin-sdk/gate
 import { MediaFetchError } from "openclaw/plugin-sdk/media-runtime";
 import { parseDateStringTimestampMs as resolveGoogleChatTimestampMs } from "openclaw/plugin-sdk/number-runtime";
 import { mergePairLoopGuardConfig } from "openclaw/plugin-sdk/pair-loop-guard-runtime";
-import type { ReplyPayload } from "openclaw/plugin-sdk/reply-runtime";
 import { normalizeOptionalLowercaseString } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { resolveWebhookPath } from "openclaw/plugin-sdk/webhook-ingress";
 import type { ResolvedGoogleChatAccount } from "./accounts.js";
@@ -29,6 +28,7 @@ import {
   deliverGoogleChatReply,
   type GoogleChatTypingMessage,
 } from "./monitor-reply-delivery.js";
+import { normalizeGoogleChatReplyTarget } from "./monitor-reply-target.js";
 import {
   registerGoogleChatWebhookTarget,
   setGoogleChatWebhookEventProcessor,
@@ -65,18 +65,6 @@ function normalizeAudienceType(value?: string | null): GoogleChatAudienceType | 
     return "project-number";
   }
   return undefined;
-}
-
-function normalizeGoogleChatReplyTarget(params: {
-  payload: ReplyPayload;
-  sourceMessageName?: string;
-  replyThreadName?: string;
-}): ReplyPayload {
-  const sourceMessageName = params.sourceMessageName;
-  if (!sourceMessageName || params.payload.replyToId !== sourceMessageName) {
-    return params.payload;
-  }
-  return { ...params.payload, replyToId: params.replyThreadName };
 }
 
 function resolveBotDisplayName(params: {
