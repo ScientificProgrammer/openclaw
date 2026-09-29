@@ -17,6 +17,7 @@ export const databaseWorkerExtensionTestFiles = [
   "extensions/feishu/src/monitor.message-handler.ingress.test.ts",
   "extensions/googlechat/src/monitor-ingress.test.ts",
   "extensions/googlechat/src/monitor.test.ts",
+  "extensions/googlechat/src/monitor.thread-replies.test.ts",
   "extensions/imessage/src/monitor/ingress.test.ts",
   "extensions/imessage/src/monitor/inbound-processing.route.test.ts",
   "extensions/irc/src/irc-ingress.test.ts",
