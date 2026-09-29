@@ -2,7 +2,10 @@
 import { estimateTokensFromChars } from "@openclaw/normalization-core/cjk-chars";
 import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
 import { resolveSessionAgentIds } from "../../agents/agent-scope.js";
-import { analyzeBootstrapBudget } from "../../agents/bootstrap-budget.js";
+import {
+  analyzeBootstrapBudget,
+  buildBootstrapInjectionStats,
+} from "../../agents/bootstrap-budget.js";
 import { isRealConversationMessage } from "../../agents/compaction-real-conversation.js";
 import {
   resolveBootstrapMaxChars,
@@ -25,18 +28,14 @@ import type { ReplyPayload } from "../types.js";
 import type { HandleCommandsParams } from "./commands-types.js";
 import { renderContextTreemapPng } from "./context-treemap.js";
 
-function formatInt(n: number): string {
-  return new Intl.NumberFormat("en-US").format(n);
-}
+const numberFormat = new Intl.NumberFormat("en-US");
+const formatInt = (value: number) => numberFormat.format(value);
 
 function formatCharsAndTokens(chars: number): string {
   return `${formatInt(chars)} chars (~${formatInt(estimateTokensFromChars(chars))} tok)`;
 }
 
 function parseContextArgs(commandBodyNormalized: string): string {
-  if (commandBodyNormalized === "/context") {
-    return "";
-  }
   if (commandBodyNormalized.startsWith("/context ")) {
     return commandBodyNormalized.slice(8).trim();
   }
@@ -47,7 +46,7 @@ function formatListTop(
   entries: Array<{ name: string; value: number }>,
   cap: number,
 ): { lines: string[]; omitted: number } {
-  const sorted = [...entries].toSorted((a, b) => b.value - a.value);
+  const sorted = entries.toSorted((a, b) => b.value - a.value);
   const top = sorted.slice(0, cap);
   const omitted = Math.max(0, sorted.length - top.length);
   const lines = top.map((e) => `- ${e.name}: ${formatCharsAndTokens(e.value)}`);
@@ -144,6 +143,7 @@ async function resolveContextReport(
   const { systemPrompt, tools, skillsPrompt, bootstrapFiles, injectedFiles, sandboxRuntime } =
     await resolveCommandsSystemPromptBundle(params);
 
+  const injectedWorkspaceFiles = buildBootstrapInjectionStats({ bootstrapFiles, injectedFiles });
   return buildSystemPromptReport({
     source: "estimate",
     generatedAt: Date.now(),
@@ -156,8 +156,7 @@ async function resolveContextReport(
     bootstrapTotalMaxChars,
     sandbox: { mode: sandboxRuntime.mode, sandboxed: sandboxRuntime.sandboxed },
     systemPrompt,
-    bootstrapFiles,
-    injectedFiles,
+    injectedWorkspaceFiles,
     skillsPrompt,
     tools,
   });
@@ -293,15 +292,14 @@ export async function buildContextReply(params: HandleCommandsParams): Promise<R
   const sandboxLine = `Sandbox: mode=${report.sandbox?.mode ?? "unknown"} sandboxed=${report.sandbox?.sandboxed ?? false}`;
   const toolSchemaLine = `Tool schemas (JSON): ${formatCharsAndTokens(report.tools.schemaChars)} (counts toward context; not shown as text)`;
   const toolListLine = `Tool list (system prompt text): ${formatCharsAndTokens(report.tools.listChars)}`;
-  const skillNameSet = new Set(report.skills.entries.map((s) => s.name));
-  const skillNames = Array.from(skillNameSet);
+  const skillNames = [...new Set(report.skills.entries.map((s) => s.name))];
   const toolNames = report.tools.entries.map((t) => t.name);
   const formatNameList = (names: string[], cap: number) =>
     names.length <= cap
       ? names.join(", ")
       : `${names.slice(0, cap).join(", ")}, … (+${names.length - cap} more)`;
-  const skillsLine = `Skills list (system prompt text): ${formatCharsAndTokens(report.skills.promptChars)} (${skillNameSet.size} skills)`;
-  const skillsNamesLine = skillNameSet.size
+  const skillsLine = `Skills list (system prompt text): ${formatCharsAndTokens(report.skills.promptChars)} (${skillNames.length} skills)`;
+  const skillsNamesLine = skillNames.length
     ? `Skills: ${formatNameList(skillNames, 20)}`
     : "Skills: (none)";
   const toolsNamesLine = toolNames.length
@@ -332,24 +330,15 @@ export async function buildContextReply(params: HandleCommandsParams): Promise<R
     bootstrapTotalMaxChars,
   });
   const truncatedBootstrapFiles = bootstrapAnalysis.truncatedFiles;
-  const truncationCauseCounts = truncatedBootstrapFiles.reduce(
-    (acc, file) => {
-      for (const cause of file.causes) {
-        if (cause === "per-file-limit") {
-          acc.perFile += 1;
-        } else if (cause === "total-limit") {
-          acc.total += 1;
-        }
-      }
-      return acc;
-    },
-    { perFile: 0, total: 0 },
-  );
+  const perFile = truncatedBootstrapFiles.filter((file) =>
+    file.causes.includes("per-file-limit"),
+  ).length;
+  const total = truncatedBootstrapFiles.filter((file) =>
+    file.causes.includes("total-limit"),
+  ).length;
   const truncationCauseParts = [
-    truncationCauseCounts.perFile > 0
-      ? `${truncationCauseCounts.perFile} file(s) exceeded max/file`
-      : null,
-    truncationCauseCounts.total > 0 ? `${truncationCauseCounts.total} file(s) hit max/total` : null,
+    perFile > 0 ? `${perFile} file(s) exceeded max/file` : null,
+    total > 0 ? `${total} file(s) hit max/total` : null,
   ].filter(Boolean);
   const bootstrapWarningLines =
     truncatedBootstrapFiles.length > 0

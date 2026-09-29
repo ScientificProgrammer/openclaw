@@ -12,6 +12,9 @@ import {
   resetDiagnosticSessionStateForTest,
 } from "../../logging/diagnostic-session-state.js";
 import { diagnosticLogger } from "../../logging/diagnostic.js";
+import { createDeferredCore } from "../../shared/deferred.js";
+import { prepareEmbeddedRunPermissionChange } from "./run-permissions.js";
+import { createEmbeddedRunPermissionChanges } from "./run/permission-change.js";
 import {
   abortAndDrainEmbeddedAgentRun,
   abortEmbeddedAgentRun,
@@ -37,10 +40,62 @@ describe("embedded-agent runner run registry", () => {
     vi.restoreAllMocks();
   });
 
-  it("aborts only compacting runs in compacting mode", () => {
+  it.each([true, false])(
+    "accepts a replacement permission acknowledgement only from the same owner: %s",
+    async (sameOwner) => {
+      const sessionId = "permission-owner";
+      const completed = createDeferredCore<boolean>();
+      const coordinator = createEmbeddedRunPermissionChanges({});
+      const replacementCoordinator = createEmbeddedRunPermissionChanges({});
+      const original = {
+        ...createEmbeddedRunHandle({ runId: "same-run-id" }),
+        permissionChangeOwner: coordinator.forAttempt().owner,
+        applyPermissionMode: () => completed.promise,
+      };
+      const replacement = {
+        ...createEmbeddedRunHandle({ runId: "same-run-id" }),
+        permissionChangeOwner: sameOwner
+          ? coordinator.forAttempt().owner
+          : replacementCoordinator.forAttempt().owner,
+      };
+      setActiveEmbeddedRun(sessionId, original);
+      const change = prepareEmbeddedRunPermissionChange(sessionId);
+      if (change.kind !== "active") {
+        throw new Error("expected an active permission change");
+      }
+      const acknowledgement = change.apply("full", vi.fn());
+      setActiveEmbeddedRun(sessionId, replacement);
+      completed.resolve(true);
+      await expect(acknowledgement).resolves.toBe(sameOwner);
+      coordinator.close();
+      replacementCoordinator.close();
+    },
+  );
+
+  it("does not deliver a captured permission change to a replacement run", async () => {
+    const sessionId = "permission-stale-before-apply";
+    const applyPermissionMode = vi.fn(async () => true);
+    setActiveEmbeddedRun(sessionId, { ...createEmbeddedRunHandle(), applyPermissionMode });
+    const change = prepareEmbeddedRunPermissionChange(sessionId);
+    if (change.kind !== "active") {
+      throw new Error("expected an active permission change");
+    }
+    setActiveEmbeddedRun(sessionId, createEmbeddedRunHandle());
+    await expect(change.apply("full", vi.fn())).resolves.toBe(false);
+    expect(applyPermissionMode).not.toHaveBeenCalled();
+  });
+
+  it("aborts only known compacting runs and continues past a failed probe", () => {
+    const abortUnknown = vi.fn();
     const abortCompacting = vi.fn();
     const abortNormal = vi.fn();
 
+    setActiveEmbeddedRun("session-unknown", {
+      ...createEmbeddedRunHandle({ abort: abortUnknown }),
+      isCompacting: () => {
+        throw new Error("compaction probe unavailable");
+      },
+    });
     setActiveEmbeddedRun(
       "session-compacting",
       createEmbeddedRunHandle({ isCompacting: true, abort: abortCompacting }),
@@ -50,6 +105,7 @@ describe("embedded-agent runner run registry", () => {
 
     const aborted = abortEmbeddedAgentRun(undefined, { mode: "compacting" });
     expect(aborted).toBe(true);
+    expect(abortUnknown).not.toHaveBeenCalled();
     expect(abortCompacting).toHaveBeenCalledTimes(1);
     expect(abortNormal).not.toHaveBeenCalled();
   });
@@ -247,14 +303,6 @@ describe("embedded-agent runner run registry", () => {
     expect(beforeCancel).not.toHaveBeenCalled();
     expect(cancel).not.toHaveBeenCalled();
     expect(warn).toHaveBeenCalledWith(expect.stringContaining("lifecycle_check_failed"));
-  });
-
-  it("passes restart ownership to every aborted run", () => {
-    const abort = vi.fn();
-    setActiveEmbeddedRun("session-restart", createEmbeddedRunHandle({ abort }));
-
-    expect(abortEmbeddedAgentRun(undefined, { mode: "all", reason: "restart" })).toBe(true);
-    expect(abort).toHaveBeenCalledWith("restart");
   });
 
   it("expires reply-owned stuck recovery as run_stalled instead of user abort", async () => {

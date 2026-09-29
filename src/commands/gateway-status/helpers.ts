@@ -30,30 +30,7 @@ export type GatewayStatusTarget = {
 };
 
 /** Sanitized config subset rendered by the deep gateway status view. */
-export type GatewayConfigSummary = {
-  path: string | null;
-  exists: boolean;
-  valid: boolean;
-  issues: Array<{ path: string; message: string }>;
-  legacyIssues: Array<{ path: string; message: string }>;
-  gateway: {
-    mode: string | null;
-    bind: string | null;
-    port: number | null;
-    controlUiEnabled: boolean | null;
-    controlUiBasePath: string | null;
-    authMode: string | null;
-    authTokenConfigured: boolean;
-    authPasswordConfigured: boolean;
-    remoteUrl: string | null;
-    remoteTokenConfigured: boolean;
-    remotePasswordConfigured: boolean;
-    tailscaleMode: string | null;
-  };
-  discovery: {
-    wideAreaEnabled: boolean | null;
-  };
-};
+export type GatewayConfigSummary = ReturnType<typeof extractConfigSummary>;
 
 function parseIntOrNull(value: unknown): number | null {
   const s =
@@ -192,7 +169,7 @@ export async function resolveAuthForTarget(
 }
 
 /** Extracts the config fields displayed by `openclaw gateway status --deep`. */
-export function extractConfigSummary(snapshotUnknown: unknown): GatewayConfigSummary {
+export function extractConfigSummary(snapshotUnknown: unknown) {
   const snap = snapshotUnknown as Partial<ConfigFileSnapshot> | null;
   const path = typeof snap?.path === "string" ? snap.path : null;
   const exists = Boolean(snap?.exists);
@@ -288,7 +265,7 @@ export function renderTargetHeader(target: GatewayStatusTarget, rich: boolean) {
 
 /** Returns true when auth succeeded enough to connect but lacks the read scope. */
 export function isScopeLimitedProbeFailure(probe: GatewayProbeResult): boolean {
-  if (probe.ok || probe.connectLatencyMs == null) {
+  if (probe.ok || !probe.gatewayReached) {
     return false;
   }
   if (probe.missingScopeErrorDetails) {
@@ -299,75 +276,41 @@ export function isScopeLimitedProbeFailure(probe: GatewayProbeResult): boolean {
 
 /** Returns true when the gateway connection was established but a later probe failed. */
 export function isPostConnectProbeFailure(probe: GatewayProbeResult): boolean {
-  return !probe.ok && probe.connectLatencyMs != null;
+  return !probe.ok && probe.gatewayReached === true;
 }
 
 /** Returns true when the probe established any gateway connection. */
 export function isProbeReachable(probe: GatewayProbeResult): boolean {
-  return probe.ok || probe.connectLatencyMs != null;
+  return probe.ok || probe.gatewayReached === true;
 }
 
-function getGatewayProbeCapability(probe: GatewayProbeResult): GatewayProbeCapability {
-  return probe.auth.capability;
-}
+// Strongest capability first; the same vocabulary owns probe selection and display.
+const gatewayProbeCapabilities = [
+  { capability: "admin_capable", label: "admin-capable", color: "info" },
+  { capability: "write_capable", label: "write-capable", color: "info" },
+  { capability: "read_only", label: "read-only", color: "info" },
+  { capability: "connected_no_operator_scope", label: "connect-only", color: "warn" },
+  { capability: "pairing_pending", label: "pairing pending", color: "warn" },
+] as const;
 
 export function summarizeGatewayProbeCapability(
   probes: GatewayProbeResult[],
 ): GatewayProbeCapability {
-  // Show the strongest observed capability across all attempted targets.
-  const priority: GatewayProbeCapability[] = [
-    "admin_capable",
-    "write_capable",
-    "read_only",
-    "connected_no_operator_scope",
-    "pairing_pending",
-    "unknown",
-  ];
-  for (const capability of priority) {
-    if (probes.some((probe) => getGatewayProbeCapability(probe) === capability)) {
-      return capability;
-    }
-  }
-  return "unknown";
-}
-
-function formatGatewayProbeCapabilityLabel(capability: GatewayProbeCapability) {
-  switch (capability) {
-    case "admin_capable":
-      return "Capability: admin-capable";
-    case "write_capable":
-      return "Capability: write-capable";
-    case "read_only":
-      return "Capability: read-only";
-    case "connected_no_operator_scope":
-      return "Capability: connect-only";
-    case "pairing_pending":
-      return "Capability: pairing pending";
-    default:
-      return "Capability: unknown";
-  }
-}
-
-function colorForGatewayProbeCapability(capability: GatewayProbeCapability) {
-  switch (capability) {
-    case "admin_capable":
-    case "write_capable":
-    case "read_only":
-      return theme.info;
-    case "connected_no_operator_scope":
-    case "pairing_pending":
-      return theme.warn;
-    default:
-      return theme.muted;
-  }
+  return (
+    gatewayProbeCapabilities.find(({ capability }) =>
+      probes.some((probe) => probe.auth.capability === capability),
+    )?.capability ?? "unknown"
+  );
 }
 
 function renderProbeCapabilityLine(probe: GatewayProbeResult, rich: boolean) {
-  const capability = getGatewayProbeCapability(probe);
+  const display = gatewayProbeCapabilities.find(
+    ({ capability }) => capability === probe.auth.capability,
+  );
   return colorize(
     rich,
-    colorForGatewayProbeCapability(capability),
-    formatGatewayProbeCapabilityLabel(capability),
+    theme[display?.color ?? "muted"],
+    `Capability: ${display?.label ?? "unknown"}`,
   );
 }
 
@@ -380,7 +323,7 @@ export function renderProbeSummaryLine(probe: GatewayProbeResult, rich: boolean)
   }
 
   const detail = probe.error ? ` - ${probe.error}` : "";
-  if (probe.connectLatencyMs != null) {
+  if (probe.gatewayReached && probe.connectLatencyMs != null) {
     const latency =
       typeof probe.connectLatencyMs === "number" ? `${probe.connectLatencyMs}ms` : "unknown";
     const readStatus = isScopeLimitedProbeFailure(probe)
@@ -389,7 +332,7 @@ export function renderProbeSummaryLine(probe: GatewayProbeResult, rich: boolean)
     return `${colorize(rich, theme.success, "Connect: ok")} (${latency}) · ${capability} · ${readStatus}${detail}`;
   }
 
-  if (getGatewayProbeCapability(probe) === "pairing_pending") {
+  if (probe.auth.capability === "pairing_pending") {
     return `${colorize(rich, theme.warn, "Connect: blocked")}${detail} · ${capability}`;
   }
 

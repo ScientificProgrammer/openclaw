@@ -1,4 +1,3 @@
-/** Creates and seeds the attempt-local trajectory recorder. */
 import type { SessionSystemPromptReport } from "../../../config/sessions/types.js";
 import { buildTrajectoryRunMetadata } from "../../../trajectory/metadata.js";
 import { createTrajectoryRuntimeRecorder } from "../../../trajectory/runtime.js";
@@ -25,7 +24,7 @@ export async function prepareEmbeddedAttemptTrajectory(input: {
     sessionKey: attempt.sessionKey,
     sessionTarget: attempt.sessionTarget,
   });
-  if (attempt.disableTrajectory) {
+  if (attempt.disableTrajectory || attempt.sessionPersistence === "detached") {
     return null;
   }
   const sessionTarget =

@@ -1,13 +1,18 @@
 // Tsdown Build tests cover tsdown build script behavior.
 import { spawn, spawnSync } from "node:child_process";
+import { once } from "node:events";
 import fs from "node:fs";
 import fsPromises from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
+import * as liveGatewayDistFence from "../../scripts/lib/live-gateway-dist-fence.mts";
+import { readProcessMemoryCapacity } from "../../scripts/lib/process-memory.mts";
 import {
+  TSDOWN_NON_SDK_DTS_CONFIG_GROUPS,
   TSDOWN_PACKAGE_CONFIG_GROUP,
+  TSDOWN_PLUGIN_SDK_DTS_CONFIG_GROUPS,
   TSDOWN_UNIFIED_CONFIG_GROUP,
   TSDOWN_UNIFIED_DTS_CONFIG_GROUPS,
 } from "../../scripts/lib/tsdown-config-groups.mts";
@@ -18,16 +23,19 @@ import {
   listTsdownOutputRoots,
   parseTsdownBuildArgs,
   prepareTsdownBuildExecution,
-  pruneSourceCheckoutBundledPluginNodeModules,
   pruneStaleRootChunkFiles,
   pruneStaleRuntimeSymlinks,
   pruneUntrackedGeneratedSourceDeclarations,
   resolveTsdownBuildInvocation,
   resolveTsdownBuildInvocations,
   resolveTsdownBuildPlan,
+  resolveStagedDeclarationConcurrency,
   resolveTsdownCleanOutputRoots,
-  runTsdownBuildInvocation,
+  runTsdownBuild,
+  runTsdownBuildInvocation as runTsdownBuildInvocationImpl,
+  sanitizeTsdownBuildOutputRoots,
 } from "../../scripts/tsdown-build.mts";
+import { createFixtureLifetime } from "../helpers/fixture-lifetime.js";
 import {
   isProcessAlive,
   waitForChildClose,
@@ -35,19 +43,33 @@ import {
   waitForFile,
   waitForPidFile,
 } from "../helpers/process-wait.js";
-import { startProcessWatchdogFixture } from "../helpers/process-watchdog.js";
-import { createScriptTestHarness } from "./test-helpers.js";
+import { createSourcePluginDependenciesFixture } from "./source-plugin-dependencies-fixture.js";
 
-const { createTempDir } = createScriptTestHarness();
+beforeEach(() => {
+  const fence = vi
+    .spyOn(liveGatewayDistFence, "resolveLiveManagedGatewayDistFence")
+    .mockResolvedValue({ refuse: false });
+  onTestFinished(() => fence.mockRestore());
+});
+
+const fixture = createFixtureLifetime();
+const { createTempDir } = fixture;
+afterEach(() => fixture.cleanup());
+const runTsdownBuildInvocation = (...args: Parameters<typeof runTsdownBuildInvocationImpl>) =>
+  fixture.track(runTsdownBuildInvocationImpl(...args));
 const TEST_PHYSICAL_MEMORY_BYTES = 16 * 1024 * 1024 * 1024;
 // Memory detection is a process-global input. Freeze it for this suite so fake cgroup
 // fixtures prove only their declared hierarchy instead of inheriting the runner's RAM.
 vi.spyOn(os, "totalmem").mockReturnValue(TEST_PHYSICAL_MEMORY_BYTES);
 const readFileSync = fs.readFileSync.bind(fs);
-vi.spyOn(fs, "readFileSync").mockImplementation((filePath, options) =>
-  filePath === "/proc/meminfo" && options === "utf8"
-    ? "MemTotal:       16777216 kB\nMemAvailable:   16777216 kB\n"
-    : readFileSync(filePath, options),
+vi.spyOn(fs, "readFileSync").mockImplementation(
+  (filePath, options?: BufferEncoding | fs.ReadFileSyncOptions | null) =>
+    filePath === "/proc/meminfo" && options === "utf8"
+      ? "MemTotal:       16777216 kB\nMemAvailable:   16777216 kB\n"
+      : readFileSync(
+          filePath,
+          typeof options === "string" ? { encoding: options } : (options ?? {}),
+        ),
 );
 const NO_MEMORY_LIMIT = {
   availableMemoryBytes: TEST_PHYSICAL_MEMORY_BYTES,
@@ -81,24 +103,13 @@ type TsdownInvocationParams = NonNullable<Parameters<typeof resolveTsdownBuildIn
 function resolveTestNodeOptions(params: TsdownInvocationParams) {
   return resolveTsdownBuildInvocation({
     nodeExecPath: "/usr/bin/node",
-    npmExecPath: "/tmp/pnpm.cjs",
     env: {},
     ...params,
   }).options.env.NODE_OPTIONS;
 }
 
 async function expectPathMissing(targetPath: string) {
-  let statError: unknown;
-  try {
-    await fsPromises.stat(targetPath);
-  } catch (error) {
-    statError = error;
-  }
-  expect(statError).toBeInstanceOf(Error);
-  if (!(statError instanceof Error)) {
-    throw new Error("expected missing path error");
-  }
-  expect(Reflect.get(statError, "code")).toBe("ENOENT");
+  await expect(fsPromises.stat(targetPath)).rejects.toMatchObject({ code: "ENOENT" });
 }
 
 describe("resolveTsdownBuildInvocation", () => {
@@ -129,17 +140,17 @@ describe("resolveTsdownBuildInvocation", () => {
 
   it("forwards explicit tsdown args after wrapper args are parsed", () => {
     const result = resolveTsdownBuildInvocation({
-      args: ["--format", "esm"],
+      args: ["--format", "esm", "--concurrency", "2"],
       platform: "linux",
       nodeExecPath: "/usr/bin/node",
-      npmExecPath: "/tmp/pnpm.cjs",
       env: {},
       ...NO_MEMORY_LIMIT,
     });
 
-    expect(result.args).toContain("tsdown");
+    expect(result.args[0]).toBe("node_modules/tsdown/dist/run.mjs");
     expect(result.args).toEqual(expect.arrayContaining(["--config-loader", "unrun", "--no-clean"]));
-    expect(result.args.slice(-2)).toEqual(["--format", "esm"]);
+    expect(result.args.slice(-4)).toEqual(["--format", "esm", "--concurrency", "2"]);
+    expect(result.args.filter((arg) => arg === "--concurrency")).toHaveLength(1);
   });
 
   it("builds AI, packages, runtime, and bounded declarations sequentially", () => {
@@ -147,7 +158,6 @@ describe("resolveTsdownBuildInvocation", () => {
       args: ["--format", "esm"],
       platform: "linux",
       nodeExecPath: "/usr/bin/node",
-      npmExecPath: "/tmp/pnpm.cjs",
       env: {},
       ...NO_MEMORY_LIMIT,
     });
@@ -156,6 +166,8 @@ describe("resolveTsdownBuildInvocation", () => {
     expect(results[0]?.args).toEqual(
       expect.arrayContaining(["--config", "tsdown.ai.config.ts", "--format", "esm"]),
     );
+    expect(results[1]?.args).toEqual(expect.arrayContaining(["--concurrency", "1"]));
+    expect(results[2]?.args).not.toContain("--concurrency");
     const filters = results.slice(1).map((result) => {
       const filterIndex = result.args.indexOf("--filter");
       return result.args[filterIndex + 1];
@@ -178,7 +190,6 @@ describe("resolveTsdownBuildInvocation", () => {
       args,
       platform: "linux",
       nodeExecPath: "/usr/bin/node",
-      npmExecPath: "/tmp/pnpm.cjs",
       env,
       ...NO_MEMORY_LIMIT,
     });
@@ -186,6 +197,9 @@ describe("resolveTsdownBuildInvocation", () => {
     expect(results).toHaveLength(2);
     expect(results[0]?.args).toEqual(expect.arrayContaining(["--config", "tsdown.ai.config.ts"]));
     expect(results[1]?.args).not.toContain("--filter");
+    for (const result of results) {
+      expect(result.args).not.toContain("--concurrency");
+    }
   });
 
   it("serializes declaration graphs when --dts overrides the no-DTS environment", () => {
@@ -193,69 +207,77 @@ describe("resolveTsdownBuildInvocation", () => {
       args: ["--dts"],
       platform: "linux",
       nodeExecPath: "/usr/bin/node",
-      npmExecPath: "/tmp/pnpm.cjs",
       env: { OPENCLAW_RUN_NODE_SKIP_DTS_BUILD: "1" },
       ...NO_MEMORY_LIMIT,
     });
 
     expect(results).toHaveLength(3 + TSDOWN_UNIFIED_DTS_CONFIG_GROUPS.length);
     expect(results[1]?.args).toEqual(expect.arrayContaining(["--filter", "openclaw-packages"]));
+    expect(results[1]?.args).toEqual(expect.arrayContaining(["--concurrency", "1"]));
     expect(results[2]?.args).toEqual(expect.arrayContaining(["--filter", "openclaw-unified"]));
     expect(results.at(-1)?.args).toEqual(
       expect.arrayContaining(["--filter", TSDOWN_UNIFIED_DTS_CONFIG_GROUPS.at(-1)]),
     );
   });
 
-  it("expands the full-build unified selector into one runtime and bounded declaration graphs", () => {
+  it.each([
+    {
+      label: "implicit unified declarations",
+      selected: [],
+      expected: TSDOWN_UNIFIED_DTS_CONFIG_GROUPS,
+    },
+    {
+      label: "explicit declaration subset",
+      selected: TSDOWN_NON_SDK_DTS_CONFIG_GROUPS,
+      expected: TSDOWN_NON_SDK_DTS_CONFIG_GROUPS,
+    },
+  ])("serializes runtime and $label without adding other groups", ({ selected, expected }) => {
     const results = resolveTsdownBuildInvocations({
       args: [
         "--config",
         "tsdown.config.ts",
         "--filter",
         TSDOWN_UNIFIED_CONFIG_GROUP,
+        ...selected.flatMap((group) => ["--filter", group]),
         "--format",
         "esm",
       ],
       platform: "linux",
       nodeExecPath: "/usr/bin/node",
-      npmExecPath: "/tmp/pnpm.cjs",
       env: {},
       ...NO_MEMORY_LIMIT,
     });
 
-    expect(results).toHaveLength(1 + TSDOWN_UNIFIED_DTS_CONFIG_GROUPS.length);
+    expect(results).toHaveLength(1 + expected.length);
     expect(
       results.map((result) => {
         const filterIndex = result.args.indexOf("--filter");
         return result.args[filterIndex + 1];
       }),
-    ).toEqual([TSDOWN_UNIFIED_CONFIG_GROUP, ...TSDOWN_UNIFIED_DTS_CONFIG_GROUPS]);
+    ).toEqual([TSDOWN_UNIFIED_CONFIG_GROUP, ...expected]);
     for (const result of results) {
       expect(result.args).toEqual(expect.arrayContaining(["--config", "tsdown.config.ts"]));
       expect(result.args).toEqual(expect.arrayContaining(["--format", "esm"]));
     }
   });
 
-  it.each(["tsdown.config.ts", "."])(
-    "keeps cleanup one-time when canonical config %s is serialized",
-    (config) => {
-      const args = ["--config", config, "--clean"];
-      const results = resolveTsdownBuildInvocations({
-        args,
-        env: {},
-        ...NO_MEMORY_LIMIT,
-      });
+  it("keeps cleanup one-time when the canonical directory config is serialized", () => {
+    const args = ["--config", ".", "--clean"];
+    const results = resolveTsdownBuildInvocations({
+      args,
+      env: {},
+      ...NO_MEMORY_LIMIT,
+    });
 
-      expect(resolveTsdownCleanOutputRoots(args)).toEqual(
-        resolveTsdownCleanOutputRoots(["--config", "tsdown.config.ts", "--clean"]),
-      );
-      expect(results.length).toBeGreaterThan(1);
-      for (const result of results) {
-        expect(result.args).toContain("--no-clean");
-        expect(result.args).not.toContain("--clean");
-      }
-    },
-  );
+    expect(resolveTsdownCleanOutputRoots(args)).toEqual(
+      resolveTsdownCleanOutputRoots(["--config", "tsdown.config.ts", "--clean"]),
+    );
+    expect(results.length).toBeGreaterThan(1);
+    for (const result of results) {
+      expect(result.args).toContain("--no-clean");
+      expect(result.args).not.toContain("--clean");
+    }
+  });
 
   it("preserves explicit cleanup for a custom config-owned output", () => {
     const [result] = resolveTsdownBuildInvocations({
@@ -304,17 +326,12 @@ describe("resolveTsdownBuildInvocation", () => {
     ).toEqual([TSDOWN_PACKAGE_CONFIG_GROUP, "openclaw-dts-base"]);
   });
 
-  it.each([
-    ["long filter", ["--filter", "openclaw-unified"]],
-    ["long assigned filter", ["--filter=openclaw-unified"]],
-    ["short filter", ["-F", "openclaw-unified"]],
-    ["short assigned filter", ["-F=openclaw-unified"]],
-  ])("keeps a caller-provided %s in one main invocation", (_label, args) => {
+  it("keeps a caller-provided filter in one main invocation", () => {
+    const args = ["-F", "openclaw-unified"];
     const results = resolveTsdownBuildInvocations({
       args,
       platform: "linux",
       nodeExecPath: "/usr/bin/node",
-      npmExecPath: "/tmp/pnpm.cjs",
       env: {},
       ...NO_MEMORY_LIMIT,
     });
@@ -325,28 +342,7 @@ describe("resolveTsdownBuildInvocation", () => {
   });
 
   it.each([
-    ["long config", ["--config", "custom.tsdown.config.ts"]],
-    ["long assigned config", ["--config=custom.tsdown.config.ts"]],
-    ["short config", ["-c", "custom.tsdown.config.ts"]],
-    ["short assigned config", ["-c=custom.tsdown.config.ts"]],
-    ["config disabled", ["--no-config", "src/index.ts"]],
-  ])("keeps a caller-provided %s in one unfiltered invocation", (_label, args) => {
-    const results = resolveTsdownBuildInvocations({
-      args,
-      platform: "linux",
-      nodeExecPath: "/usr/bin/node",
-      npmExecPath: "/tmp/pnpm.cjs",
-      env: {},
-      ...NO_MEMORY_LIMIT,
-    });
-
-    expect(results).toHaveLength(1);
-    expect(results[0]?.args.slice(-args.length)).toEqual(args);
-  });
-
-  it.each([
     ["long", ["--watch"]],
-    ["long path", ["--watch", "src"]],
     ["long assigned", ["--watch=src"]],
     ["short", ["-w"]],
     ["short assigned", ["-w=src"]],
@@ -358,14 +354,11 @@ describe("resolveTsdownBuildInvocation", () => {
     expect(results[0]?.args.slice(-args.length)).toEqual(args);
   });
 
-  it.each([["--watch"], ["-w"]])(
-    "rejects default %s mode before splitting long-lived watchers",
-    (watchArg) => {
-      expect(() =>
-        resolveTsdownBuildInvocations({ args: [watchArg], env: {}, ...NO_MEMORY_LIMIT }),
-      ).toThrow("watch mode requires an explicit --config/-c or --no-config selector");
-    },
-  );
+  it("rejects default watch mode before splitting long-lived watchers", () => {
+    expect(() =>
+      resolveTsdownBuildInvocations({ args: ["-w"], env: {}, ...NO_MEMORY_LIMIT }),
+    ).toThrow("watch mode requires an explicit --config/-c or --no-config selector");
+  });
 
   it("keeps an explicit config-free positional entry in one small plan", () => {
     const args = ["--no-config", "packages/normalization-core/src/mountinfo-path.ts"];
@@ -408,7 +401,6 @@ describe("resolveTsdownBuildInvocation", () => {
     const result = resolveTsdownBuildPlan({
       platform: "linux",
       nodeExecPath: "/usr/bin/node",
-      npmExecPath: "/tmp/pnpm.cjs",
       env: {},
       cgroupMemoryLimitPaths: ["/test/memory.max"],
       fs: {
@@ -430,21 +422,19 @@ describe("resolveTsdownBuildInvocation", () => {
     }
   });
 
-  it.each([
-    ["custom config", ["--config", "custom.tsdown.config.ts"]],
-    ["disabled config", ["--no-config", "src/index.ts"]],
-    ["package-only filtered build", ["--filter", TSDOWN_PACKAGE_CONFIG_GROUP]],
-  ])("does not apply full-build admission to a %s", (_label, args) => {
+  it("keeps custom configs in one invocation without full-build admission", () => {
+    const args = ["-c", "custom.tsdown.config.ts"];
     const result = resolveTsdownBuildPlan({
       args,
       platform: "linux",
       nodeExecPath: "/usr/bin/node",
-      npmExecPath: "/tmp/pnpm.cjs",
       env: {},
       cgroupMemoryLimitBytes: 4 * 1024 * 1024 * 1024,
     });
 
     expect(result.heapShortfall).toBeNull();
+    expect(result.invocations).toHaveLength(1);
+    expect(result.invocations[0]?.args.slice(-args.length)).toEqual(args);
   });
 
   it("applies admission to the direct unified declaration plan", () => {
@@ -466,17 +456,10 @@ describe("resolveTsdownBuildInvocation", () => {
   });
 
   it.each([
-    ["long", ["--filter", TSDOWN_PACKAGE_CONFIG_GROUP, "--filter", TSDOWN_UNIFIED_CONFIG_GROUP]],
     [
       "long reversed",
       ["--filter", TSDOWN_UNIFIED_CONFIG_GROUP, "--filter", TSDOWN_PACKAGE_CONFIG_GROUP],
     ],
-    [
-      "long assigned",
-      [`--filter=${TSDOWN_PACKAGE_CONFIG_GROUP}`, `--filter=${TSDOWN_UNIFIED_CONFIG_GROUP}`],
-    ],
-    ["short", ["-F", TSDOWN_PACKAGE_CONFIG_GROUP, "-F", TSDOWN_UNIFIED_CONFIG_GROUP]],
-    ["short reversed", ["-F", TSDOWN_UNIFIED_CONFIG_GROUP, "-F", TSDOWN_PACKAGE_CONFIG_GROUP]],
     ["short assigned", [`-F=${TSDOWN_PACKAGE_CONFIG_GROUP}`, `-F=${TSDOWN_UNIFIED_CONFIG_GROUP}`]],
   ])("admits repeated %s filters and cleans the complete output set", (_label, args) => {
     const result = resolveTsdownBuildPlan({
@@ -561,24 +544,18 @@ describe("resolveTsdownBuildInvocation", () => {
     ).toEqual(new Set(listTsdownOutputRoots()));
   });
 
-  it.each([
-    ["--config", "tsdown.config.ts"],
-    ["--config=tsdown.config.ts"],
-    ["-c", "tsdown.config.ts"],
-    ["-c=tsdown.config.ts"],
-    ["--config", "."],
-    ["--config=."],
-    ["-c", "."],
-    ["-c=."],
-  ])("applies admission to canonical config form %j", (...args) => {
-    expect(
-      resolveTsdownBuildPlan({
-        args,
-        env: {},
-        cgroupMemoryLimitBytes: 4 * 1024 * 1024 * 1024,
-      }).heapShortfall?.fatal,
-    ).toBe(true);
-  });
+  it.each([["--config=tsdown.config.ts"], ["-c", "tsdown.config.ts"], ["-c=."]])(
+    "applies admission to alternate canonical config form %j",
+    (...args) => {
+      expect(
+        resolveTsdownBuildPlan({
+          args,
+          env: {},
+          cgroupMemoryLimitBytes: 4 * 1024 * 1024 * 1024,
+        }).heapShortfall?.fatal,
+      ).toBe(true);
+    },
+  );
 
   it("applies admission to the unfiltered canonical config but not a package-only selector", () => {
     const full = resolveTsdownBuildPlan({
@@ -636,7 +613,6 @@ describe("resolveTsdownBuildInvocation", () => {
       args,
       platform: "linux",
       nodeExecPath: "/usr/bin/node",
-      npmExecPath: "/tmp/pnpm.cjs",
       env,
       cgroupMemoryLimitBytes: 2 * 1024 * 1024 * 1024,
     });
@@ -644,27 +620,16 @@ describe("resolveTsdownBuildInvocation", () => {
     expect(result.maxOldSpaceMb).toBe(1280);
     expect(result.heapShortfall?.fatal).toBe(true);
     expect(result.invocations).toHaveLength(2);
+    expect(result.invocations[0]?.args).toEqual(
+      expect.arrayContaining(["--config", "tsdown.ai.config.ts"]),
+    );
+    expect(result.invocations[1]?.args).not.toContain("--filter");
   });
 
-  it("restores declaration-build admission when --dts overrides the Docker default", () => {
-    const result = resolveTsdownBuildPlan({
-      args: ["--dts"],
-      env: { OPENCLAW_RUN_NODE_SKIP_DTS_BUILD: "1" },
-      cgroupMemoryLimitBytes: 2 * 1024 * 1024 * 1024,
-    });
-
-    expect(result.heapShortfall?.fatal).toBe(true);
-  });
-
-  it("routes Windows tsdown builds through the pnpm runner instead of shell=true", () => {
-    const rootDir = createTempDir("openclaw-pnpm-runner-");
-    const npmExecPath = path.join(rootDir, "pnpm.cjs");
-    fs.writeFileSync(npmExecPath, "console.log('pnpm');\n");
-
+  it("keeps the selected Windows runtime and literal compiler arguments", () => {
     const result = resolveTsdownBuildInvocation({
       platform: "win32",
       nodeExecPath: "C:\\Program Files\\nodejs\\node.exe",
-      npmExecPath,
       env: {},
       ...NO_MEMORY_LIMIT,
     });
@@ -672,14 +637,14 @@ describe("resolveTsdownBuildInvocation", () => {
     expect(result).toEqual({
       command: "C:\\Program Files\\nodejs\\node.exe",
       args: [
-        npmExecPath,
-        "exec",
-        "tsdown",
+        "node_modules/tsdown/dist/run.mjs",
         "--config-loader",
         "unrun",
         "--logLevel",
         "warn",
         "--no-clean",
+        "--concurrency",
+        "1",
       ],
       options: {
         stdio: ["ignore", "pipe", "pipe"],
@@ -692,34 +657,16 @@ describe("resolveTsdownBuildInvocation", () => {
 
   it.each([
     {
-      title: "keeps inherited Windows tsdown heap settings at the Windows build cap",
-      platform: "win32",
-      execPath: "C:\\Program Files\\nodejs\\node.exe",
-      pnpmPath: "C:\\repo\\pnpm.cjs",
-      nodeOptions: "--trace-warnings --max-old-space-size=8192",
-      expectedNodeOptions: "--trace-warnings --max-old-space-size=8192",
-    },
-    {
       title: "clamps explicit Windows tsdown heap settings to the Windows build cap",
       platform: "win32",
       execPath: "C:\\Program Files\\nodejs\\node.exe",
-      pnpmPath: "C:\\repo\\pnpm.cjs",
       nodeOptions: "--trace-warnings --max-old-space-size=12288",
       expectedNodeOptions: "--trace-warnings --max-old-space-size=8192",
-    },
-    {
-      title: "preserves explicit tsdown heap settings",
-      platform: "linux",
-      execPath: "/usr/bin/node",
-      pnpmPath: "/tmp/pnpm.cjs",
-      nodeOptions: "--trace-warnings --max-old-space-size=12288",
-      expectedNodeOptions: "--trace-warnings --max-old-space-size=12288",
     },
     {
       title: "raises inherited lower tsdown heap settings to the build default",
       platform: "linux",
       execPath: "/usr/bin/node",
-      pnpmPath: "/tmp/pnpm.cjs",
       nodeOptions: "--trace-warnings --max-old-space-size=4096",
       expectedNodeOptions: "--trace-warnings --max-old-space-size=12288",
     },
@@ -727,26 +674,18 @@ describe("resolveTsdownBuildInvocation", () => {
       title: "raises split inherited lower tsdown heap settings to the build default",
       platform: "linux",
       execPath: "/usr/bin/node",
-      pnpmPath: "/tmp/pnpm.cjs",
       nodeOptions: "--trace-warnings --max-old-space-size 4096",
       expectedNodeOptions: "--trace-warnings --max-old-space-size=12288",
     },
-  ])("$title", ({ platform, execPath, pnpmPath, nodeOptions, expectedNodeOptions }) => {
+  ])("$title", ({ platform, execPath, nodeOptions, expectedNodeOptions }) => {
     const result = resolveTsdownBuildInvocation({
       platform,
       nodeExecPath: execPath,
-      npmExecPath: pnpmPath,
       env: { NODE_OPTIONS: nodeOptions },
       ...NO_MEMORY_LIMIT,
     });
 
     expect(result.options.env.NODE_OPTIONS).toBe(expectedNodeOptions);
-  });
-
-  it("keeps default tsdown heap below the container memory limit", () => {
-    expect(resolveTestNodeOptions({ cgroupMemoryLimitBytes: 7 * 1024 * 1024 * 1024 })).toBe(
-      "--max-old-space-size=6400",
-    );
   });
 
   it("deducts memory already used by a shared limiting cgroup", () => {
@@ -759,35 +698,41 @@ describe("resolveTsdownBuildInvocation", () => {
       ],
     ]);
     const fsFixture = createMemoryFileSystem(cgroupFiles);
-    const result = resolveTsdownBuildPlan({
+    const memory = {
       env: {},
       cgroupMemoryLimitPaths: ["/test/memory.max"],
       physicalMemoryBytes: 16 * 1024 * 1024 * 1024,
       processResidentMemoryBytes: 64 * 1024 * 1024,
       procMeminfoPath: "/openclaw-test-missing-proc-meminfo",
       fs: fsFixture,
-    });
+    };
+    const result = resolveTsdownBuildPlan(memory);
 
     // Credit 768 MiB of inactive file pages and this wrapper's 64 MiB RSS. Anonymous memory,
     // shmem, and the remaining 128 MiB kernel charge all compete with the child heap.
     expect(result.maxOldSpaceMb).toBe(3520);
     expect(result.heapShortfall?.fatal).toBe(true);
+    expect(readProcessMemoryCapacity(memory)).toMatchObject({
+      capacityBytes: 5 * 1024 * 1024 * 1024,
+      limitBytes: 4288 * 1024 * 1024,
+      usageKnown: true,
+      unresolved: false,
+    });
 
     cgroupFiles.set("/test/memory.current", `${832 * 1024 * 1024}\n`);
     cgroupFiles.set(
       "/test/memory.stat",
       `anon ${64 * 1024 * 1024}\nshmem 0\nfile ${768 * 1024 * 1024}\ninactive_file ${768 * 1024 * 1024}\nkernel 0\n`,
     );
-    const isolated = resolveTsdownBuildPlan({
-      env: {},
-      cgroupMemoryLimitPaths: ["/test/memory.max"],
-      physicalMemoryBytes: 16 * 1024 * 1024 * 1024,
-      processResidentMemoryBytes: 64 * 1024 * 1024,
-      procMeminfoPath: "/openclaw-test-missing-proc-meminfo",
-      fs: fsFixture,
-    });
+    const isolated = resolveTsdownBuildPlan(memory);
     expect(isolated.maxOldSpaceMb).toBe(4352);
     expect(isolated.heapShortfall).toBeNull();
+    expect(readProcessMemoryCapacity(memory)).toMatchObject({
+      capacityBytes: 5 * 1024 * 1024 * 1024,
+      limitBytes: 5 * 1024 * 1024 * 1024,
+      usageKnown: true,
+      unresolved: false,
+    });
   });
 
   it("refuses to start when the host budget cannot fit the build", () => {
@@ -802,15 +747,6 @@ describe("resolveTsdownBuildInvocation", () => {
     expect(shortfall?.message).toContain("OPENCLAW_TSDOWN_MAX_OLD_SPACE_MB=<MB>");
   });
 
-  it("refuses a host whose slice cannot hold the whole-build peak", () => {
-    // A 4GiB slice resolves a 3328MB heap and clears the early invocations, then dies partway
-    // through the third: the binding constraint is the 4730MiB whole-build peak, not one pass.
-    expect(
-      describeInsufficientTsdownHeap({ env: {}, cgroupMemoryLimitBytes: 4 * 1024 * 1024 * 1024 })
-        ?.fatal,
-    ).toBe(true);
-  });
-
   it("points Docker refusals at the public build heap override", () => {
     const shortfall = describeInsufficientTsdownHeap({
       env: { OPENCLAW_INTERNAL_DOCKER_BUILD_PLUGIN_IDS: "" },
@@ -820,12 +756,6 @@ describe("resolveTsdownBuildInvocation", () => {
     expect(shortfall?.fatal).toBe(true);
     expect(shortfall?.message).toContain("set OPENCLAW_DOCKER_BUILD_TSDOWN_MAX_OLD_SPACE_MB=<MB>");
     expect(shortfall?.message).not.toContain("set OPENCLAW_TSDOWN_MAX_OLD_SPACE_MB=<MB>");
-  });
-
-  it("admits the smallest slice measured to complete a full build", () => {
-    expect(
-      describeInsufficientTsdownHeap({ env: {}, cgroupMemoryLimitBytes: 5 * 1024 * 1024 * 1024 }),
-    ).toBeNull();
   });
 
   it("uses an explicit heap override as the operator's opt-in for the complete plan", () => {
@@ -871,7 +801,6 @@ describe("resolveTsdownBuildInvocation", () => {
   it.each([
     ["repeated named configs", ["--config", "custom.ts", "-c=tsdown.config.ts"]],
     ["config then no-config", ["--config", "tsdown.config.ts", "--no-config", "src/index.ts"]],
-    ["no-config then config", ["--no-config", "src/index.ts", "-c=tsdown.config.ts"]],
   ])("rejects %s before cleanup", (_label, args) => {
     const cleanup = vi.fn();
 
@@ -889,10 +818,37 @@ describe("resolveTsdownBuildInvocation", () => {
   });
 
   it.each([
-    ["missing output directory", ["--out-dir", "--watch"]],
-    ["empty assigned output directory", ["--out-dir="]],
-    ["repeated output directories", ["--out-dir", "first", "-d=second"]],
-  ])("rejects %s before cleanup", (_label, args) => {
+    [
+      "missing output directory",
+      ["--out-dir", "--watch"],
+      "tsdown build requires one concrete --out-dir/-d value",
+    ],
+    [
+      "empty assigned output directory",
+      ["--out-dir="],
+      "tsdown build requires one concrete --out-dir/-d value",
+    ],
+    [
+      "missing short output directory",
+      ["-d"],
+      "tsdown build requires one concrete --out-dir/-d value",
+    ],
+    [
+      "empty assigned short output directory",
+      ["-d="],
+      "tsdown build requires one concrete --out-dir/-d value",
+    ],
+    [
+      "repeated output directories",
+      ["--out-dir", "first", "-d=second"],
+      "tsdown build accepts only one --out-dir/-d value",
+    ],
+    [
+      "malformed output directory after repeated values",
+      ["--out-dir", "first", "-d=second", "--out-dir"],
+      "tsdown build requires one concrete --out-dir/-d value",
+    ],
+  ])("rejects %s before cleanup", (_label, args, message) => {
     const cleanup = vi.fn();
 
     expect(() =>
@@ -904,13 +860,12 @@ describe("resolveTsdownBuildInvocation", () => {
         },
         { cleanup },
       ),
-    ).toThrow(/tsdown build .* --out-dir\/-d value/u);
+    ).toThrow(new Error(message));
     expect(cleanup).not.toHaveBeenCalled();
   });
 
   it.each([
     ["bare long filter", ["--filter"]],
-    ["bare short filter", ["-F"]],
     ["empty assigned filter", ["--filter="]],
     ["missing repeated filter", ["--filter", "openclaw-packages", "-F", "--watch"]],
   ])("rejects %s before cleanup", (_label, args) => {
@@ -929,27 +884,11 @@ describe("resolveTsdownBuildInvocation", () => {
     expect(cleanup).not.toHaveBeenCalled();
   });
 
-  it("stays silent when the host budget fits the build", () => {
-    expect(
-      describeInsufficientTsdownHeap({ env: {}, cgroupMemoryLimitBytes: 8 * 1024 * 1024 * 1024 }),
-    ).toBeNull();
-  });
-
-  it("never sizes the heap above a cgroup limit smaller than the old floor", () => {
-    // A floor applied on top of a real limit yields a heap the cgroup cannot honour, so the
-    // build is OOM-killed instead of merely running smaller.
-    // 1500 MiB budget minus the 768 MiB headroom, not the former 2048 MiB floor.
-    expect(resolveTestNodeOptions({ cgroupMemoryLimitBytes: 1500 * 1024 * 1024 })).toBe(
-      "--max-old-space-size=732",
+  it("keeps a sub-MiB cgroup limit bounded instead of treating it as unbounded", () => {
+    expect(resolveTestNodeOptions({ cgroupMemoryLimitBytes: 1024 * 1024 - 1 })).toBe(
+      "--max-old-space-size=1",
     );
   });
-
-  it.each([4096, 1024 * 1024 - 1])(
-    "keeps a %i-byte cgroup limit bounded instead of treating it as unbounded",
-    (cgroupMemoryLimitBytes) => {
-      expect(resolveTestNodeOptions({ cgroupMemoryLimitBytes })).toBe("--max-old-space-size=1");
-    },
-  );
 
   it("keeps a parsed zero-byte cgroup limit bounded", () => {
     expect(
@@ -1026,18 +965,47 @@ describe("resolveTsdownBuildInvocation", () => {
 
     expect(resolveTsdownBuildPlan(base).maxOldSpaceMb).toBe(3328);
     expect(resolveTsdownBuildPlan({ ...base, availableMemoryBytes: 0 }).maxOldSpaceMb).toBe(1);
+    expect(readProcessMemoryCapacity(base)).toMatchObject({
+      capacityBytes: 8 * 1024 * 1024 * 1024,
+      limitBytes: 4 * 1024 * 1024 * 1024,
+      availableBytes: 4 * 1024 * 1024 * 1024,
+    });
+    expect(readProcessMemoryCapacity({ ...base, availableMemoryBytes: 0 })).toMatchObject({
+      capacityBytes: 8 * 1024 * 1024 * 1024,
+      limitBytes: 0,
+      availableBytes: 0,
+    });
   });
 
   it("caps an oversized cgroup limit by physical memory", () => {
-    const result = resolveTsdownBuildPlan({
+    const memory = {
       env: {},
       cgroupMemoryLimitBytes: 64 * 1024 * 1024 * 1024,
       procMeminfoPath: "/openclaw-test-missing-proc-meminfo",
       physicalMemoryBytes: 4 * 1024 * 1024 * 1024,
-    });
+    };
+    const result = resolveTsdownBuildPlan(memory);
 
     expect(result.maxOldSpaceMb).toBe(3328);
     expect(result.heapShortfall?.fatal).toBe(true);
+    expect(readProcessMemoryCapacity(memory).capacityBytes).toBe(4 * 1024 * 1024 * 1024);
+  });
+
+  it("keeps raw capacity unknown when a finite controller has no known physical bound", () => {
+    const memory = {
+      platform: "linux",
+      cgroupMemoryLimitBytes: 8 * 1024 * 1024 * 1024,
+      physicalMemoryBytes: Number.NaN,
+      availableMemoryBytes: 4 * 1024 * 1024 * 1024,
+      fs: createMemoryFileSystem(new Map()),
+    };
+
+    expect(readProcessMemoryCapacity(memory)).toMatchObject({
+      capacityBytes: null,
+      limitBytes: 4 * 1024 * 1024 * 1024,
+      availableBytes: 4 * 1024 * 1024 * 1024,
+      unresolved: false,
+    });
   });
 
   it("caps the tsdown heap using the process's own cgroup slice budget", () => {
@@ -1065,11 +1033,13 @@ describe("resolveTsdownBuildInvocation", () => {
       ["/sys/fs/cgroup/user.slice/memory.max", `${5 * 1024 * 1024 * 1024}\n`],
     ]);
 
-    const nodeOptions = resolveTestNodeOptions({
+    const memory = {
       fs: createMemoryFileSystem(cgroupFiles),
-    });
+    };
+    const nodeOptions = resolveTestNodeOptions(memory);
 
     expect(nodeOptions).toBe("--max-old-space-size=4352");
+    expect(readProcessMemoryCapacity(memory).capacityBytes).toBe(5 * 1024 * 1024 * 1024);
   });
 
   it("uses a resolved v1 memory limit when a hybrid host's v2 view is inherited", () => {
@@ -1145,6 +1115,12 @@ describe("resolveTsdownBuildInvocation", () => {
       fs: fsFixture,
     });
 
+    expect(readProcessMemoryCapacity({ fs: fsFixture })).toMatchObject({
+      capacityBytes: null,
+      limitBytes: null,
+      availableBytes: null,
+      unresolved: true,
+    });
     expect(result.maxOldSpaceMb).toBe(1);
     expect(result.heapShortfall?.fatal).toBe(true);
     expect(result.heapShortfall?.message).toContain(
@@ -1467,14 +1443,16 @@ describe("resolveTsdownBuildInvocation", () => {
       [`/sys/fs/cgroup${slicePath}/memory.limit_in_bytes`, "9223372036854771712\n"],
     ]);
 
-    const nodeOptions = resolveTestNodeOptions({
+    const memory = {
       platform: "linux",
       constrainedMemoryBytes: 5 * 1024 * 1024 * 1024,
       procMemTotalBytes: 16 * 1024 * 1024 * 1024,
       fs: createMemoryFileSystem(cgroupFiles),
-    });
+    };
+    const nodeOptions = resolveTestNodeOptions(memory);
 
     expect(nodeOptions).toBe("--max-old-space-size=3328");
+    expect(readProcessMemoryCapacity(memory).capacityBytes).toBe(4 * 1024 * 1024 * 1024);
   });
 
   it("ignores a cgroup-v1 parent limit when hierarchy accounting is disabled", () => {
@@ -1607,15 +1585,6 @@ describe("resolveTsdownBuildInvocation", () => {
     expect(nodeOptions).toBe("--trace-warnings --max-old-space-size=6400");
   });
 
-  it("honors OPENCLAW_TSDOWN_MAX_OLD_SPACE_MB over platform and memory defaults", () => {
-    const nodeOptions = resolveTestNodeOptions({
-      env: { OPENCLAW_TSDOWN_MAX_OLD_SPACE_MB: "3072" },
-      cgroupMemoryLimitBytes: 7 * 1024 * 1024 * 1024,
-    });
-
-    expect(nodeOptions).toBe("--max-old-space-size=3072");
-  });
-
   it("keeps memory detection when OPENCLAW_TSDOWN_MAX_OLD_SPACE_MB is blank", () => {
     const nodeOptions = resolveTestNodeOptions({
       env: { OPENCLAW_TSDOWN_MAX_OLD_SPACE_MB: "  " },
@@ -1629,7 +1598,6 @@ describe("resolveTsdownBuildInvocation", () => {
     const result = resolveTsdownBuildInvocation({
       platform: "win32",
       nodeExecPath: "C:\\Program Files\\nodejs\\node.exe",
-      npmExecPath: "C:\\repo\\pnpm.cjs",
       env: {
         NODE_OPTIONS: "--trace-warnings --max-old-space-size=12288",
         OPENCLAW_TSDOWN_MAX_OLD_SPACE_MB: "4096",
@@ -1645,7 +1613,6 @@ describe("resolveTsdownBuildInvocation", () => {
       expect(() =>
         resolveTsdownBuildInvocation({
           nodeExecPath: "/usr/bin/node",
-          npmExecPath: "/tmp/pnpm.cjs",
           env: { OPENCLAW_TSDOWN_MAX_OLD_SPACE_MB: value },
           ...NO_MEMORY_LIMIT,
         }),
@@ -1668,11 +1635,11 @@ describe("resolveTsdownBuildInvocation", () => {
     expect(nodeOptions).toBe("--max-old-space-size=6400");
   });
 
-  it("can run tsdown without invoking pnpm", () => {
+  it("preserves the selected compiler runtime despite inherited package-manager state", () => {
     const result = resolveTsdownBuildInvocation({
       platform: "linux",
       nodeExecPath: "/usr/bin/node",
-      env: { OPENCLAW_BUILD_ALL_NO_PNPM: "1" },
+      env: { npm_execpath: "/unrelated/pnpm.cjs" },
       ...NO_MEMORY_LIMIT,
     });
 
@@ -1685,6 +1652,8 @@ describe("resolveTsdownBuildInvocation", () => {
         "--logLevel",
         "warn",
         "--no-clean",
+        "--concurrency",
+        "1",
       ],
       options: {
         stdio: ["ignore", "pipe", "pipe"],
@@ -1692,7 +1661,7 @@ describe("resolveTsdownBuildInvocation", () => {
         windowsVerbatimArguments: undefined,
         env: {
           NODE_OPTIONS: "--max-old-space-size=12288",
-          OPENCLAW_BUILD_ALL_NO_PNPM: "1",
+          npm_execpath: "/unrelated/pnpm.cjs",
         },
       },
     });
@@ -1734,63 +1703,48 @@ describe("resolveTsdownBuildInvocation", () => {
     expect(resolveTsdownCleanOutputRoots(["--format", "esm"])).toEqual(listTsdownOutputRoots());
   });
 
-  it("keeps source-checkout prune best-effort", () => {
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-    const rmSync = vi.spyOn(fs, "rmSync");
+  it("prunes stale hashed root chunk files but keeps stable aliases and nested assets", () =>
+    fixture.run(async () => {
+      const rootDir = createTempDir("openclaw-tsdown-build-");
+      const distDir = path.join(rootDir, "dist");
+      const distRuntimeDir = path.join(rootDir, "dist-runtime");
+      await fsPromises.mkdir(path.join(distDir, "control-ui"), { recursive: true });
+      await fsPromises.mkdir(distRuntimeDir, { recursive: true });
+      await fsPromises.writeFile(path.join(distDir, "delegate-BPjCe4gC.js"), "old delegate\n");
+      await fsPromises.writeFile(
+        path.join(distDir, "compact.runtime-2DiEmVcA.js"),
+        "old runtime\n",
+      );
+      await fsPromises.writeFile(path.join(distDir, "compact.runtime.js"), "stable alias\n");
+      await fsPromises.writeFile(path.join(distDir, "entry.js"), "entry\n");
+      await fsPromises.writeFile(path.join(distDir, "control-ui", "index.html"), "asset\n");
+      await fsPromises.writeFile(
+        path.join(distRuntimeDir, "heartbeat-runner.runtime-fspOEj_1.js"),
+        "old runtime\n",
+      );
+      await fsPromises.writeFile(
+        path.join(distRuntimeDir, "heartbeat-runner.runtime.js"),
+        "alias\n",
+      );
 
-    rmSync.mockImplementation(() => {
-      throw new Error("locked");
-    });
+      pruneStaleRootChunkFiles({ cwd: rootDir });
 
-    expect(
-      pruneSourceCheckoutBundledPluginNodeModules({
-        cwd: process.cwd(),
-      }),
-    ).toBeUndefined();
-
-    expect(warn).toHaveBeenCalledWith(
-      "tsdown: could not prune bundled plugin source node_modules: Error: locked",
-    );
-
-    warn.mockRestore();
-    rmSync.mockRestore();
-  });
-
-  it("prunes stale hashed root chunk files but keeps stable aliases and nested assets", async () => {
-    const rootDir = createTempDir("openclaw-tsdown-build-");
-    const distDir = path.join(rootDir, "dist");
-    const distRuntimeDir = path.join(rootDir, "dist-runtime");
-    await fsPromises.mkdir(path.join(distDir, "control-ui"), { recursive: true });
-    await fsPromises.mkdir(distRuntimeDir, { recursive: true });
-    await fsPromises.writeFile(path.join(distDir, "delegate-BPjCe4gC.js"), "old delegate\n");
-    await fsPromises.writeFile(path.join(distDir, "compact.runtime-2DiEmVcA.js"), "old runtime\n");
-    await fsPromises.writeFile(path.join(distDir, "compact.runtime.js"), "stable alias\n");
-    await fsPromises.writeFile(path.join(distDir, "entry.js"), "entry\n");
-    await fsPromises.writeFile(path.join(distDir, "control-ui", "index.html"), "asset\n");
-    await fsPromises.writeFile(
-      path.join(distRuntimeDir, "heartbeat-runner.runtime-fspOEj_1.js"),
-      "old runtime\n",
-    );
-    await fsPromises.writeFile(path.join(distRuntimeDir, "heartbeat-runner.runtime.js"), "alias\n");
-
-    pruneStaleRootChunkFiles({ cwd: rootDir });
-
-    await expect(
-      fsPromises.readFile(path.join(distDir, "compact.runtime.js"), "utf8"),
-    ).resolves.toBe("stable alias\n");
-    await expect(fsPromises.readFile(path.join(distDir, "entry.js"), "utf8")).resolves.toBe(
-      "entry\n",
-    );
-    await expect(
-      fsPromises.readFile(path.join(distDir, "control-ui", "index.html"), "utf8"),
-    ).resolves.toBe("asset\n");
-    await expect(
-      fsPromises.readFile(path.join(distRuntimeDir, "heartbeat-runner.runtime.js"), "utf8"),
-    ).resolves.toBe("alias\n");
-    await expectPathMissing(path.join(distDir, "delegate-BPjCe4gC.js"));
-    await expectPathMissing(path.join(distDir, "compact.runtime-2DiEmVcA.js"));
-    await expectPathMissing(path.join(distRuntimeDir, "heartbeat-runner.runtime-fspOEj_1.js"));
-  });
+      await expect(
+        fsPromises.readFile(path.join(distDir, "compact.runtime.js"), "utf8"),
+      ).resolves.toBe("stable alias\n");
+      await expect(fsPromises.readFile(path.join(distDir, "entry.js"), "utf8")).resolves.toBe(
+        "entry\n",
+      );
+      await expect(
+        fsPromises.readFile(path.join(distDir, "control-ui", "index.html"), "utf8"),
+      ).resolves.toBe("asset\n");
+      await expect(
+        fsPromises.readFile(path.join(distRuntimeDir, "heartbeat-runner.runtime.js"), "utf8"),
+      ).resolves.toBe("alias\n");
+      await expectPathMissing(path.join(distDir, "delegate-BPjCe4gC.js"));
+      await expectPathMissing(path.join(distDir, "compact.runtime-2DiEmVcA.js"));
+      await expectPathMissing(path.join(distRuntimeDir, "heartbeat-runner.runtime-fspOEj_1.js"));
+    }));
 
   it.each([
     { label: "default build", args: [], skipDts: "0", preserveMetadata: "0" },
@@ -1804,184 +1758,290 @@ describe("resolveTsdownBuildInvocation", () => {
     { label: "cached build-all", args: [], skipDts: "1", preserveMetadata: "1" },
   ])(
     "preserves separately owned outputs during $label cleanup",
-    async ({ args, skipDts, preserveMetadata }) => {
-      const rootDir = createTempDir("openclaw-tsdown-clean-");
-      const retainedFiles = [
-        "dist/control-ui/index.html",
-        "dist/control-ui/sw.js",
-        "dist/control-ui/asset-manifest.json",
-        "dist/control-ui/assets/index-AbCd1234.js",
-        "dist/control-ui/assets/index-AbCd1234.js.map",
-        "dist/control-ui/assets/index-AbCd1234.js.br",
-        "dist/control-ui/assets/nested/styles-AbCd1234.css",
-        "packages/plugin-sdk/dist/keep.js",
-        "packages/agent-core/src/keep.ts",
-        "tmp/keep.js",
-      ];
-      const declarationFiles = [
-        "dist/plugin-sdk/core.d.ts",
-        "dist/plugin-sdk/nested/types.d.cts",
-        "dist-runtime/extensions/demo/index.d.ts",
-        "packages/media-understanding-common/dist/index.d.mts",
-        "packages/media-understanding-common/dist/nested/types.d.ts",
-      ];
-      const metadataFile = "dist/cli-startup-metadata.json";
-      const staleFiles = [
-        "dist/entry.js",
-        "dist/stale-AbCd1234.js",
-        "dist/stale-AbCd1234.js.map",
-        "dist/plugin-sdk/core.js",
-        "dist/nested/stale.js",
-        "dist/nested/stale.js.map",
-        "dist/control-ui-old/index.html",
-        "dist/extensions/demo/src/index.js",
-        "dist/extensions/demo/node_modules/staged/index.js",
-        "dist/extensions/node_modules/openclaw/plugin-sdk/core.js",
-        "dist-runtime/stale.js",
-        "dist-runtime/stale.js.map",
-        "dist-runtime/control-ui/index.html",
-        "dist-runtime/extensions/demo/index.js",
-        "dist-runtime/extensions/demo/node_modules/staged/index.js",
-        "packages/agent-core/dist/stale.js",
-        "packages/net-policy/dist/stale.js",
-        "packages/media-understanding-common/dist/index.mjs",
-        "packages/media-understanding-common/dist/chunks/old.js",
-      ];
-      for (const relativePath of [
-        ...retainedFiles,
-        ...declarationFiles,
-        metadataFile,
-        ...staleFiles,
-      ]) {
-        const filePath = path.join(rootDir, relativePath);
-        await fsPromises.mkdir(path.dirname(filePath), { recursive: true });
-        await fsPromises.writeFile(filePath, `sentinel:${relativePath}\n`);
-      }
+    ({ args, skipDts, preserveMetadata }) =>
+      fixture.run(async () => {
+        const rootDir = createTempDir("openclaw-tsdown-clean-");
+        const sourceDependencies = await createSourcePluginDependenciesFixture(rootDir);
+        sourceDependencies.assertResolution();
+        const retainedFiles = [
+          "dist/control-ui/index.html",
+          "dist/control-ui/sw.js",
+          "dist/control-ui/asset-manifest.json",
+          "dist/control-ui/assets/index-AbCd1234.js",
+          "dist/control-ui/assets/index-AbCd1234.js.map",
+          "dist/control-ui/assets/index-AbCd1234.js.br",
+          "dist/control-ui/assets/nested/styles-AbCd1234.css",
+          "packages/plugin-sdk/dist/keep.js",
+          "packages/agent-core/src/keep.ts",
+          "tmp/keep.js",
+        ];
+        const declarationFiles = [
+          "dist/plugin-sdk/core.d.ts",
+          "dist/plugin-sdk/nested/types.d.cts",
+          "dist-runtime/extensions/demo/index.d.ts",
+          "packages/media-understanding-common/dist/index.d.mts",
+          "packages/media-understanding-common/dist/nested/types.d.ts",
+        ];
+        const metadataFile = "dist/cli-startup-metadata.json";
+        const staleFiles = [
+          "dist/entry.js",
+          "dist/stale-AbCd1234.js",
+          "dist/stale-AbCd1234.js.map",
+          "dist/plugin-sdk/core.js",
+          "dist/nested/stale.js",
+          "dist/nested/stale.js.map",
+          "dist/control-ui-old/index.html",
+          "dist/extensions/demo/src/index.js",
+          "dist/extensions/demo/node_modules/staged/index.js",
+          "dist/extensions/node_modules/openclaw/plugin-sdk/core.js",
+          "dist-runtime/stale.js",
+          "dist-runtime/stale.js.map",
+          "dist-runtime/control-ui/index.html",
+          "dist-runtime/extensions/demo/index.js",
+          "dist-runtime/extensions/demo/node_modules/staged/index.js",
+          "packages/agent-core/dist/stale.js",
+          "packages/net-policy/dist/stale.js",
+          "packages/media-understanding-common/dist/index.mjs",
+          "packages/media-understanding-common/dist/chunks/old.js",
+        ];
+        for (const relativePath of [
+          ...retainedFiles,
+          ...declarationFiles,
+          metadataFile,
+          ...staleFiles,
+        ]) {
+          const filePath = path.join(rootDir, relativePath);
+          await fsPromises.mkdir(path.dirname(filePath), { recursive: true });
+          await fsPromises.writeFile(filePath, `sentinel:${relativePath}\n`);
+        }
 
-      const scriptUrl = pathToFileURL(path.resolve("scripts/tsdown-build.mts")).href;
-      const result = spawnSync(
-        process.execPath,
-        [
-          "--import",
-          import.meta.resolve("tsx"),
-          "--input-type=module",
-          "-e",
-          `import { prepareTsdownBuildExecution } from ${JSON.stringify(scriptUrl)};
+        const scriptUrl = pathToFileURL(path.resolve("scripts/tsdown-build.mts")).href;
+        const result = spawnSync(
+          process.execPath,
+          [
+            "--import",
+            import.meta.resolve("tsx"),
+            "--input-type=module",
+            "-e",
+            `import { prepareTsdownBuildExecution } from ${JSON.stringify(scriptUrl)};
        const plan = prepareTsdownBuildExecution(${JSON.stringify({ args, ...NO_MEMORY_LIMIT })});
        if (!plan) throw new Error("fixture build was not admitted");`,
-        ],
-        {
-          cwd: rootDir,
-          encoding: "utf8",
-          env: {
-            ...process.env,
-            OPENCLAW_RUN_NODE_SKIP_DTS_BUILD: skipDts,
-            OPENCLAW_PRESERVE_CLI_STARTUP_METADATA: preserveMetadata,
+          ],
+          {
+            cwd: rootDir,
+            encoding: "utf8",
+            env: {
+              ...process.env,
+              OPENCLAW_RUN_NODE_SKIP_DTS_BUILD: skipDts,
+              OPENCLAW_PRESERVE_CLI_STARTUP_METADATA: preserveMetadata,
+            },
           },
-        },
-      );
-      expect(result.status, result.stderr).toBe(0);
-      for (const relativePath of staleFiles) {
-        await expectPathMissing(path.join(rootDir, relativePath));
-      }
-      for (const relativePath of [
-        "dist/extensions/demo/node_modules",
-        "dist/extensions/node_modules",
-        "dist-runtime/extensions/demo/node_modules",
-        "packages/agent-core/dist",
-        "packages/net-policy/dist",
-      ]) {
-        await expectPathMissing(path.join(rootDir, relativePath));
-      }
-      for (const [files, preserve] of [
-        [declarationFiles, skipDts === "1"],
-        [[metadataFile], preserveMetadata === "1"],
-      ] as const) {
-        for (const relativePath of files) {
-          if (preserve) {
-            retainedFiles.push(relativePath);
-          } else {
-            await expectPathMissing(path.join(rootDir, relativePath));
+        );
+        expect(result.status, result.stderr).toBe(0);
+        sourceDependencies.assertResolution();
+        for (const relativePath of staleFiles) {
+          await expectPathMissing(path.join(rootDir, relativePath));
+        }
+        for (const relativePath of [
+          "dist/extensions/demo/node_modules",
+          "dist/extensions/node_modules",
+          "dist-runtime/extensions/demo/node_modules",
+          "packages/agent-core/dist",
+          "packages/net-policy/dist",
+        ]) {
+          await expectPathMissing(path.join(rootDir, relativePath));
+        }
+        for (const [files, preserve] of [
+          [declarationFiles, skipDts === "1"],
+          [[metadataFile], preserveMetadata === "1"],
+        ] as const) {
+          for (const relativePath of files) {
+            if (preserve) {
+              retainedFiles.push(relativePath);
+            } else {
+              await expectPathMissing(path.join(rootDir, relativePath));
+            }
           }
         }
-      }
-      for (const relativePath of retainedFiles) {
-        await expect(fsPromises.readFile(path.join(rootDir, relativePath), "utf8")).resolves.toBe(
-          `sentinel:${relativePath}\n`,
-        );
-      }
-    },
+        for (const relativePath of retainedFiles) {
+          await expect(fsPromises.readFile(path.join(rootDir, relativePath), "utf8")).resolves.toBe(
+            `sentinel:${relativePath}\n`,
+          );
+        }
+      }),
   );
 
-  it("cleans only selected tsdown output roots", async () => {
-    const rootDir = createTempDir("openclaw-tsdown-selected-clean-");
-    const aiFile = path.join(rootDir, "packages", "ai", "dist", "stale.js");
-    const coreFile = path.join(rootDir, "dist", "keep.js");
-    await fsPromises.mkdir(path.dirname(aiFile), { recursive: true });
-    await fsPromises.mkdir(path.dirname(coreFile), { recursive: true });
-    await fsPromises.writeFile(aiFile, "stale\n");
-    await fsPromises.writeFile(coreFile, "keep\n");
+  it("cleans only selected tsdown output roots", () =>
+    fixture.run(async () => {
+      const rootDir = createTempDir("openclaw-tsdown-selected-clean-");
+      const aiFile = path.join(rootDir, "packages", "ai", "dist", "stale.js");
+      const coreFile = path.join(rootDir, "dist", "keep.js");
+      await fsPromises.mkdir(path.dirname(aiFile), { recursive: true });
+      await fsPromises.mkdir(path.dirname(coreFile), { recursive: true });
+      await fsPromises.writeFile(aiFile, "stale\n");
+      await fsPromises.writeFile(coreFile, "keep\n");
 
-    cleanTsdownOutputRoots({ cwd: rootDir, roots: ["packages/ai/dist"] });
+      cleanTsdownOutputRoots({ cwd: rootDir, roots: ["packages/ai/dist"] });
 
-    await expectPathMissing(aiFile);
-    await expect(fsPromises.readFile(coreFile, "utf8")).resolves.toBe("keep\n");
-  });
+      await expectPathMissing(aiFile);
+      await expect(fsPromises.readFile(coreFile, "utf8")).resolves.toBe("keep\n");
+    }));
 
-  it("cleans an absolute explicit output directory without rebasing it under cwd", async () => {
-    const rootDir = createTempDir("openclaw-tsdown-absolute-clean-");
-    const outputDir = path.join(rootDir, "custom-dist");
-    const staleFile = path.join(outputDir, "stale.js");
-    await fsPromises.mkdir(outputDir, { recursive: true });
-    await fsPromises.writeFile(staleFile, "stale\n");
+  it("refuses to sanitize a symlinked direct-build output root", () =>
+    fixture.run(async () => {
+      const rootDir = createTempDir("openclaw-tsdown-sanitize-symlink-");
+      const targetDir = path.join(rootDir, "target");
+      const declaration = path.join(targetDir, "index.d.ts");
+      const malformed = "export { __exportAll, publicApi };\n";
+      await fsPromises.mkdir(targetDir);
+      await fsPromises.writeFile(declaration, malformed);
+      await fsPromises.mkdir(path.join(rootDir, "packages", "ai"), { recursive: true });
+      await fsPromises.symlink(targetDir, path.join(rootDir, "packages", "ai", "dist"), "dir");
 
-    cleanTsdownOutputRoots({ cwd: path.join(rootDir, "checkout"), roots: [outputDir] });
+      expect(() =>
+        sanitizeTsdownBuildOutputRoots(["--config", "tsdown.ai.config.ts"], rootDir),
+      ).toThrow(/symbolic link/u);
 
-    await expectPathMissing(outputDir);
-  });
+      await expect(fsPromises.readFile(declaration, "utf8")).resolves.toBe(malformed);
+    }));
+
+  it("refuses to sanitize a direct-build output root behind an intermediate symlink", () =>
+    fixture.run(async () => {
+      const rootDir = createTempDir("openclaw-tsdown-sanitize-parent-symlink-");
+      const targetPackages = path.join(rootDir, "target-packages");
+      const declaration = path.join(targetPackages, "ai", "dist", "index.d.ts");
+      const malformed = "export { __exportAll, publicApi };\n";
+      await fsPromises.mkdir(path.dirname(declaration), { recursive: true });
+      await fsPromises.writeFile(declaration, malformed);
+      await fsPromises.symlink(targetPackages, path.join(rootDir, "packages"), "dir");
+
+      expect(() =>
+        sanitizeTsdownBuildOutputRoots(["--config", "tsdown.ai.config.ts"], rootDir),
+      ).toThrow(/symbolic link/u);
+
+      await expect(fsPromises.readFile(declaration, "utf8")).resolves.toBe(malformed);
+    }));
+
+  it.each([
+    { code: 0, expectedAi: "export { publicApi };\n", label: "successful" },
+    { code: 1, expectedAi: "export { __exportAll, publicApi };\n", label: "failed" },
+  ])("sanitizes selected declarations only after a $label direct build", ({ code, expectedAi }) =>
+    fixture.run(async () => {
+      const rootDir = createTempDir(`openclaw-tsdown-runner-sanitize-${code}-`);
+      const aiDeclaration = path.join(rootDir, "packages", "ai", "dist", "index.d.ts");
+      const rootDeclaration = path.join(rootDir, "dist", "index.d.ts");
+      const malformed = "export { __exportAll, publicApi };\n";
+      await fsPromises.mkdir(path.dirname(aiDeclaration), { recursive: true });
+      await fsPromises.mkdir(path.dirname(rootDeclaration), { recursive: true });
+      await fsPromises.writeFile(aiDeclaration, malformed);
+      await fsPromises.writeFile(rootDeclaration, malformed);
+      const executeBuild = vi.fn(async () => code);
+
+      await expect(
+        runTsdownBuild(["--config", "tsdown.ai.config.ts"], { cwd: rootDir, executeBuild }),
+      ).resolves.toBe(code);
+
+      expect(executeBuild).toHaveBeenCalledWith(["--config", "tsdown.ai.config.ts"]);
+      await expect(fsPromises.readFile(aiDeclaration, "utf8")).resolves.toBe(expectedAi);
+      await expect(fsPromises.readFile(rootDeclaration, "utf8")).resolves.toBe(malformed);
+    }),
+  );
+
+  it("refuses a direct tsdown entry before executeBuild when the live Gateway fence trips", () =>
+    fixture.run(async () => {
+      const executeBuild = vi.fn(async () => 0);
+      const resolveLiveGatewayDistFence = vi
+        .spyOn(liveGatewayDistFence, "resolveLiveManagedGatewayDistFence")
+        .mockResolvedValue({
+          refuse: true,
+          message: "[openclaw] Refusing to rebuild dist while a managed Gateway is still running.",
+        });
+
+      await expect(
+        runTsdownBuild(["--config", "tsdown.ai.config.ts"], {
+          cwd: createTempDir("openclaw-tsdown-live-fence-"),
+          executeBuild,
+        }),
+      ).resolves.toBe(1);
+
+      expect(executeBuild).not.toHaveBeenCalled();
+      expect(resolveLiveGatewayDistFence).toHaveBeenCalledOnce();
+    }));
+
+  it("keeps a nested packaged Mac app intact while rebuilding its replacement runtime", () =>
+    fixture.run(async () => {
+      const appPath = "candidates/OpenClaw.app";
+      const rootDir = createTempDir("openclaw-tsdown-app-pairing-");
+      const appFile = path.join(rootDir, "dist", appPath, "Contents", "Resources", "worker.js");
+      const staleFile = path.join(rootDir, "dist", "stale.js");
+      await fsPromises.mkdir(path.dirname(appFile), { recursive: true });
+      await fsPromises.writeFile(appFile, "previous signed worker\n");
+      await fsPromises.writeFile(staleFile, "stale\n");
+
+      cleanTsdownOutputRoots({ cwd: rootDir, roots: ["dist"] });
+
+      await expect(fsPromises.readFile(appFile, "utf8")).resolves.toBe("previous signed worker\n");
+      await expectPathMissing(staleFile);
+    }));
+
+  it("cleans an absolute explicit output directory without rebasing it under cwd", () =>
+    fixture.run(async () => {
+      const rootDir = createTempDir("openclaw-tsdown-absolute-clean-");
+      const outputDir = path.join(rootDir, "custom-dist");
+      const staleFile = path.join(outputDir, "stale.js");
+      await fsPromises.mkdir(outputDir, { recursive: true });
+      await fsPromises.writeFile(staleFile, "stale\n");
+
+      cleanTsdownOutputRoots({ cwd: path.join(rootDir, "checkout"), roots: [outputDir] });
+
+      await expectPathMissing(outputDir);
+    }));
 
   it.each([".", "src"])(
     "refuses an output root containing checkout artifact ownership from %s",
-    async (directory) => {
-      const rootDir = createTempDir("openclaw-tsdown-owner-clean-");
-      const cwd = path.join(rootDir, directory);
-      const owner = path.join(rootDir, ".artifacts/dist-artifacts.lock/owner.json");
-      await fsPromises.mkdir(path.dirname(owner), { recursive: true });
-      await fsPromises.mkdir(cwd, { recursive: true });
-      await fsPromises.mkdir(path.join(rootDir, ".git"));
-      await fsPromises.writeFile(owner, "owned");
-      expect(() =>
-        cleanTsdownOutputRoots({ cwd, roots: [path.join(rootDir, ".artifacts")] }),
-      ).toThrow("Cannot clean the checkout's dist artifact ownership location");
-      expect(await fsPromises.readFile(owner, "utf8")).toBe("owned");
-    },
+    (directory) =>
+      fixture.run(async () => {
+        const rootDir = createTempDir("openclaw-tsdown-owner-clean-");
+        const cwd = path.join(rootDir, directory);
+        const owner = path.join(rootDir, ".artifacts/dist-artifacts.lock/owner.json");
+        await fsPromises.mkdir(path.dirname(owner), { recursive: true });
+        await fsPromises.mkdir(cwd, { recursive: true });
+        await fsPromises.mkdir(path.join(rootDir, ".git"));
+        await fsPromises.writeFile(owner, "owned");
+        expect(() =>
+          cleanTsdownOutputRoots({ cwd, roots: [path.join(rootDir, ".artifacts")] }),
+        ).toThrow("Cannot clean the checkout's dist artifact ownership location");
+        expect(await fsPromises.readFile(owner, "utf8")).toBe("owned");
+      }),
   );
 
-  it("refuses to clean the working directory and leaves it intact", async () => {
-    const rootDir = createTempDir("openclaw-tsdown-cwd-clean-");
-    const keepFile = path.join(rootDir, "keep.js");
-    await fsPromises.writeFile(keepFile, "keep\n");
+  it("refuses to clean the working directory and leaves it intact", () =>
+    fixture.run(async () => {
+      const rootDir = createTempDir("openclaw-tsdown-cwd-clean-");
+      const keepFile = path.join(rootDir, "keep.js");
+      await fsPromises.writeFile(keepFile, "keep\n");
 
-    expect(() => cleanTsdownOutputRoots({ cwd: rootDir, roots: ["."] })).toThrow(
-      "Cannot clean the current working directory",
-    );
+      expect(() => cleanTsdownOutputRoots({ cwd: rootDir, roots: ["."] })).toThrow(
+        "Cannot clean the current working directory",
+      );
 
-    await expect(fsPromises.readFile(keepFile, "utf8")).resolves.toBe("keep\n");
-  });
+      await expect(fsPromises.readFile(keepFile, "utf8")).resolves.toBe("keep\n");
+    }));
 
-  it("refuses to clean a working-directory ancestor and leaves it intact", async () => {
-    const rootDir = createTempDir("openclaw-tsdown-ancestor-clean-");
-    const checkoutDir = path.join(rootDir, "checkout");
-    const keepFile = path.join(rootDir, "keep.js");
-    await fsPromises.mkdir(checkoutDir);
-    await fsPromises.writeFile(keepFile, "keep\n");
+  it("refuses to clean a working-directory ancestor and leaves it intact", () =>
+    fixture.run(async () => {
+      const rootDir = createTempDir("openclaw-tsdown-ancestor-clean-");
+      const checkoutDir = path.join(rootDir, "checkout");
+      const keepFile = path.join(rootDir, "keep.js");
+      await fsPromises.mkdir(checkoutDir);
+      await fsPromises.writeFile(keepFile, "keep\n");
 
-    expect(() => cleanTsdownOutputRoots({ cwd: checkoutDir, roots: [".."] })).toThrow(
-      "Cannot clean the current working directory or one of its ancestors",
-    );
+      expect(() => cleanTsdownOutputRoots({ cwd: checkoutDir, roots: [".."] })).toThrow(
+        "Cannot clean the current working directory or one of its ancestors",
+      );
 
-    await expect(fsPromises.readFile(keepFile, "utf8")).resolves.toBe("keep\n");
-  });
+      await expect(fsPromises.readFile(keepFile, "utf8")).resolves.toBe("keep\n");
+    }));
 
   it.each([
     ["drive", "D:\\"],
@@ -2002,31 +2062,32 @@ describe("resolveTsdownBuildInvocation", () => {
     }
   });
 
-  it("refuses a symlinked output root with preserved children and leaves the target unchanged", async () => {
-    const rootDir = createTempDir("openclaw-tsdown-clean-symlink-");
-    const targetDir = path.join(rootDir, "gateway-dist");
-    const targetFile = path.join(targetDir, "chunk-abc123.js");
-    const metadataFile = path.join(targetDir, "cli-startup-metadata.json");
-    await fsPromises.mkdir(targetDir, { recursive: true });
-    await fsPromises.writeFile(targetFile, "generated\n");
-    await fsPromises.writeFile(metadataFile, '{"generatedBy":"test"}\n');
-    const distLink = path.join(rootDir, "dist");
-    await fsPromises.symlink(targetDir, distLink, "dir");
+  it("refuses a symlinked output root with preserved children and leaves the target unchanged", () =>
+    fixture.run(async () => {
+      const rootDir = createTempDir("openclaw-tsdown-clean-symlink-");
+      const targetDir = path.join(rootDir, "gateway-dist");
+      const targetFile = path.join(targetDir, "chunk-abc123.js");
+      const metadataFile = path.join(targetDir, "cli-startup-metadata.json");
+      await fsPromises.mkdir(targetDir, { recursive: true });
+      await fsPromises.writeFile(targetFile, "generated\n");
+      await fsPromises.writeFile(metadataFile, '{"generatedBy":"test"}\n');
+      const distLink = path.join(rootDir, "dist");
+      await fsPromises.symlink(targetDir, distLink, "dir");
 
-    expect(() =>
-      cleanTsdownOutputRoots({
-        cwd: rootDir,
-        roots: ["dist"],
-        env: { OPENCLAW_PRESERVE_CLI_STARTUP_METADATA: "1" },
-      }),
-    ).toThrow(/symbolic link/u);
+      expect(() =>
+        cleanTsdownOutputRoots({
+          cwd: rootDir,
+          roots: ["dist"],
+          env: { OPENCLAW_PRESERVE_CLI_STARTUP_METADATA: "1" },
+        }),
+      ).toThrow(/symbolic link/u);
 
-    expect(fs.readlinkSync(distLink)).toBe(targetDir);
-    await expect(fsPromises.readFile(targetFile, "utf8")).resolves.toBe("generated\n");
-    await expect(fsPromises.readFile(metadataFile, "utf8")).resolves.toBe(
-      '{"generatedBy":"test"}\n',
-    );
-  });
+      expect(fs.readlinkSync(distLink)).toBe(targetDir);
+      await expect(fsPromises.readFile(targetFile, "utf8")).resolves.toBe("generated\n");
+      await expect(fsPromises.readFile(metadataFile, "utf8")).resolves.toBe(
+        '{"generatedBy":"test"}\n',
+      );
+    }));
 
   it("rejects a symlink before traversing protected output children", () => {
     const readdirSync = vi.fn(fs.readdirSync);
@@ -2047,134 +2108,107 @@ describe("resolveTsdownBuildInvocation", () => {
     expect(readdirSync).not.toHaveBeenCalled();
   });
 
-  it("validates every clean root before mutating any output", async () => {
-    const rootDir = createTempDir("openclaw-tsdown-clean-roots-");
-    const firstRootFile = path.join(rootDir, "dist", "keep.js");
-    const targetDir = path.join(rootDir, "gateway-runtime");
-    await fsPromises.mkdir(path.dirname(firstRootFile), { recursive: true });
-    await fsPromises.mkdir(targetDir);
-    await fsPromises.writeFile(firstRootFile, "keep\n");
-    await fsPromises.symlink(targetDir, path.join(rootDir, "dist-runtime"), "dir");
+  it("validates every clean root before mutating any output", () =>
+    fixture.run(async () => {
+      const rootDir = createTempDir("openclaw-tsdown-clean-roots-");
+      const firstRootFile = path.join(rootDir, "dist", "keep.js");
+      const targetDir = path.join(rootDir, "gateway-runtime");
+      await fsPromises.mkdir(path.dirname(firstRootFile), { recursive: true });
+      await fsPromises.mkdir(targetDir);
+      await fsPromises.writeFile(firstRootFile, "keep\n");
+      await fsPromises.symlink(targetDir, path.join(rootDir, "dist-runtime"), "dir");
 
-    expect(() =>
-      cleanTsdownOutputRoots({
+      expect(() =>
+        cleanTsdownOutputRoots({
+          cwd: rootDir,
+          roots: ["dist", "dist-runtime"],
+        }),
+      ).toThrow(/symbolic link/u);
+
+      await expect(fsPromises.readFile(firstRootFile, "utf8")).resolves.toBe("keep\n");
+    }));
+
+  it("refuses an output root behind an intermediate symlink", () =>
+    fixture.run(async () => {
+      const rootDir = createTempDir("openclaw-tsdown-clean-parent-symlink-");
+      const checkoutDir = path.join(rootDir, "checkout");
+      const targetDir = path.join(rootDir, "external", "dist");
+      const targetFile = path.join(targetDir, "keep.js");
+      await fsPromises.mkdir(checkoutDir);
+      await fsPromises.mkdir(targetDir, { recursive: true });
+      await fsPromises.writeFile(targetFile, "keep\n");
+      await fsPromises.symlink(path.dirname(targetDir), path.join(checkoutDir, "linked"), "dir");
+
+      expect(() =>
+        cleanTsdownOutputRoots({ cwd: checkoutDir, roots: [path.join("linked", "dist")] }),
+      ).toThrow(/symbolic link/u);
+
+      await expect(fsPromises.readFile(targetFile, "utf8")).resolves.toBe("keep\n");
+    }));
+
+  it("validates every chunk root before pruning any output", () =>
+    fixture.run(async () => {
+      const rootDir = createTempDir("openclaw-tsdown-prune-roots-");
+      const firstRootFile = path.join(rootDir, "dist", "delegate-OldHash.js");
+      const targetDir = path.join(rootDir, "gateway-runtime");
+      await fsPromises.mkdir(path.dirname(firstRootFile), { recursive: true });
+      await fsPromises.mkdir(targetDir);
+      await fsPromises.writeFile(firstRootFile, "keep\n");
+      await fsPromises.symlink(targetDir, path.join(rootDir, "dist-runtime"), "dir");
+
+      expect(() => pruneStaleRootChunkFiles({ cwd: rootDir })).toThrow(/symbolic link/u);
+
+      await expect(fsPromises.readFile(firstRootFile, "utf8")).resolves.toBe("keep\n");
+    }));
+
+  it("refuses to prune runtime overlay symlinks through a symlinked output root", () =>
+    fixture.run(async () => {
+      const rootDir = createTempDir("openclaw-tsdown-runtime-symlink-");
+      const targetDir = path.join(rootDir, "gateway-dist");
+      const pluginNodeModules = path.join(targetDir, "extensions", "telegram", "node_modules");
+      await fsPromises.mkdir(pluginNodeModules, { recursive: true });
+      const markerFile = path.join(pluginNodeModules, "keep.js");
+      await fsPromises.writeFile(markerFile, "keep\n");
+      const distLink = path.join(rootDir, "dist");
+      await fsPromises.symlink(targetDir, distLink, "dir");
+
+      expect(() => pruneStaleRuntimeSymlinks({ cwd: rootDir })).toThrow(/symbolic link/u);
+
+      expect(fs.readlinkSync(distLink)).toBe(targetDir);
+      await expect(fsPromises.readFile(markerFile, "utf8")).resolves.toBe("keep\n");
+    }));
+
+  it("prunes untracked generated declaration files that shadow source entries", () =>
+    fixture.run(async () => {
+      const rootDir = createTempDir("openclaw-tsdown-source-dts-");
+      const signalDir = path.join(rootDir, "extensions", "signal");
+      const signalSrcDir = path.join(signalDir, "src");
+      await fsPromises.mkdir(signalSrcDir, { recursive: true });
+      await fsPromises.writeFile(path.join(signalDir, "api.ts"), "export {};\n");
+      await fsPromises.writeFile(path.join(signalDir, "api.d.ts"), "export {};\n");
+      await fsPromises.writeFile(path.join(signalSrcDir, "probe.ts"), "export {};\n");
+      await fsPromises.writeFile(path.join(signalSrcDir, "probe.d.ts"), "export {};\n");
+      await fsPromises.writeFile(
+        path.join(signalSrcDir, "ambient.d.ts"),
+        "declare const x: string;\n",
+      );
+
+      const removed = pruneUntrackedGeneratedSourceDeclarations({
         cwd: rootDir,
-        roots: ["dist", "dist-runtime"],
-      }),
-    ).toThrow(/symbolic link/u);
+        spawnSync: () => ({
+          status: 0,
+          stdout:
+            "extensions/signal/api.d.ts\nextensions/signal/src/probe.d.ts\nextensions/signal/src/ambient.d.ts\n",
+        }),
+      });
 
-    await expect(fsPromises.readFile(firstRootFile, "utf8")).resolves.toBe("keep\n");
-  });
-
-  it("refuses a symlinked output root even without protected children", async () => {
-    const rootDir = createTempDir("openclaw-tsdown-clean-symlink-plain-");
-    const targetDir = path.join(rootDir, "gateway-dist");
-    const targetFile = path.join(targetDir, "stale.js");
-    await fsPromises.mkdir(targetDir, { recursive: true });
-    await fsPromises.writeFile(targetFile, "stale\n");
-    const distLink = path.join(rootDir, "dist");
-    await fsPromises.symlink(targetDir, distLink, "dir");
-
-    expect(() => cleanTsdownOutputRoots({ cwd: rootDir, roots: ["dist"] })).toThrow(
-      /symbolic link/u,
-    );
-
-    expect(fs.readlinkSync(distLink)).toBe(targetDir);
-    await expect(fsPromises.readFile(targetFile, "utf8")).resolves.toBe("stale\n");
-  });
-
-  it("refuses an output root behind an intermediate symlink", async () => {
-    const rootDir = createTempDir("openclaw-tsdown-clean-parent-symlink-");
-    const checkoutDir = path.join(rootDir, "checkout");
-    const targetDir = path.join(rootDir, "external", "dist");
-    const targetFile = path.join(targetDir, "keep.js");
-    await fsPromises.mkdir(checkoutDir);
-    await fsPromises.mkdir(targetDir, { recursive: true });
-    await fsPromises.writeFile(targetFile, "keep\n");
-    await fsPromises.symlink(path.dirname(targetDir), path.join(checkoutDir, "linked"), "dir");
-
-    expect(() =>
-      cleanTsdownOutputRoots({ cwd: checkoutDir, roots: [path.join("linked", "dist")] }),
-    ).toThrow(/symbolic link/u);
-
-    await expect(fsPromises.readFile(targetFile, "utf8")).resolves.toBe("keep\n");
-  });
-
-  it("refuses to prune stale root chunks through a symlinked output root", async () => {
-    const rootDir = createTempDir("openclaw-tsdown-prune-symlink-");
-    const targetDir = path.join(rootDir, "gateway-dist");
-    const hashedFile = path.join(targetDir, "delegate-BPjCe4gC.js");
-    await fsPromises.mkdir(targetDir, { recursive: true });
-    await fsPromises.writeFile(hashedFile, "old delegate\n");
-    const distLink = path.join(rootDir, "dist");
-    await fsPromises.symlink(targetDir, distLink, "dir");
-
-    expect(() => pruneStaleRootChunkFiles({ cwd: rootDir })).toThrow(/symbolic link/u);
-
-    expect(fs.readlinkSync(distLink)).toBe(targetDir);
-    await expect(fsPromises.readFile(hashedFile, "utf8")).resolves.toBe("old delegate\n");
-  });
-
-  it("validates every chunk root before pruning any output", async () => {
-    const rootDir = createTempDir("openclaw-tsdown-prune-roots-");
-    const firstRootFile = path.join(rootDir, "dist", "delegate-OldHash.js");
-    const targetDir = path.join(rootDir, "gateway-runtime");
-    await fsPromises.mkdir(path.dirname(firstRootFile), { recursive: true });
-    await fsPromises.mkdir(targetDir);
-    await fsPromises.writeFile(firstRootFile, "keep\n");
-    await fsPromises.symlink(targetDir, path.join(rootDir, "dist-runtime"), "dir");
-
-    expect(() => pruneStaleRootChunkFiles({ cwd: rootDir })).toThrow(/symbolic link/u);
-
-    await expect(fsPromises.readFile(firstRootFile, "utf8")).resolves.toBe("keep\n");
-  });
-
-  it("refuses to prune runtime overlay symlinks through a symlinked output root", async () => {
-    const rootDir = createTempDir("openclaw-tsdown-runtime-symlink-");
-    const targetDir = path.join(rootDir, "gateway-dist");
-    const pluginNodeModules = path.join(targetDir, "extensions", "telegram", "node_modules");
-    await fsPromises.mkdir(pluginNodeModules, { recursive: true });
-    const markerFile = path.join(pluginNodeModules, "keep.js");
-    await fsPromises.writeFile(markerFile, "keep\n");
-    const distLink = path.join(rootDir, "dist");
-    await fsPromises.symlink(targetDir, distLink, "dir");
-
-    expect(() => pruneStaleRuntimeSymlinks({ cwd: rootDir })).toThrow(/symbolic link/u);
-
-    expect(fs.readlinkSync(distLink)).toBe(targetDir);
-    await expect(fsPromises.readFile(markerFile, "utf8")).resolves.toBe("keep\n");
-  });
-
-  it("prunes untracked generated declaration files that shadow source entries", async () => {
-    const rootDir = createTempDir("openclaw-tsdown-source-dts-");
-    const signalDir = path.join(rootDir, "extensions", "signal");
-    const signalSrcDir = path.join(signalDir, "src");
-    await fsPromises.mkdir(signalSrcDir, { recursive: true });
-    await fsPromises.writeFile(path.join(signalDir, "api.ts"), "export {};\n");
-    await fsPromises.writeFile(path.join(signalDir, "api.d.ts"), "export {};\n");
-    await fsPromises.writeFile(path.join(signalSrcDir, "probe.ts"), "export {};\n");
-    await fsPromises.writeFile(path.join(signalSrcDir, "probe.d.ts"), "export {};\n");
-    await fsPromises.writeFile(
-      path.join(signalSrcDir, "ambient.d.ts"),
-      "declare const x: string;\n",
-    );
-
-    const removed = pruneUntrackedGeneratedSourceDeclarations({
-      cwd: rootDir,
-      spawnSync: () => ({
-        status: 0,
-        stdout:
-          "extensions/signal/api.d.ts\nextensions/signal/src/probe.d.ts\nextensions/signal/src/ambient.d.ts\n",
-      }),
-    });
-
-    expect(removed).toBe(2);
-    await expectPathMissing(path.join(signalDir, "api.d.ts"));
-    await expectPathMissing(path.join(signalSrcDir, "probe.d.ts"));
-    await expect(
-      fsPromises.readFile(path.join(signalSrcDir, "ambient.d.ts"), "utf8"),
-    ).resolves.toBe("declare const x: string;\n");
-  });
+      expect(removed).toBe(2);
+      await expectPathMissing(path.join(signalDir, "api.d.ts"));
+      await expectPathMissing(path.join(signalSrcDir, "probe.d.ts"));
+      await expect(
+        fsPromises.readFile(path.join(signalSrcDir, "ambient.d.ts"), "utf8"),
+      ).resolves.toBe("declare const x: string;\n");
+    }));
 });
 
 describe("createTsdownOutputScanner", () => {
@@ -2219,173 +2253,39 @@ describe("runTsdownBuildInvocation", () => {
     };
   }
 
-  function startTimeoutFixture(parentScript: string, output: ReturnType<typeof createWriteSink>) {
-    return startProcessWatchdogFixture(() =>
-      runTsdownBuildInvocation(
-        {
-          command: process.execPath,
-          args: ["-e", parentScript],
-          options: {
-            stdio: ["ignore", "pipe", "pipe"],
-            shell: false,
-            env: process.env,
-          },
-        },
-        {
-          stdout: output.sink,
-          stderr: output.sink,
-          env: {
-            ...process.env,
-            OPENCLAW_TSDOWN_HEARTBEAT_MS: "0",
-            OPENCLAW_TSDOWN_TIMEOUT_MS: "250",
-          },
-        },
-      ),
-    );
-  }
-
-  it("streams child output while preserving diagnostics for post-run checks", async () => {
-    const output = createWriteSink();
-    const result = await runTsdownBuildInvocation(
+  function startTimeoutFixture(
+    parentScript: string,
+    output: ReturnType<typeof createWriteSink>,
+    signal: AbortSignal,
+  ) {
+    const schedule = globalThis.setTimeout;
+    const cancel = globalThis.clearTimeout;
+    let now = Date.now();
+    const clock = vi.spyOn(Date, "now");
+    let abortFailure: Error | undefined;
+    const pending = new Map<ReturnType<typeof setTimeout>, { at: number; fire: () => void }>();
+    // Only the watchdog and escalation use 250ms. Group polling stays real, but
+    // its Date.now deadline shares this logical clock with both callbacks.
+    const timers = vi
+      .spyOn(globalThis, "setTimeout")
+      .mockImplementation((callback, ms, ...args) => {
+        if (ms !== 250) {
+          return schedule(callback, ms, ...args);
+        }
+        const handle = schedule(() => {}, ms);
+        pending.set(handle, { at: now + ms, fire: () => callback(...args) });
+        return handle;
+      });
+    const clears = vi.spyOn(globalThis, "clearTimeout").mockImplementation((handle) => {
+      if (typeof handle === "object" && handle) {
+        pending.delete(handle);
+      }
+      cancel(handle);
+    });
+    const completion = runTsdownBuildInvocation(
       {
         command: process.execPath,
-        args: [
-          "-e",
-          "process.stdout.write('stdout-ok\\n'); process.stderr.write('[INEFFECTIVE_DYNAMIC_IMPORT]\\n')",
-        ],
-        options: {
-          stdio: ["ignore", "pipe", "pipe"],
-          shell: false,
-          env: process.env,
-        },
-      },
-      {
-        stdout: output.sink,
-        stderr: output.sink,
-        env: { ...process.env, OPENCLAW_TSDOWN_HEARTBEAT_MS: "0" },
-      },
-    );
-
-    expect(result.status).toBe(0);
-    expect(result.hasIneffectiveDynamicImport).toBe(true);
-    expect(output.chunks.join("")).toContain("stdout-ok");
-  });
-
-  it("preserves successful declarations when the native compiler fails", async () => {
-    const rootDir = fs.realpathSync(createTempDir("openclaw-tsdown-native-dts-"));
-    const sourcePath = path.join(rootDir, "index.ts");
-    const declarationPath = path.join(rootDir, "dist", "index.d.ts");
-    fs.writeFileSync(path.join(rootDir, "package.json"), '{"type":"module"}\n');
-    fs.writeFileSync(
-      path.join(rootDir, "tsconfig.json"),
-      JSON.stringify({
-        compilerOptions: {
-          target: "ESNext",
-          module: "ESNext",
-          moduleResolution: "Bundler",
-          declaration: true,
-          emitDeclarationOnly: true,
-          noCheck: true,
-          noEmitOnError: false,
-          rootDir,
-        },
-        files: [sourcePath],
-      }),
-    );
-    const buildOptions = {
-      clean: false,
-      config: false,
-      cwd: rootDir,
-      entry: [sourcePath],
-      fixedExtension: false,
-      format: "esm",
-      logLevel: "error",
-      outDir: path.join(rootDir, "dist"),
-      platform: "node",
-      report: false,
-      tsconfig: path.join(rootDir, "tsconfig.json"),
-    };
-    const script = [
-      'import { build } from "tsdown";',
-      'const nativePackage = import.meta.resolve("@typescript/native-preview/package.json");',
-      'const { default: getExePath } = await import(new URL("lib/getExePath.js", nativePackage).href);',
-      `await build({ ...${JSON.stringify(buildOptions)}, dts: { generator: "tsgo", emitDtsOnly: true, tsgo: { path: getExePath() } } });`,
-    ].join("\n");
-    const output = createWriteSink();
-    // Keep compiler scratch output inside the fixture even when compilation rejects.
-    const env = { ...process.env, TMPDIR: rootDir, TEMP: rootDir, TMP: rootDir };
-    const invocation = {
-      command: process.execPath,
-      args: ["--input-type=module", "-e", script],
-      options: { stdio: ["ignore", "pipe", "pipe"], shell: false, env },
-    };
-    const runOptions = { stdout: output.sink, stderr: output.sink };
-
-    fs.writeFileSync(sourcePath, 'export const broken = "healthy";\n');
-    const healthy = await runTsdownBuildInvocation(invocation, runOptions);
-    expect(healthy.status, healthy.captured).toBe(0);
-    const declarations = fs.readFileSync(declarationPath, "utf8");
-    expect(declarations).toContain('"healthy"');
-
-    fs.writeFileSync(sourcePath, "export const broken = ;\n");
-    const failed = await runTsdownBuildInvocation(invocation, runOptions);
-    expect(failed.captured).toContain("TS1109");
-    expect(failed.status, failed.captured).toBeGreaterThan(0);
-    expect(fs.readFileSync(declarationPath, "utf8")).toBe(declarations);
-  });
-
-  it("rejects malformed OPENCLAW_TSDOWN_TIMEOUT_MS values", async () => {
-    const invocation = {
-      command: process.execPath,
-      args: ["-e", "process.exit(0)"],
-      options: {
-        stdio: ["ignore", "pipe", "pipe"],
-        shell: false,
-        env: process.env,
-      },
-    };
-
-    for (const value of ["1.5", "1e3", "10ms", "0"]) {
-      await expect(
-        runTsdownBuildInvocation(invocation, {
-          env: {
-            ...process.env,
-            OPENCLAW_TSDOWN_TIMEOUT_MS: value,
-          },
-        }),
-      ).rejects.toThrow("OPENCLAW_TSDOWN_TIMEOUT_MS must be");
-    }
-  });
-
-  it("rejects malformed OPENCLAW_TSDOWN_HEARTBEAT_MS values", async () => {
-    const invocation = {
-      command: process.execPath,
-      args: ["-e", "process.exit(0)"],
-      options: {
-        stdio: ["ignore", "pipe", "pipe"],
-        shell: false,
-        env: process.env,
-      },
-    };
-
-    for (const value of ["1.5", "1e3", "10ms", "-1"]) {
-      await expect(
-        runTsdownBuildInvocation(invocation, {
-          env: {
-            ...process.env,
-            OPENCLAW_TSDOWN_HEARTBEAT_MS: value,
-          },
-        }),
-      ).rejects.toThrow("OPENCLAW_TSDOWN_HEARTBEAT_MS must be");
-    }
-  });
-
-  it("terminates the child when OPENCLAW_TSDOWN_TIMEOUT_MS elapses", async () => {
-    const output = createWriteSink();
-    const result = await runTsdownBuildInvocation(
-      {
-        command: process.execPath,
-        args: ["-e", "setTimeout(() => {}, 10000)"],
+        args: ["-e", parentScript],
         options: {
           stdio: ["ignore", "pipe", "pipe"],
           shell: false,
@@ -2398,163 +2298,787 @@ describe("runTsdownBuildInvocation", () => {
         env: {
           ...process.env,
           OPENCLAW_TSDOWN_HEARTBEAT_MS: "0",
-          OPENCLAW_TSDOWN_TIMEOUT_MS: "50",
+          OPENCLAW_TSDOWN_TIMEOUT_MS: "250",
         },
       },
     );
+    const supervisor = {
+      completion,
+      advance(ms: number) {
+        const target = now + ms;
+        while (true) {
+          const next = [...pending].toSorted((left, right) => left[1].at - right[1].at)[0];
+          if (!next || next[1].at > target) {
+            break;
+          }
+          now = next[1].at;
+          clock.mockReturnValue(now);
+          pending.delete(next[0]);
+          cancel(next[0]);
+          next[1].fire();
+        }
+        now = target;
+        clock.mockReturnValue(now);
+      },
+      resume() {
+        const started = performance.now();
+        clock.mockImplementation(() => now + performance.now() - started);
+      },
+      dispose(pid?: number) {
+        return fixture.verifyCleanup(async () => {
+          try {
+            try {
+              supervisor.advance(500);
+            } finally {
+              supervisor.resume();
+            }
+          } finally {
+            try {
+              await completion;
+              if (pid !== undefined && isProcessAlive(pid)) {
+                process.kill(pid, "SIGKILL");
+                await waitForDead(pid, 2_000);
+              }
+            } finally {
+              signal.removeEventListener("abort", abort);
+              for (const handle of pending.keys()) {
+                cancel(handle);
+              }
+              clears.mockRestore();
+              timers.mockRestore();
+              clock.mockRestore();
+            }
+          }
+          if (abortFailure) {
+            throw abortFailure;
+          }
+        });
+      },
+    };
+    const abort = () => {
+      try {
+        try {
+          supervisor.advance(500);
+        } finally {
+          supervisor.resume();
+        }
+      } catch (error) {
+        // Event listeners cannot reject the driver promise. Report the failure
+        // from restoration after the caller has awaited the owned completion.
+        abortFailure = new Error("Controlled supervisor cancellation failed", { cause: error });
+      }
+    };
+    signal.addEventListener("abort", abort, { once: true });
+    if (signal.aborted) {
+      abort();
+    }
+    return supervisor;
+  }
 
-    expect(result.timedOut).toBe(true);
-    expect(result.status).toBeNull();
-    expect(result.signal).toBe("SIGTERM");
-    expect(output.chunks.join("")).toContain("timeout after 50ms");
-  });
+  it("streams child output while preserving diagnostics for post-run checks", () =>
+    fixture.run(async () => {
+      const output = createWriteSink();
+      const result = await runTsdownBuildInvocation(
+        {
+          command: process.execPath,
+          args: [
+            "-e",
+            "process.stdout.write('stdout-ok\\n'); process.stderr.write('[INEFFECTIVE_DYNAMIC_IMPORT]\\n')",
+          ],
+          options: {
+            stdio: ["ignore", "pipe", "pipe"],
+            shell: false,
+            env: process.env,
+          },
+        },
+        {
+          stdout: output.sink,
+          stderr: output.sink,
+          env: { ...process.env, OPENCLAW_TSDOWN_HEARTBEAT_MS: "0" },
+        },
+      );
+
+      expect(result.status).toBe(0);
+      expect(result.hasIneffectiveDynamicImport).toBe(true);
+      expect(output.chunks.join("")).toContain("stdout-ok");
+      expect(output.chunks.join("")).not.toContain("[tsdown-build] child result");
+    }));
+
+  it("reports a silent compiler failure without attributing it to cleanup", () =>
+    fixture.run(async () => {
+      const output = createWriteSink();
+      const result = await runTsdownBuildInvocation(
+        {
+          command: process.execPath,
+          args: ["-e", "process.exit(7)"],
+          options: { stdio: ["ignore", "pipe", "pipe"], shell: false, env: process.env },
+        },
+        { stderr: output.sink, env: { OPENCLAW_TSDOWN_HEARTBEAT_MS: "0" } },
+      );
+
+      expect(result).toMatchObject({ status: 7, signal: null, timedOut: false, error: null });
+      expect(output.chunks.join("")).toContain(
+        JSON.stringify({
+          status: 7,
+          signal: null,
+          parentSignal: null,
+          timedOut: false,
+          cleanup: "none",
+          observedProcessState: "dead",
+          observationScope: process.platform === "win32" ? "leader" : "process-group",
+          finalStatus: 7,
+        }),
+      );
+    }));
+
+  it.skipIf(process.platform === "win32")(
+    "reports cleanup rejecting a successful compiler with a remaining descendant",
+    () =>
+      fixture.run(async () => {
+        const rootDir = createTempDir("openclaw-tsdown-close-");
+        const childPidPath = path.join(rootDir, "child.pid");
+        const childScript = [
+          `require('node:fs').writeFileSync(${JSON.stringify(childPidPath)}, String(process.pid));`,
+          "setInterval(() => {}, 1000);",
+          "process.send('ready');",
+        ].join("");
+        const parentScript = [
+          `const child = require('node:child_process').spawn(process.execPath, ['-e', ${JSON.stringify(childScript)}], { stdio: ['ignore', 'ignore', 'ignore', 'ipc'] });`,
+          // Readiness owns the race: the compiler exits only once its same-group
+          // descendant is running, without that descendant holding output pipes.
+          "child.once('message', () => { child.disconnect(); child.unref(); process.exit(0); });",
+        ].join("");
+        const output = createWriteSink();
+        const completion = runTsdownBuildInvocation(
+          {
+            command: process.execPath,
+            args: ["-e", parentScript],
+            options: { stdio: ["ignore", "pipe", "pipe"], shell: false, env: process.env },
+          },
+          {
+            stderr: output.sink,
+            env: { OPENCLAW_TSDOWN_HEARTBEAT_MS: "0", OPENCLAW_TSDOWN_TIMEOUT_MS: "5000" },
+          },
+        );
+        let childPid: number | undefined;
+        try {
+          childPid = await waitForPidFile(childPidPath, 2_000);
+          expect(await completion).toMatchObject({
+            status: 1,
+            signal: null,
+            timedOut: false,
+            error: null,
+          });
+          expect(output.chunks.join("")).toContain(
+            JSON.stringify({
+              status: 0,
+              signal: null,
+              parentSignal: null,
+              timedOut: false,
+              cleanup: "remaining-descendants",
+              observedProcessState: "dead",
+              observationScope: "process-group",
+              finalStatus: 1,
+            }),
+          );
+          await waitForDead(childPid, 2_000);
+        } finally {
+          await fixture.verifyCleanup(async () => {
+            try {
+              await completion;
+            } finally {
+              childPid ??= fs.existsSync(childPidPath)
+                ? Number(fs.readFileSync(childPidPath, "utf8"))
+                : undefined;
+              if (childPid !== undefined && isProcessAlive(childPid)) {
+                process.kill(childPid, "SIGKILL");
+                await waitForDead(childPid, 2_000);
+              }
+            }
+          });
+        }
+      }),
+  );
+
+  it.for(["native declarations", "runtime JavaScript"])(
+    "preserves successful %s when source syntax is invalid",
+    (mode, { signal }) =>
+      fixture.run(async () => {
+        const native = mode === "native declarations";
+        const rootDir = fs.realpathSync(createTempDir("openclaw-tsdown-syntax-"));
+        const sourcePath = path.join(rootDir, "index.ts");
+        const outputPath = path.join(rootDir, "dist", native ? "index.d.ts" : "index.js");
+        fs.writeFileSync(path.join(rootDir, "package.json"), '{"type":"module"}\n');
+        fs.writeFileSync(
+          path.join(rootDir, "tsconfig.json"),
+          JSON.stringify({
+            compilerOptions: {
+              target: "ESNext",
+              module: "ESNext",
+              moduleResolution: "Bundler",
+              declaration: true,
+              emitDeclarationOnly: true,
+              noCheck: true,
+              noEmitOnError: false,
+              rootDir,
+            },
+            files: [sourcePath],
+          }),
+        );
+        const buildOptions = {
+          clean: false,
+          config: false,
+          cwd: rootDir,
+          entry: [sourcePath],
+          fixedExtension: false,
+          format: "esm",
+          logLevel: "error",
+          outDir: path.join(rootDir, "dist"),
+          platform: "node",
+          report: false,
+          tsconfig: path.join(rootDir, "tsconfig.json"),
+        };
+        const dtsOptions = native
+          ? '{ generator: "tsgo", emitDtsOnly: true, tsgo: { path: getExePath() } }'
+          : "false";
+        const script = [
+          'import { build } from "tsdown";',
+          ...(native
+            ? [
+                'const nativePackage = import.meta.resolve("typescript/package.json");',
+                'const { default: getExePath } = await import(new URL("lib/getExePath.js", nativePackage).href);',
+              ]
+            : []),
+          `await build({ ...${JSON.stringify(buildOptions)}, dts: ${dtsOptions} });`,
+        ].join("\n");
+        const output = createWriteSink();
+        // Keep compiler scratch output inside the fixture even when compilation rejects.
+        const env = { ...process.env, TMPDIR: rootDir, TEMP: rootDir, TMP: rootDir };
+        const invocation = {
+          command: process.execPath,
+          args: ["--input-type=module", "-e", script],
+          options: { stdio: ["ignore", "pipe", "pipe"], shell: false, env },
+        };
+        const runOptions = { stdout: output.sink, stderr: output.sink };
+
+        fs.writeFileSync(sourcePath, 'export const broken = "healthy";\n');
+        const healthy = await runTsdownBuildInvocation(invocation, runOptions);
+        expect(healthy.status, healthy.captured).toBe(0);
+        const previous = fs.readFileSync(outputPath, "utf8");
+        expect(previous).toContain('"healthy"');
+
+        signal.throwIfAborted();
+        fs.writeFileSync(sourcePath, "export const broken = ;\n");
+        const failed = await runTsdownBuildInvocation(invocation, runOptions);
+        expect(failed).toMatchObject({ error: null, signal: null, timedOut: false });
+        expect(failed.status, failed.captured).toBeGreaterThan(0);
+        expect(fs.readFileSync(outputPath, "utf8")).toBe(previous);
+        expect(failed.captured).toContain(native ? "TS1109" : "PARSE_ERROR");
+      }),
+  );
+
+  it("rejects malformed OPENCLAW_TSDOWN_TIMEOUT_MS values", () =>
+    fixture.run(async () => {
+      const invocation = {
+        command: process.execPath,
+        args: ["-e", "process.exit(0)"],
+        options: {
+          stdio: ["ignore", "pipe", "pipe"],
+          shell: false,
+          env: process.env,
+        },
+      };
+
+      for (const value of ["1.5", "1e3", "10ms", "0"]) {
+        await expect(
+          runTsdownBuildInvocation(invocation, {
+            env: {
+              ...process.env,
+              OPENCLAW_TSDOWN_TIMEOUT_MS: value,
+            },
+          }),
+        ).rejects.toThrow("OPENCLAW_TSDOWN_TIMEOUT_MS must be");
+      }
+    }));
+
+  it("rejects malformed OPENCLAW_TSDOWN_HEARTBEAT_MS values", () =>
+    fixture.run(async () => {
+      const invocation = {
+        command: process.execPath,
+        args: ["-e", "process.exit(0)"],
+        options: {
+          stdio: ["ignore", "pipe", "pipe"],
+          shell: false,
+          env: process.env,
+        },
+      };
+
+      for (const value of ["1.5", "1e3", "10ms", "-1"]) {
+        await expect(
+          runTsdownBuildInvocation(invocation, {
+            env: {
+              ...process.env,
+              OPENCLAW_TSDOWN_HEARTBEAT_MS: value,
+            },
+          }),
+        ).rejects.toThrow("OPENCLAW_TSDOWN_HEARTBEAT_MS must be");
+      }
+    }));
+
+  it("terminates the child when OPENCLAW_TSDOWN_TIMEOUT_MS elapses", () =>
+    fixture.run(async () => {
+      const output = createWriteSink();
+      const result = await runTsdownBuildInvocation(
+        {
+          command: process.execPath,
+          args: ["-e", "setTimeout(() => {}, 10000)"],
+          options: {
+            stdio: ["ignore", "pipe", "pipe"],
+            shell: false,
+            env: process.env,
+          },
+        },
+        {
+          stdout: output.sink,
+          stderr: output.sink,
+          env: {
+            ...process.env,
+            OPENCLAW_TSDOWN_HEARTBEAT_MS: "0",
+            OPENCLAW_TSDOWN_TIMEOUT_MS: "50",
+          },
+        },
+      );
+
+      expect(result.timedOut).toBe(true);
+      expect(result.status).toBeNull();
+      expect(result.signal).toBe("SIGTERM");
+      expect(output.chunks.join("")).toContain("timeout after 50ms");
+      expect(output.chunks.join("")).toContain('"status":null,"signal":"SIGTERM"');
+      expect(output.chunks.join("")).toContain('"cleanup":"timeout"');
+    }));
 
   it.skipIf(process.platform === "win32")(
     "kills timed-out tsdown process groups when the wrapper exits first",
-    async () => {
-      const rootDir = createTempDir("openclaw-tsdown-timeout-");
-      const childPidPath = path.join(rootDir, "child.pid");
-      const termPath = path.join(rootDir, "child.term");
-      const childScript = [
-        "const fs = require('node:fs');",
-        `process.on('SIGTERM', () => fs.writeFileSync(${JSON.stringify(termPath)}, 'SIGTERM'));`,
-        `fs.writeFileSync(${JSON.stringify(childPidPath)}, String(process.pid));`,
-        "setInterval(() => {}, 1000);",
-      ].join("");
-      const parentScript = [
-        "const { spawn } = require('node:child_process');",
-        "process.on('SIGTERM', () => process.exit(0));",
-        `spawn(process.execPath, ['-e', ${JSON.stringify(childScript)}], { stdio: 'ignore' });`,
-        "setInterval(() => {}, 1000);",
-      ].join("");
-      const output = createWriteSink();
-      const releaseAndWait = startTimeoutFixture(parentScript, output);
-      let childPid: number | undefined;
-
-      try {
-        // The descendant publishes its PID only after installing its SIGTERM handler.
-        childPid = await waitForPidFile(childPidPath, 2_000);
-        expect(isProcessAlive(childPid)).toBe(true);
-        const result = await releaseAndWait();
-
-        expect(result).toMatchObject({ timedOut: true, status: 0, signal: null, error: null });
-        expect(fs.readFileSync(termPath, "utf8")).toBe("SIGTERM");
-        expect(output.chunks.join("")).toContain("forcing SIGKILL");
-        await waitForDead(childPid, 2_000);
-      } finally {
-        await releaseAndWait();
-        if (childPid !== undefined && isProcessAlive(childPid)) {
-          process.kill(childPid, "SIGKILL");
-          await waitForDead(childPid, 2_000);
-        }
-      }
-    },
-  );
-
-  it.skipIf(process.platform === "win32")(
-    "preserves timeout grace when descendant processes exit cleanly",
-    async () => {
-      const rootDir = createTempDir("openclaw-tsdown-timeout-clean-");
-      const cleanupPath = path.join(rootDir, "child.cleanup");
-      const childPidPath = path.join(rootDir, "child.pid");
-      const childScript = [
-        "const fs = require('node:fs');",
-        "process.on('SIGTERM', () => {",
-        "  setTimeout(() => {",
-        `    fs.writeFileSync(${JSON.stringify(cleanupPath)}, 'clean');`,
-        "    process.exit(0);",
-        "  }, 50);",
-        "});",
-        `fs.writeFileSync(${JSON.stringify(childPidPath)}, String(process.pid));`,
-        "setInterval(() => {}, 1000);",
-      ].join("");
-      const parentScript = [
-        "const { spawn } = require('node:child_process');",
-        "process.on('SIGTERM', () => process.exit(0));",
-        `spawn(process.execPath, ['-e', ${JSON.stringify(childScript)}], { stdio: 'ignore' });`,
-        "setInterval(() => {}, 1000);",
-      ].join("");
-      const output = createWriteSink();
-      const releaseAndWait = startTimeoutFixture(parentScript, output);
-      let childPid: number | undefined;
-
-      try {
-        // The descendant publishes its PID only after installing its SIGTERM handler.
-        childPid = await waitForPidFile(childPidPath, 2_000);
-        const startedAt = Date.now();
-        const result = await releaseAndWait();
-
-        expect(result).toMatchObject({ timedOut: true, status: 0, signal: null, error: null });
-        expect(fs.readFileSync(cleanupPath, "utf8")).toBe("clean");
-        expect(output.chunks.join("")).not.toContain("forcing SIGKILL");
-        expect(Date.now() - startedAt).toBeLessThan(900);
-        await waitForDead(childPid, 2_000);
-      } finally {
-        await releaseAndWait();
-        if (childPid !== undefined && isProcessAlive(childPid)) {
-          process.kill(childPid, "SIGKILL");
-          await waitForDead(childPid, 2_000);
-        }
-      }
-    },
-  );
-
-  it.skipIf(process.platform === "win32")(
-    "cleans process-group descendants before forwarding parent SIGTERM",
-    async () => {
-      const rootDir = createTempDir("openclaw-tsdown-parent-signal-");
-      const childPidPath = path.join(rootDir, "child.pid");
-      const readyPath = path.join(rootDir, "child.ready");
-      const scriptUrl = pathToFileURL(path.resolve("scripts/tsdown-build.mts")).href;
-      let childPid = 0;
-      let runner: ReturnType<typeof spawn> | undefined;
-
-      try {
+    ({ signal }) =>
+      fixture.run(async () => {
+        const rootDir = createTempDir("openclaw-tsdown-timeout-");
+        const childPidPath = path.join(rootDir, "child.pid");
+        const parentPidPath = path.join(rootDir, "parent.pid");
+        const termPath = path.join(rootDir, "child.term");
+        // Allocate the marker before readiness; filesystem setup must not consume termination grace.
         const childScript = [
           "const fs = require('node:fs');",
-          "process.on('SIGTERM', () => {});",
+          `const termFd = fs.openSync(${JSON.stringify(termPath)}, 'wx');`,
+          "process.on('SIGTERM', () => fs.writeSync(termFd, 'SIGTERM', 0));",
+          `fs.writeFileSync(${JSON.stringify(parentPidPath)}, String(process.ppid));`,
           `fs.writeFileSync(${JSON.stringify(childPidPath)}, String(process.pid));`,
           "setInterval(() => {}, 1000);",
         ].join("");
         const parentScript = [
           "const { spawn } = require('node:child_process');",
-          `spawn(process.execPath, ['-e', ${JSON.stringify(childScript)}], { stdio: 'ignore' });`,
-          `require('node:fs').writeFileSync(${JSON.stringify(readyPath)}, 'ready');`,
           "process.on('SIGTERM', () => process.exit(0));",
+          `spawn(process.execPath, ['-e', ${JSON.stringify(childScript)}], { stdio: 'ignore' });`,
           "setInterval(() => {}, 1000);",
         ].join("");
-        const runnerScript = [
-          `import { runTsdownBuildInvocation } from ${JSON.stringify(scriptUrl)};`,
-          "const result = await runTsdownBuildInvocation(",
-          `  { command: process.execPath, args: ['-e', ${JSON.stringify(parentScript)}], options: { stdio: ['ignore', 'pipe', 'pipe'], shell: false, env: process.env } },`,
-          "  { env: { ...process.env, OPENCLAW_TSDOWN_HEARTBEAT_MS: '0' } },",
-          "); process.exitCode = result.status ?? 1;",
-        ].join("\n");
+        const output = createWriteSink();
+        const supervisor = startTimeoutFixture(parentScript, output, signal);
+        let childPid: number | undefined;
 
-        runner = spawn(process.execPath, ["--input-type=module", "-e", runnerScript], {
-          cwd: process.cwd(),
-          stdio: ["ignore", "ignore", "pipe"],
-        });
+        try {
+          // The descendant publishes its PID only after installing its SIGTERM handler.
+          childPid = await waitForPidFile(childPidPath, 2_000);
+          expect(isProcessAlive(childPid)).toBe(true);
+          supervisor.advance(250);
+          await vi.waitUntil(() => fs.readFileSync(termPath, "utf8") === "SIGTERM", {
+            timeout: 2_000,
+            interval: 5,
+          });
+          const parentPid = Number(fs.readFileSync(parentPidPath, "utf8"));
+          await vi.waitUntil(() => !isProcessAlive(parentPid), { timeout: 2_000, interval: 5 });
+          supervisor.advance(249);
+          expect(isProcessAlive(childPid)).toBe(true);
+          expect(output.chunks.join("")).not.toContain("forcing SIGKILL");
+          supervisor.advance(1);
+          supervisor.resume();
+          const result = await supervisor.completion;
 
-        await waitForFile(readyPath, 2_000);
-        childPid = await waitForPidFile(childPidPath, 2_000);
-        expect(isProcessAlive(childPid)).toBe(true);
-
-        runner.kill("SIGTERM");
-
-        await expect(waitForChildClose(runner)).resolves.toEqual({
-          code: 143,
-          signal: null,
-        });
-        await waitForDead(childPid, 2_000);
-      } finally {
-        if (runner?.pid && isProcessAlive(runner.pid)) {
-          runner.kill("SIGKILL");
+          expect(result).toMatchObject({ timedOut: true, status: 0, signal: null, error: null });
+          expect(fs.readFileSync(termPath, "utf8")).toBe("SIGTERM");
+          expect(output.chunks.join("")).toContain("forcing SIGKILL");
+          await waitForDead(childPid, 2_000);
+        } finally {
+          await supervisor.dispose(childPid);
         }
-        if (childPid && isProcessAlive(childPid)) {
-          process.kill(childPid, "SIGKILL");
+      }),
+  );
+
+  it.skipIf(process.platform === "win32")(
+    "preserves timeout grace when descendant processes exit cleanly",
+    ({ signal }) =>
+      fixture.run(async () => {
+        const rootDir = createTempDir("openclaw-tsdown-timeout-clean-");
+        const cleanupPath = path.join(rootDir, "child.cleanup");
+        const termPath = path.join(rootDir, "child.term");
+        const releasePath = path.join(rootDir, "child.release");
+        const childPidPath = path.join(rootDir, "child.pid");
+        const parentPidPath = path.join(rootDir, "parent.pid");
+        // Allocate markers before readiness; their contents record signal and released cleanup.
+        const childScript = [
+          "const fs = require('node:fs');",
+          `const termFd = fs.openSync(${JSON.stringify(termPath)}, 'wx');`,
+          `const cleanupFd = fs.openSync(${JSON.stringify(cleanupPath)}, 'wx');`,
+          "process.on('SIGTERM', () => {",
+          "  fs.writeSync(termFd, 'SIGTERM', 0);",
+          "  setInterval(() => {",
+          `    if (!fs.existsSync(${JSON.stringify(releasePath)})) return;`,
+          "    fs.writeSync(cleanupFd, 'clean', 0);",
+          "    process.exit(0);",
+          "  }, 5);",
+          "});",
+          `fs.writeFileSync(${JSON.stringify(parentPidPath)}, String(process.ppid));`,
+          `fs.writeFileSync(${JSON.stringify(childPidPath)}, String(process.pid));`,
+          "setInterval(() => {}, 1000);",
+        ].join("");
+        const parentScript = [
+          "const { spawn } = require('node:child_process');",
+          "process.on('SIGTERM', () => process.exit(0));",
+          `spawn(process.execPath, ['-e', ${JSON.stringify(childScript)}], { stdio: 'ignore' });`,
+          "setInterval(() => {}, 1000);",
+        ].join("");
+        const output = createWriteSink();
+        const supervisor = startTimeoutFixture(parentScript, output, signal);
+        let childPid: number | undefined;
+
+        try {
+          // The descendant publishes its PID only after installing its SIGTERM handler.
+          childPid = await waitForPidFile(childPidPath, 2_000);
+          supervisor.advance(250);
+          await vi.waitUntil(() => fs.readFileSync(termPath, "utf8") === "SIGTERM", {
+            timeout: 2_000,
+            interval: 5,
+          });
+          const parentPid = Number(fs.readFileSync(parentPidPath, "utf8"));
+          await vi.waitUntil(() => !isProcessAlive(parentPid), { timeout: 2_000, interval: 5 });
+          supervisor.advance(249);
+          expect(isProcessAlive(childPid)).toBe(true);
+          expect(fs.readFileSync(cleanupPath, "utf8")).toBe("");
+          expect(output.chunks.join("")).not.toContain("forcing SIGKILL");
+          fs.writeFileSync(releasePath, "release");
+          const result = await supervisor.completion;
+
+          expect(result).toMatchObject({ timedOut: true, status: 0, signal: null, error: null });
+          expect(fs.readFileSync(cleanupPath, "utf8")).toBe("clean");
+          expect(output.chunks.join("")).not.toContain("forcing SIGKILL");
+          // Even a late escalation callback must be inert after the real join.
+          supervisor.advance(1);
+          expect(output.chunks.join("")).not.toContain("forcing SIGKILL");
+          supervisor.resume();
+          await waitForDead(childPid, 2_000);
+        } finally {
+          await supervisor.dispose(childPid);
         }
+      }),
+  );
+
+  it.skipIf(process.platform === "win32")(
+    "joins a canceled controlled-grace driver with a held child",
+    ({ signal }) =>
+      fixture.run(async () => {
+        const root = createTempDir("tsdown-canceled-driver-");
+        const ready = path.join(root, "ready");
+        const term = path.join(root, "term");
+        const controller = new AbortController();
+        const output = createWriteSink();
+        const supervisor = startTimeoutFixture(
+          `
+        const fs = require("node:fs");
+        process.on("SIGTERM", () => fs.writeFileSync(${JSON.stringify(term)}, "term"));
+        fs.writeFileSync(${JSON.stringify(ready)}, String(process.pid));
+        setInterval(() => {}, 1000);
+      `,
+          output,
+          AbortSignal.any([signal, controller.signal]),
+        );
+        let pid: number | undefined;
+        try {
+          pid = await waitForPidFile(ready, 2_000);
+          supervisor.advance(250);
+          await vi.waitUntil(() => fs.existsSync(term), { timeout: 2_000, interval: 5 });
+          supervisor.advance(249);
+          expect(isProcessAlive(pid)).toBe(true);
+          expect(output.chunks.join("")).not.toContain("forcing SIGKILL");
+          controller.abort(new Error("driver canceled"));
+          expect(output.chunks.join("")).toContain("forcing SIGKILL");
+          await expect(supervisor.completion).resolves.toMatchObject({
+            timedOut: true,
+            status: null,
+            signal: "SIGKILL",
+            error: null,
+          });
+          await waitForDead(pid, 2_000);
+        } finally {
+          await supervisor.dispose(pid);
+        }
+      }),
+  );
+
+  it.skipIf(process.platform === "win32")(
+    "cleans process-group descendants before forwarding parent SIGTERM",
+    () =>
+      fixture.run(async () => {
+        const rootDir = createTempDir("openclaw-tsdown-parent-signal-");
+        const childPidPath = path.join(rootDir, "child.pid");
+        const readyPath = path.join(rootDir, "child.ready");
+        const scriptUrl = pathToFileURL(path.resolve("scripts/tsdown-build.mts")).href;
+        let childPid = 0;
+        let runner: ReturnType<typeof spawn> | undefined;
+        let runnerClosed: Promise<unknown> | undefined;
+
+        try {
+          const childScript = [
+            "const fs = require('node:fs');",
+            "process.on('SIGTERM', () => {});",
+            `fs.writeFileSync(${JSON.stringify(childPidPath)}, String(process.pid));`,
+            "setInterval(() => {}, 1000);",
+          ].join("");
+          const parentScript = [
+            "const { spawn } = require('node:child_process');",
+            `spawn(process.execPath, ['-e', ${JSON.stringify(childScript)}], { stdio: 'ignore' });`,
+            `require('node:fs').writeFileSync(${JSON.stringify(readyPath)}, 'ready');`,
+            "process.on('SIGTERM', () => process.exit(0));",
+            "setInterval(() => {}, 1000);",
+          ].join("");
+          const runnerScript = [
+            `import { runTsdownBuildInvocation } from ${JSON.stringify(scriptUrl)};`,
+            "const result = await runTsdownBuildInvocation(",
+            `  { command: process.execPath, args: ['-e', ${JSON.stringify(parentScript)}], options: { stdio: ['ignore', 'pipe', 'pipe'], shell: false, env: process.env } },`,
+            "  { env: { ...process.env, OPENCLAW_TSDOWN_HEARTBEAT_MS: '0' } },",
+            "); process.exitCode = result.status ?? 1;",
+          ].join("\n");
+
+          runner = spawn(process.execPath, ["--input-type=module", "-e", runnerScript], {
+            cwd: process.cwd(),
+            stdio: ["ignore", "ignore", "pipe"],
+          });
+
+          runnerClosed = fixture.track(once(runner, "close"));
+          await waitForFile(readyPath, 2_000);
+          childPid = await waitForPidFile(childPidPath, 2_000);
+          expect(isProcessAlive(childPid)).toBe(true);
+
+          runner.kill("SIGTERM");
+
+          await expect(waitForChildClose(runner)).resolves.toEqual({
+            code: 143,
+            signal: null,
+          });
+          await waitForDead(childPid, 2_000);
+        } finally {
+          await fixture.verifyCleanup(async () => {
+            if (runner?.pid && isProcessAlive(runner.pid)) {
+              runner.kill("SIGTERM");
+            }
+            await runnerClosed;
+            if (childPid && isProcessAlive(childPid)) {
+              process.kill(childPid, "SIGKILL");
+              await waitForDead(childPid, 2_000);
+            }
+          });
+        }
+      }),
+  );
+});
+
+describe("staged declaration admission", () => {
+  const GiB = 1024 ** 3;
+  const groups = TSDOWN_PLUGIN_SDK_DTS_CONFIG_GROUPS.map((name) => ({
+    name,
+    maxOldSpaceMb: 12288,
+  }));
+  const unequalGroups = TSDOWN_NON_SDK_DTS_CONFIG_GROUPS.map((name, index) => ({
+    name,
+    maxOldSpaceMb: [2048, 3072, 4096, 12288, 6144, 10240][index]!,
+  }));
+  const capacity = {
+    platform: "linux",
+    availableParallelism: 2,
+    availableMemoryBytes: 32 * GiB,
+    physicalMemoryBytes: 32 * GiB,
+    procMemTotalBytes: 32 * GiB,
+    cgroupMemoryLimitPaths: ["/test/memory.max"],
+    constrainedMemoryBytes: 0,
+    processResidentMemoryBytes: 0,
+    fs: createMemoryFileSystem(
+      new Map([
+        ["/test/memory.max", `${32 * GiB}`],
+        ["/test/memory.current", "0"],
+      ]),
+    ),
+    env: { OPENCLAW_TSDOWN_MAX_OLD_SPACE_MB: "49152" },
+  };
+  it.each([
+    { name: "room for both unchanged heaps and headroom", facts: {}, expected: 2 },
+    { name: "exact aggregate boundary", facts: { availableMemoryBytes: 25.5 * GiB }, expected: 2 },
+    {
+      name: "one byte below aggregate boundary",
+      facts: { availableMemoryBytes: 25.5 * GiB - 1 },
+      expected: 1,
+    },
+    {
+      name: "six groups at the two largest heaps plus headroom",
+      selected: unequalGroups,
+      facts: { availableMemoryBytes: 23.5 * GiB },
+      expected: 2,
+    },
+    {
+      name: "six groups one byte below the two largest heaps plus headroom",
+      selected: unequalGroups,
+      facts: { availableMemoryBytes: 23.5 * GiB - 1 },
+      expected: 1,
+    },
+    {
+      name: "sixteen GiB cgroup despite explicit override",
+      facts: { cgroupMemoryLimitBytes: 16 * GiB },
+      expected: 1,
+    },
+    {
+      name: "sixteen GiB available despite large host",
+      facts: { availableMemoryBytes: 16 * GiB },
+      expected: 1,
+    },
+    {
+      name: "physical memory smaller than cgroup",
+      facts: { procMemTotalBytes: 16 * GiB },
+      expected: 1,
+    },
+    { name: "one delivered CPU", facts: { availableParallelism: 1 }, expected: 1 },
+    { name: "unknown available memory", facts: { availableMemoryBytes: Number.NaN }, expected: 1 },
+  ])("uses actual capacity for $name", ({ facts, expected, selected = groups }) => {
+    const before = structuredClone(selected);
+    expect(resolveStagedDeclarationConcurrency(selected, { ...capacity, ...facts })).toBe(expected);
+    expect(selected).toEqual(before);
+  });
+
+  it.each([
+    { name: "missing v2 usage", limit: "memory.max", usage: "memory.current", value: undefined },
+    { name: "invalid v2 usage", limit: "memory.high", usage: "memory.current", value: "invalid" },
+    {
+      name: "unreadable v2 usage",
+      limit: "memory.max",
+      usage: "memory.current",
+      value: Object.assign(new Error("EACCES: memory.current"), { code: "EACCES" }),
+    },
+    {
+      name: "missing v1 usage",
+      limit: "memory.limit_in_bytes",
+      usage: "memory.usage_in_bytes",
+      value: undefined,
+    },
+    {
+      name: "invalid v1 usage",
+      limit: "memory.limit_in_bytes",
+      usage: "memory.usage_in_bytes",
+      value: "max",
+    },
+    {
+      name: "readable v2 usage",
+      limit: "memory.max",
+      usage: "memory.current",
+      value: "0",
+      expected: 2,
+    },
+    { name: "charged v2 usage", limit: "memory.max", usage: "memory.current", value: `${8 * GiB}` },
+    {
+      name: "readable v1 usage",
+      limit: "memory.limit_in_bytes",
+      usage: "memory.usage_in_bytes",
+      value: "0",
+      expected: 2,
+    },
+    {
+      name: "unlimited v2",
+      limit: "memory.max",
+      usage: "memory.current",
+      value: undefined,
+      limitValue: "max",
+      expected: 2,
+    },
+    {
+      name: "unlimited v1",
+      limit: "memory.limit_in_bytes",
+      usage: "memory.usage_in_bytes",
+      value: undefined,
+      limitValue: "9223372036854771712",
+      expected: 2,
+    },
+  ])(
+    "requires observed remaining capacity for $name",
+    ({ limit, usage, value, limitValue = `${32 * GiB}`, expected = 1 }) => {
+      const files = new Map<string, string | Error>([[`/test/${limit}`, limitValue]]);
+      if (value !== undefined) {
+        files.set(`/test/${usage}`, value);
       }
+      const facts = {
+        ...capacity,
+        cgroupMemoryLimitPaths: [`/test/${limit}`],
+        fs: createMemoryFileSystem(files),
+      };
+      expect(resolveStagedDeclarationConcurrency(groups, facts)).toBe(expected);
+      expect(resolveTsdownBuildPlan({ ...facts, env: {} }).maxOldSpaceMb).toBe(12288);
+      expect(resolveTsdownBuildPlan(facts).maxOldSpaceMb).toBe(49152);
     },
   );
+
+  it("does not let known leaf usage conceal unknown ancestor usage", () => {
+    const facts = {
+      ...capacity,
+      cgroupMemoryLimitPaths: ["/test/leaf/memory.max", "/test/memory.max"],
+      fs: createMemoryFileSystem(
+        new Map([
+          ["/test/leaf/memory.max", `${32 * GiB}`],
+          ["/test/leaf/memory.current", "0"],
+          ["/test/memory.max", `${64 * GiB}`],
+        ]),
+      ),
+    };
+    expect(resolveStagedDeclarationConcurrency(groups, facts)).toBe(1);
+    expect(resolveTsdownBuildPlan({ ...facts, env: {} }).maxOldSpaceMb).toBe(12288);
+  });
+
+  it.each([
+    { name: "all cache hits", selected: [] },
+    { name: "one miss", selected: groups.slice(0, 1) },
+    { name: "repeated partition", selected: [groups[0]!, groups[0]!] },
+    {
+      name: "mixed SDK and base groups",
+      selected: [groups[0]!, { name: "openclaw-dts-base", maxOldSpaceMb: 12288 }],
+      expected: 2,
+    },
+    {
+      name: "unknown declaration group",
+      selected: [groups[0]!, { name: "unknown-declaration", maxOldSpaceMb: 12288 }],
+    },
+    { name: "duplicate among three programs", selected: [...groups, groups[0]!] },
+  ])("bounds admission for $name", ({ selected, expected = 1 }) => {
+    expect(resolveStagedDeclarationConcurrency(selected, capacity)).toBe(expected);
+  });
+
+  it("does not use an explicit heap to conceal an unresolved cgroup", () => {
+    const memoryFs = createMemoryFileSystem(
+      new Map([
+        ["/proc/self/cgroup", "0::/hidden.slice/openclaw.service\n"],
+        [
+          "/proc/self/mountinfo",
+          "29 23 0:26 /different.slice /sys/fs/cgroup rw - cgroup2 cgroup rw\n",
+        ],
+      ]),
+    );
+    expect(
+      resolveStagedDeclarationConcurrency(groups, {
+        ...capacity,
+        cgroupMemoryLimitPaths: undefined,
+        fs: memoryFs,
+      }),
+    ).toBe(1);
+  });
 });

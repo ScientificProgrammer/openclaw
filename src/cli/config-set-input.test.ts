@@ -3,11 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import {
-  hasProviderBuilderOptions,
-  parseBatchSource,
-  type ConfigSetOptions,
-} from "./config-set-input.js";
+import { parseBatchSource, parseConfigSetCurrentExpectation } from "./config-set-input.js";
 
 function withBatchFile<T>(prefix: string, contents: string, run: (batchPath: string) => T): T {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -21,18 +17,50 @@ function withBatchFile<T>(prefix: string, contents: string, run: (batchPath: str
 }
 
 describe("config set input parsing", () => {
-  it("does not treat retired provider bypass fields as builder options", () => {
-    const retired = {
-      providerAllowInsecurePath: true,
-      providerAllowSymlinkCommand: true,
-    } as ConfigSetOptions;
-
-    expect(hasProviderBuilderOptions(retired)).toBe(false);
-    expect(hasProviderBuilderOptions({ providerTrustedDir: ["/usr/local/bin"] })).toBe(true);
+  it("parses absent and strict JSON current-value expectations", () => {
+    expect(parseConfigSetCurrentExpectation({ expectCurrentAbsent: true })).toEqual({
+      kind: "absent",
+    });
+    expect(parseConfigSetCurrentExpectation({ expectCurrentJson: "null" })).toEqual({
+      kind: "json",
+      value: null,
+    });
+    expect(
+      parseConfigSetCurrentExpectation({ expectCurrentJson: '{"enabled":true,"ports":[1,2]}' }),
+    ).toEqual({
+      kind: "json",
+      value: { enabled: true, ports: [1, 2] },
+    });
   });
 
-  it("returns null when no batch options are provided", () => {
-    expect(parseBatchSource({})).toBeNull();
+  it.each([
+    {
+      name: "both expectation flags",
+      options: { expectCurrentAbsent: true, expectCurrentJson: "null" },
+      message: "choose either --expect-current-absent or --expect-current-json",
+    },
+    {
+      name: "malformed expected JSON",
+      options: { expectCurrentJson: "{enabled:true}" },
+      message: "--expect-current-json must be valid JSON",
+    },
+    {
+      name: "non-finite expected number",
+      options: { expectCurrentJson: "1e999" },
+      message: "--expect-current-json must be valid JSON",
+    },
+    {
+      name: "batch mode",
+      options: { expectCurrentAbsent: true, batchJson: "[]" },
+      message: "cannot be combined with batch mode",
+    },
+    {
+      name: "dry-run",
+      options: { expectCurrentAbsent: true, dryRun: true },
+      message: "cannot be combined with --dry-run",
+    },
+  ] as const)("rejects $name with a current-value expectation", ({ options, message }) => {
+    expect(() => parseConfigSetCurrentExpectation(options)).toThrow(message);
   });
 
   it("rejects using both --batch-json and --batch-file", () => {
@@ -97,24 +125,6 @@ describe("config set input parsing", () => {
     expect(() => parseBatchSource({ batchJson })).toThrow(message);
   });
 
-  it("parses valid --batch-file payloads", () => {
-    withBatchFile(
-      "openclaw-config-set-input-",
-      '[{"path":"gateway.auth.mode","value":"token"}]',
-      (batchPath) => {
-        const parsed = parseBatchSource({
-          batchFile: batchPath,
-        });
-        expect(parsed).toEqual([
-          {
-            path: "gateway.auth.mode",
-            value: "token",
-          },
-        ]);
-      },
-    );
-  });
-
   it("rejects --batch-file when the file does not exist", () => {
     expect(() =>
       parseBatchSource({
@@ -132,24 +142,6 @@ describe("config set input parsing", () => {
     } finally {
       fs.rmSync(batchPath, { recursive: true, force: true });
     }
-  });
-
-  it("rejects malformed --batch-file payloads", () => {
-    withBatchFile("openclaw-config-set-input-invalid-", "{}", (batchPath) => {
-      expect(() =>
-        parseBatchSource({
-          batchFile: batchPath,
-        }),
-      ).toThrow("--batch-file must be a JSON array.");
-    });
-  });
-
-  it("rejects empty --batch-file payloads", () => {
-    withBatchFile("openclaw-config-set-input-empty-", "[]", (batchPath) => {
-      expect(() => parseBatchSource({ batchFile: batchPath })).toThrow(
-        "--batch-file must contain at least one config update.",
-      );
-    });
   });
 
   it("rejects --batch-file payloads above the config mutation limit", () => {

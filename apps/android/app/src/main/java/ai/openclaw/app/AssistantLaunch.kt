@@ -74,7 +74,6 @@ internal val SHARED_ATTACHMENT_MIME_ALLOWLIST =
 
 internal val SHARED_AUDIO_DOCUMENT_MIME_TYPES =
   SHARED_ATTACHMENT_MIME_ALLOWLIST.filterNot { it == "image/*" || it == "video/*" }.toTypedArray()
-internal val SHARED_VIDEO_MIME_TYPES = arrayOf("video/*")
 
 /**
  * Parses app-owned navigation actions that should open a specific home tab.
@@ -84,6 +83,7 @@ fun parseHomeDestinationIntent(intent: Intent?): HomeDestination? {
   return when {
     // Debug-only shortcut keeps E2E navigation out of release builds.
     BuildConfig.DEBUG && action == actionOpenVoiceE2e -> HomeDestination.Voice
+
     else -> null
   }
 }
@@ -94,12 +94,13 @@ fun parseHomeDestinationIntent(intent: Intent?): HomeDestination? {
 fun parseAssistantLaunchIntent(intent: Intent?): AssistantLaunchRequest? {
   val action = intent?.action ?: return null
   return when (action) {
-    Intent.ACTION_ASSIST ->
+    Intent.ACTION_ASSIST -> {
       AssistantLaunchRequest(
         source = "assist",
         prompt = null,
         autoSend = false,
       )
+    }
 
     actionAskOpenClaw -> {
       val prompt = intent.getStringExtra(extraAssistantPrompt)?.trim()?.ifEmpty { null }
@@ -110,7 +111,9 @@ fun parseAssistantLaunchIntent(intent: Intent?): AssistantLaunchRequest? {
       )
     }
 
-    else -> null
+    else -> {
+      null
+    }
   }
 }
 
@@ -149,13 +152,17 @@ private fun sharedAttachments(
 ): SharedAttachmentSelection {
   val streamUris =
     when (action) {
-      Intent.ACTION_SEND ->
+      Intent.ACTION_SEND -> {
         listOfNotNull(IntentCompat.getParcelableExtra(intent, Intent.EXTRA_STREAM, Uri::class.java))
+      }
 
-      Intent.ACTION_SEND_MULTIPLE ->
+      Intent.ACTION_SEND_MULTIPLE -> {
         IntentCompat.getParcelableArrayListExtra(intent, Intent.EXTRA_STREAM, Uri::class.java).orEmpty()
+      }
 
-      else -> emptyList()
+      else -> {
+        emptyList()
+      }
     }
   val clipUris =
     intent.clipData

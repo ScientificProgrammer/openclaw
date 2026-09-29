@@ -1,37 +1,32 @@
 /**
  * Tests subagent command output: status lines, info, log routing, shared text
- * extraction, and focus resolution. Grouped in one file because each command
+ * extraction. Grouped in one file because each command
  * test file pays the full auto-reply module graph on import; keep sibling
  * subagent command assertions here instead of new per-action files.
  */
 import os from "node:os";
 import path from "node:path";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import * as controlScope from "../../agents/subagents/registry/subagent-control-scope.js";
 import { SUBAGENT_ENDED_REASON_KILLED } from "../../agents/subagents/registry/subagent-lifecycle-events.js";
-import {
-  countPendingDescendantRuns,
-  listSubagentRunsForController,
-} from "../../agents/subagents/registry/subagent-registry-read.js";
+import { captureSubagentListReadContext } from "../../agents/subagents/registry/subagent-list.js";
+import { subagentRuns } from "../../agents/subagents/registry/subagent-registry-memory.js";
+import { buildSubagentRunReadIndexFromRuns } from "../../agents/subagents/registry/subagent-registry-queries.js";
 import {
   addSubagentRunForTests,
+  releaseSubagentRun,
   resetSubagentRegistryForTests,
 } from "../../agents/subagents/registry/subagent-registry.test-helpers.js";
 import type { SubagentRunRecord } from "../../agents/subagents/registry/subagent-registry.types.js";
 import type { OpenClawConfig } from "../../config/config.js";
-import { failTaskRunByRunIdCore } from "../../tasks/task-executor.js";
-import { createTaskRecord } from "../../tasks/task-registry.js";
-import { resetTaskRegistryForTests } from "../../tasks/task-runtime.test-helpers.js";
 import type { ReplyPayload } from "../types.js";
 import { buildSubagentsStatusLine } from "./commands-status-subagents.js";
 import { extractSubagentMessageText } from "./commands-subagents-text.js";
+import { handleSubagentsCommand } from "./commands-subagents.js";
 import { handleSubagentsInfoAction } from "./commands-subagents/action-info.js";
 import { handleSubagentsListAction } from "./commands-subagents/action-list.js";
 import { handleSubagentsLogAction } from "./commands-subagents/action-log.js";
-import { resolveFocusTargetSession } from "./commands-subagents/shared.js";
-import {
-  baseCommandTestConfig,
-  configureInMemoryTaskRegistryStoreForTests,
-} from "./commands.test-harness.js";
+import { baseCommandTestConfig, buildCommandTestParams } from "./commands.test-harness.js";
 
 const callGatewayMock = vi.hoisted(() => vi.fn());
 
@@ -46,9 +41,48 @@ function requireReplyText(reply: ReplyPayload | undefined): string {
   return reply.text;
 }
 
+function commandReadContext(runs: SubagentRunRecord[]) {
+  const snapshot = new Map(runs.map((run) => [run.runId, run]));
+  const index = buildSubagentRunReadIndexFromRuns({ runs: snapshot });
+  return {
+    list: captureSubagentListReadContext(runs, index, snapshot, 30),
+  };
+}
+
 describe("subagents status", () => {
   beforeEach(() => {
     resetSubagentRegistryForTests();
+  });
+
+  it("does not count stale unended runs as active or completed", async () => {
+    const now = Date.now();
+    for (const [name, ageMs, endedAt] of [
+      ["stale", 3 * 60 * 60_000, undefined],
+      ["live", 60_000, undefined],
+      ["completed", 120_000, now - 60_000],
+    ] as const) {
+      addSubagentRunForTests({
+        runId: name,
+        childSessionKey: `agent:main:subagent:${name}`,
+        requesterSessionKey: "agent:main:main",
+        requesterDisplayKey: "main",
+        task: `${name} worker`,
+        cleanup: "keep",
+        createdAt: now - ageMs,
+        startedAt: now - ageMs,
+        endedAt,
+      });
+    }
+
+    const text = buildSubagentsStatusLine({
+      context: await controlScope.buildControlledSubagentRunsReadContext("agent:main:main"),
+      verboseEnabled: true,
+      now,
+    });
+
+    expect(text).toContain("🤖 Subagents: 1 active · 1 done");
+    expect(text).toContain("live worker");
+    expect(text).not.toContain("stale worker");
   });
 
   it.each([
@@ -68,6 +102,7 @@ describe("subagents status", () => {
           requesterSessionKey: "agent:main:main",
           requesterDisplayKey: "main",
           task: "do thing",
+          completion: { required: true, resultText: "Completed the requested task" },
           cleanup: "keep",
           createdAt: 1000,
           startedAt: 1000,
@@ -75,36 +110,6 @@ describe("subagents status", () => {
       },
       verboseLevel: "off" as const,
       expectedText: ["🤖 Subagents: 1 active", "  • do thing · 4s"],
-      unexpectedText: [] as string[],
-    },
-    {
-      name: "includes subagent details in /status when verbose",
-      seedRuns: () => {
-        addSubagentRunForTests({
-          runId: "run-1",
-          childSessionKey: "agent:main:subagent:abc",
-          requesterSessionKey: "agent:main:main",
-          requesterDisplayKey: "main",
-          task: "do thing",
-          cleanup: "keep",
-          createdAt: 1000,
-          startedAt: 1000,
-        });
-        addSubagentRunForTests({
-          runId: "run-2",
-          childSessionKey: "agent:main:subagent:def",
-          requesterSessionKey: "agent:main:main",
-          requesterDisplayKey: "main",
-          task: "finished task",
-          cleanup: "keep",
-          createdAt: 900,
-          startedAt: 900,
-          endedAt: 1200,
-          outcome: { status: "ok" },
-        });
-      },
-      verboseLevel: "on" as const,
-      expectedText: ["🤖 Subagents: 1 active", "· 1 done", "  • do thing · 4s"],
       unexpectedText: [] as string[],
     },
     {
@@ -127,14 +132,12 @@ describe("subagents status", () => {
       expectedText: ["🤖 Subagents: 0 active · 1 done"],
       unexpectedText: ["  • finished task"],
     },
-  ])("$name", ({ seedRuns, verboseLevel, expectedText, unexpectedText }) => {
+  ])("$name", async ({ seedRuns, verboseLevel, expectedText, unexpectedText }) => {
     seedRuns();
-    const runs = listSubagentRunsForController("agent:main:main");
     const text =
       buildSubagentsStatusLine({
-        runs,
+        context: await controlScope.buildControlledSubagentRunsReadContext("agent:main:main"),
         verboseEnabled: verboseLevel === "on",
-        pendingDescendantsForRun: (entry) => countPendingDescendantRuns(entry.childSessionKey),
         now: 5000,
       }) ?? "";
     for (const expected of expectedText) {
@@ -144,6 +147,245 @@ describe("subagents status", () => {
       expect(text).not.toContain(blocked);
     }
   });
+
+  it.each([1, 2])(
+    "keeps the newest three details and %i pending children in the full counts",
+    async (children) => {
+      const now = Date.now();
+      const parentKey = "agent:main:subagent:tie-a";
+      for (const [name, ageMs, ended] of [
+        ["tie-b", 2_000, false],
+        ["done", 3_000, true],
+        ["oldest", 4_000, false],
+        ["first", 1_000, false],
+        ["tie-a", 2_000, true],
+        ["stale", 3 * 60 * 60_000, false],
+      ] as const) {
+        addSubagentRunForTests({
+          runId: name,
+          childSessionKey: `agent:main:subagent:${name}`,
+          requesterSessionKey: "agent:main:main",
+          requesterDisplayKey: "main",
+          task: `${name} worker`,
+          cleanup: "keep",
+          createdAt: now - ageMs,
+          startedAt: now - ageMs,
+          endedAt: ended ? now - 500 : undefined,
+        });
+      }
+      for (let index = 0; index < children; index++) {
+        addSubagentRunForTests({
+          runId: `child-${index}`,
+          childSessionKey: `${parentKey}:subagent:${index}`,
+          requesterSessionKey: parentKey,
+          requesterDisplayKey: "tie-a",
+          task: "pending child",
+          cleanup: "keep",
+          createdAt: now - 1_000,
+          startedAt: now - 1_000,
+          endedAt: index > 0 ? now - 500 : undefined,
+        });
+      }
+
+      const text = buildSubagentsStatusLine({
+        context: await controlScope.buildControlledSubagentRunsReadContext("agent:main:main"),
+        verboseEnabled: true,
+        now,
+      });
+      const details = text?.split("\n").slice(1);
+
+      expect(text).toContain("Subagents: 4 active · 1 done");
+      expect(details).toEqual([
+        expect.stringContaining("first worker"),
+        expect.stringContaining("tie-b worker"),
+        expect.stringContaining("tie-a worker"),
+      ]);
+      expect(details?.[0]).toContain("1s");
+      expect(details?.[1]).toContain("2s");
+      expect(details?.[2]).toContain("2s");
+      expect(details?.[2]).toMatch(new RegExp(`\\b${children} child`));
+    },
+  );
+
+  it.each([
+    { endedAt: Number.NaN, duration: "4s" },
+    { endedAt: Infinity, duration: "0s" },
+  ])("preserves active duration for non-finite end $endedAt", async ({ endedAt, duration }) => {
+    const run: SubagentRunRecord = {
+      runId: "non-finite-end",
+      childSessionKey: "agent:main:subagent:non-finite-end",
+      requesterSessionKey: "agent:main:main",
+      requesterDisplayKey: "main",
+      task: "active worker",
+      cleanup: "keep",
+      createdAt: 1_000,
+      execution: { status: "running", startedAt: 1_000, endedAt },
+    };
+    addSubagentRunForTests(run);
+    const text = buildSubagentsStatusLine({
+      context: await controlScope.buildControlledSubagentRunsReadContext("agent:main:main"),
+      verboseEnabled: false,
+      now: 5_000,
+    });
+    expect(text).toContain("Subagents: 1 active");
+    expect(text).toContain(`active worker · ${duration}`);
+  });
+});
+
+describe("subagents command snapshots", () => {
+  beforeEach(() => {
+    resetSubagentRegistryForTests({ persist: false });
+  });
+
+  afterEach(() => {
+    resetSubagentRegistryForTests({ persist: false });
+  });
+
+  it("renders the captured controlled run and descendant facts after a concurrent settlement", async () => {
+    const parent = {
+      runId: "paired-parent",
+      childSessionKey: "agent:main:subagent:paired-parent",
+      requesterSessionKey: "agent:main:main",
+      requesterDisplayKey: "main",
+      task: "paired parent",
+      cleanup: "keep",
+      createdAt: Date.now() - 2_000,
+      execution: { status: "terminal", endedAt: Date.now() - 1_000 },
+    } satisfies SubagentRunRecord;
+    const child = {
+      ...parent,
+      runId: "paired-child",
+      childSessionKey: "agent:main:subagent:paired-child",
+      requesterSessionKey: parent.childSessionKey,
+      execution: { status: "running", startedAt: Date.now() },
+    } satisfies SubagentRunRecord;
+    addSubagentRunForTests(parent);
+    addSubagentRunForTests(child);
+    const prepare = controlScope.buildControlledSubagentRunsReadContext;
+    const snapshot = vi
+      .spyOn(controlScope, "buildControlledSubagentRunsReadContext")
+      .mockImplementation(async (...args) => {
+        const context = await prepare(...args);
+        queueMicrotask(() => {
+          subagentRuns.get(parent.runId)!.task = "changed after preparation";
+          addSubagentRunForTests({
+            ...child,
+            execution: { status: "terminal", endedAt: Date.now() },
+            cleanupCompletedAt: Date.now(),
+          });
+        });
+        return context;
+      });
+    try {
+      const result = await handleSubagentsCommand(
+        buildCommandTestParams("/subagents list", baseCommandTestConfig),
+        true,
+      );
+      const text = requireReplyText(result?.reply);
+      expect(text).toContain("active (waiting on 1 child)");
+      expect(text).toContain("paired parent");
+      expect(text).not.toContain("changed after preparation");
+    } finally {
+      snapshot.mockRestore();
+    }
+  });
+
+  it("captures controlled runs after lazy action loading", async () => {
+    const controllerSessionKey = "agent:main:main";
+    const parentSessionKey = "agent:main:subagent:snapshot-parent";
+    const parentRunId = "snapshot-parent-run";
+
+    await handleSubagentsCommand(
+      buildCommandTestParams("/subagents list", baseCommandTestConfig),
+      true,
+    );
+    addSubagentRunForTests({
+      runId: parentRunId,
+      childSessionKey: parentSessionKey,
+      controllerSessionKey,
+      requesterSessionKey: controllerSessionKey,
+      requesterDisplayKey: "main",
+      task: "removed parent",
+      cleanup: "keep",
+      createdAt: Date.now() - 2_000,
+      startedAt: Date.now() - 2_000,
+      endedAt: Date.now() - 1_000,
+      outcome: { status: "ok" },
+    });
+
+    const pendingReply = handleSubagentsCommand(
+      buildCommandTestParams("/agents", baseCommandTestConfig),
+      true,
+    );
+    queueMicrotask(() => {
+      releaseSubagentRun(parentRunId);
+      addSubagentRunForTests({
+        runId: "snapshot-child-run",
+        childSessionKey: `${parentSessionKey}:subagent:child`,
+        controllerSessionKey: parentSessionKey,
+        requesterSessionKey: parentSessionKey,
+        requesterDisplayKey: parentSessionKey,
+        task: "new child",
+        cleanup: "keep",
+        createdAt: Date.now(),
+        startedAt: Date.now(),
+      });
+    });
+
+    const text = requireReplyText((await pendingReply)?.reply);
+    expect(text).toContain("(none)");
+    expect(text).not.toContain("removed parent");
+    expect(text).not.toContain("waiting on 1 child");
+  });
+});
+
+describe("subagents global-session inspection", () => {
+  beforeEach(() => {
+    resetSubagentRegistryForTests({ persist: false });
+    callGatewayMock.mockReset().mockResolvedValue({ messages: [] });
+    for (const agentId of ["research", "ops"]) {
+      addSubagentRunForTests({
+        runId: `global-${agentId}`,
+        childSessionKey: `agent:${agentId}:subagent:worker`,
+        controllerSessionKey: "global",
+        requesterSessionKey: "global",
+        requesterAgentId: agentId,
+        requesterDisplayKey: "global",
+        task: `${agentId} worker`,
+        cleanup: "keep",
+        createdAt: Date.now() - 1_000,
+        startedAt: Date.now() - 1_000,
+      });
+    }
+  });
+
+  afterEach(() => resetSubagentRegistryForTests({ persist: false }));
+
+  it.each(["/subagents list", "/subagents info 1", "/subagents log 1", "/agents"])(
+    "keeps the selected agent's global children visible through %s",
+    async (command) => {
+      const cfg: OpenClawConfig = {
+        ...baseCommandTestConfig,
+        agents: { ownership: "explicit", entries: { research: {}, ops: {} } },
+        session: { scope: "global" },
+      };
+      const params = buildCommandTestParams(command, cfg, { SessionKey: "global" });
+      params.sessionKey = "global";
+      params.agentId = "research";
+
+      const result = await handleSubagentsCommand(params, true);
+      const text = requireReplyText(result?.reply);
+
+      expect(text).toContain("research worker");
+      expect(text).not.toContain("ops worker");
+      if (command === "/subagents log 1") {
+        expect(callGatewayMock).toHaveBeenCalledWith({
+          method: "chat.history",
+          params: { sessionKey: "agent:research:subagent:worker", limit: 20 },
+        });
+      }
+    },
+  );
 });
 
 describe("subagents info", () => {
@@ -162,22 +404,20 @@ describe("subagents info", () => {
     };
   }
 
-  function buildInfoContext(params: { cfg: OpenClawConfig; runs: object[]; restTokens: string[] }) {
+  function buildInfoContext(params: {
+    cfg: OpenClawConfig;
+    runs: SubagentRunRecord[];
+    restTokens: string[];
+  }): Parameters<typeof handleSubagentsInfoAction>[0] {
     return {
-      params: {
-        cfg: params.cfg,
-        sessionKey: "agent:main:main",
-      },
-      handledPrefix: "/subagents",
+      params: buildCommandTestParams("/subagents info", params.cfg),
       requesterKey: "agent:main:main",
-      runs: params.runs,
+      readContext: commandReadContext(params.runs),
       restTokens: params.restTokens,
-    } as Parameters<typeof handleSubagentsInfoAction>[0];
+    };
   }
 
   beforeEach(() => {
-    resetTaskRegistryForTests({ persist: false });
-    configureInMemoryTaskRegistryStoreForTests();
     resetSubagentRegistryForTests();
   });
 
@@ -191,16 +431,17 @@ describe("subagents info", () => {
     expect(result.reply?.text).toContain("/subagents info <id|#>");
   });
 
-  it("returns info for a subagent", () => {
+  it.each([false, true])("returns info for a subagent with task missing=%s", (taskMissing) => {
     const now = Date.now();
     const runId = "commands-subagents-info-run";
     const childSessionKey = "agent:main:subagent:commands-info";
-    const run = {
+    const run: SubagentRunRecord = {
       runId,
       childSessionKey,
       requesterSessionKey: "agent:main:main",
       requesterDisplayKey: "main",
       task: "do thing",
+      completion: { required: true, resultText: "Completed the requested task" },
       cleanup: "keep",
       createdAt: now - 20_000,
       execution: {
@@ -211,27 +452,77 @@ describe("subagents info", () => {
       },
     } satisfies SubagentRunRecord;
     addSubagentRunForTests(run);
-    createTaskRecord({
-      runtime: "subagent",
-      requesterSessionKey: "agent:main:main",
-      childSessionKey,
-      runId,
-      task: "do thing",
-      status: "succeeded",
-      terminalSummary: "Completed the requested task",
-      deliveryStatus: "delivered",
-    });
+    if (taskMissing) {
+      run.delivery = {
+        status: "discarded",
+        disposition: "permanent_failure",
+        discardReason: "task-missing",
+        discardedAt: now,
+      };
+    }
     const cfg = buildCommandTestConfig();
     const result = handleSubagentsInfoAction(
-      buildInfoContext({ cfg, runs: [run], restTokens: ["1"] }),
+      buildInfoContext({ cfg, runs: [run], restTokens: [runId] }),
     );
     const text = requireReplyText(result.reply);
     expect(result.shouldContinue).toBe(false);
     expect(text).toContain("Subagent info");
     expect(text).toContain(`Run: ${runId}`);
     expect(text).toContain("Status: done");
-    expect(text).toContain("TaskStatus: succeeded");
-    expect(text).toContain("Task summary: Completed the requested task");
+    expect(text).toContain("Outcome: ok");
+    expect(text).toContain("Progress: Completed the requested task");
+    if (taskMissing) {
+      expect(text).toContain("Delivery: discarded");
+      expect(text).toContain("Delivery disposition: task-missing");
+      expect(text).toContain(`Delivery retired: ${new Date(now).toISOString()}`);
+    }
+  });
+
+  it("uses displayed indices for info and log when stale unended runs exist", async () => {
+    const now = Date.now();
+    const runs: SubagentRunRecord[] = [
+      {
+        runId: "numbering-stale",
+        childSessionKey: "agent:main:subagent:numbering-stale",
+        requesterSessionKey: "agent:main:main",
+        requesterDisplayKey: "main",
+        task: "stale worker",
+        cleanup: "keep",
+        createdAt: now - 3 * 60 * 60_000,
+        execution: { status: "running", startedAt: now - 3 * 60 * 60_000 },
+      },
+      {
+        runId: "numbering-recent",
+        childSessionKey: "agent:main:subagent:numbering-recent",
+        requesterSessionKey: "agent:main:main",
+        requesterDisplayKey: "main",
+        task: "recent worker",
+        cleanup: "keep",
+        createdAt: now - 120_000,
+        execution: {
+          status: "terminal",
+          startedAt: now - 120_000,
+          endedAt: now - 60_000,
+          outcome: { status: "ok" },
+        },
+      },
+    ];
+    for (const run of runs) {
+      addSubagentRunForTests(run);
+    }
+    const context = buildInfoContext({ cfg: buildCommandTestConfig(), runs, restTokens: ["1"] });
+    const listing = requireReplyText((await handleSubagentsListAction(context)).reply);
+    expect(listing).toContain("1. recent worker");
+    expect(listing).not.toContain("stale worker");
+    expect(requireReplyText(handleSubagentsInfoAction(context).reply)).toContain(
+      "Run: numbering-recent",
+    );
+    callGatewayMock.mockResolvedValue({ messages: [] });
+    await handleSubagentsLogAction(context);
+    expect(callGatewayMock).toHaveBeenLastCalledWith({
+      method: "chat.history",
+      params: { sessionKey: "agent:main:subagent:numbering-recent", limit: 20 },
+    });
   });
 
   it.each([
@@ -259,7 +550,7 @@ describe("subagents info", () => {
     },
   ])(
     "keeps /subagents info and list aligned for $name",
-    ({ endedReason, outcome, expectedStatus }) => {
+    async ({ endedReason, outcome, expectedStatus }) => {
       const now = Date.now();
       const run = {
         runId: `commands-subagents-status-${expectedStatus}`,
@@ -287,7 +578,7 @@ describe("subagents info", () => {
       expect(requireReplyText(handleSubagentsInfoAction(context).reply)).toContain(
         `Status: ${expectedStatus}`,
       );
-      expect(requireReplyText(handleSubagentsListAction(context).reply)).toContain(
+      expect(requireReplyText((await handleSubagentsListAction(context)).reply)).toContain(
         ` ${expectedStatus}`,
       );
     },
@@ -339,6 +630,7 @@ describe("subagents info", () => {
       requesterSessionKey: "agent:main:main",
       requesterDisplayKey: "main",
       task: "Inspect the stuck run",
+      delivery: { status: "suspended", lastError: "Needs manual follow-up." },
       cleanup: "keep",
       createdAt: now - 20_000,
       execution: {
@@ -358,27 +650,6 @@ describe("subagents info", () => {
       },
     } satisfies SubagentRunRecord;
     addSubagentRunForTests(run);
-    createTaskRecord({
-      runtime: "subagent",
-      requesterSessionKey: "agent:main:main",
-      childSessionKey,
-      runId,
-      task: "Inspect the stuck run",
-      status: "running",
-      deliveryStatus: "delivered",
-    });
-    failTaskRunByRunIdCore({
-      runId,
-      endedAt: now - 1_000,
-      error: [
-        "OpenClaw runtime context (internal):",
-        "This context is runtime-generated, not user-authored. Keep internal details private.",
-        "",
-        "[Internal task completion event]",
-        "source: subagent",
-      ].join("\n"),
-      terminalSummary: "Needs manual follow-up.",
-    });
     const cfg = buildCommandTestConfig();
     const result = handleSubagentsInfoAction(
       buildInfoContext({ cfg, runs: [run], restTokens: ["1"] }),
@@ -393,7 +664,7 @@ describe("subagents info", () => {
     expect(text).not.toContain("Internal task completion event");
   });
 
-  it("uses the requester key for task ownership lookup", () => {
+  it("shows the selected routed requester completion", () => {
     const now = Date.now();
     const runId = "commands-subagents-info-routed-run";
     const childSessionKey = "agent:main:subagent:commands-info-routed";
@@ -403,6 +674,7 @@ describe("subagents info", () => {
       requesterSessionKey: "agent:main:target",
       requesterDisplayKey: "target",
       task: "do routed thing",
+      completion: { required: true, resultText: "Resolved via routed owner key" },
       cleanup: "keep",
       createdAt: now - 20_000,
       execution: {
@@ -413,16 +685,6 @@ describe("subagents info", () => {
       },
     } satisfies SubagentRunRecord;
     addSubagentRunForTests(run);
-    createTaskRecord({
-      runtime: "subagent",
-      requesterSessionKey: "agent:main:target",
-      childSessionKey,
-      runId,
-      task: "do routed thing",
-      status: "succeeded",
-      terminalSummary: "Resolved via routed owner key",
-      deliveryStatus: "delivered",
-    });
     const cfg = {
       commands: { text: true },
       channels: { quietchat: { allowFrom: ["*"] } },
@@ -430,19 +692,18 @@ describe("subagents info", () => {
     } as OpenClawConfig;
     const result = handleSubagentsInfoAction({
       params: {
-        cfg,
+        ...buildCommandTestParams("/subagents info 1", cfg),
         sessionKey: "agent:main:slash-session",
       },
-      handledPrefix: "/subagents",
       requesterKey: "agent:main:target",
-      runs: [run],
+      readContext: commandReadContext([run]),
       restTokens: ["1"],
-    } as Parameters<typeof handleSubagentsInfoAction>[0]);
+    });
     const text = requireReplyText(result.reply);
 
     expect(result.shouldContinue).toBe(false);
-    expect(text).toContain("TaskStatus: succeeded");
-    expect(text).toContain("Task summary: Resolved via routed owner key");
+    expect(text).toContain("Outcome: ok");
+    expect(text).toContain("Progress: Resolved via routed owner key");
   });
 });
 
@@ -463,17 +724,16 @@ describe("subagents log", () => {
     };
   }
 
-  function buildLogContext(restTokens: string[], runs: SubagentRunRecord[]) {
+  function buildLogContext(
+    restTokens: string[],
+    runs: SubagentRunRecord[],
+  ): Parameters<typeof handleSubagentsLogAction>[0] {
     return {
-      params: {
-        cfg: {} as OpenClawConfig,
-        sessionKey: "agent:main:main",
-      },
-      handledPrefix: "/subagents",
+      params: buildCommandTestParams("/subagents log", {}),
       requesterKey: "agent:main:main",
-      runs,
+      readContext: commandReadContext(runs),
       restTokens,
-    } as Parameters<typeof handleSubagentsLogAction>[0];
+    };
   }
 
   beforeEach(() => {
@@ -612,32 +872,5 @@ describe("extractSubagentMessageText", () => {
       const result = extractSubagentMessageText(testCase.message);
       expect(result?.text).toBe(testCase.expectedText);
     }
-  });
-});
-
-describe("resolveFocusTargetSession", () => {
-  beforeEach(() => {
-    callGatewayMock.mockReset();
-  });
-
-  it("restricts gateway fallback resolution to a subagent requester's children", async () => {
-    callGatewayMock.mockResolvedValue({
-      key: "agent:main:subagent:child",
-    });
-
-    const result = await resolveFocusTargetSession({
-      runs: [],
-      token: "child",
-      requesterKey: "agent:main:subagent:parent",
-    });
-
-    expect(result?.targetSessionKey).toBe("agent:main:subagent:child");
-    expect(callGatewayMock).toHaveBeenCalledWith({
-      method: "sessions.resolve",
-      params: {
-        key: "child",
-        spawnedBy: "agent:main:subagent:parent",
-      },
-    });
   });
 });

@@ -1,5 +1,36 @@
 #!/bin/bash
+
+# Bash 5.3+ can deadlock writing heredoc pipes on macOS before the reader starts.
+if [[ ${OSTYPE:-} == darwin* && $BASH != /bin/bash ]] && ((BASH_VERSINFO[0] > 5 || (BASH_VERSINFO[0] == 5 && BASH_VERSINFO[1] >= 3))); then
+  if (return 0 2>/dev/null); then
+    printf '%s\n' 'Run this installer with /bin/bash on macOS instead of sourcing it.' >&2
+    return 1
+  fi
+  case "${BASH_SOURCE[0]:-}" in
+    ""|bash|-bash|/dev/stdin)
+      # Bash reads piped scripts unbuffered; stdin now starts after this guard.
+      OPENCLAW_INSTALLER_REEXEC_FILE="$(mktemp "${TMPDIR:-/tmp}/openclaw-installer.XXXXXX")" || exit 1
+      export OPENCLAW_INSTALLER_REEXEC_FILE
+      trap 'rm -f -- "$OPENCLAW_INSTALLER_REEXEC_FILE"' EXIT
+      { printf '#!/bin/bash\n'; cat; } > "$OPENCLAW_INSTALLER_REEXEC_FILE" || exit 1
+      exec /bin/bash "$OPENCLAW_INSTALLER_REEXEC_FILE" "$@"
+      ;;
+    *) exec /bin/bash "$0" "$@" ;;
+  esac
+fi
+
 set -euo pipefail
+
+# BEGIN GENERATED UPDATE NETWORK BUDGET
+# Source: src/infra/update-network-budget.ts; regenerate: node scripts/generate-update-network-budget.mjs
+UPDATE_NETWORK_TIMEOUT_SECONDS=300
+# END GENERATED UPDATE NETWORK BUDGET
+
+# The re-executed shell has the script open, so unlink its private copy now.
+if [[ -n "${OPENCLAW_INSTALLER_REEXEC_FILE:-}" && "${BASH_SOURCE[0]:-}" == "$OPENCLAW_INSTALLER_REEXEC_FILE" ]]; then
+  rm -f -- "$OPENCLAW_INSTALLER_REEXEC_FILE"
+fi
+unset OPENCLAW_INSTALLER_REEXEC_FILE
 
 # OpenClaw Installer for macOS and Linux
 # Usage: curl -fsSL --proto '=https' --tlsv1.2 https://openclaw.ai/install.sh | bash
@@ -23,14 +54,11 @@ NODE_BREW_FORMULA="node"
 # Linux package repositories can publish builds ahead of the Node release line.
 # Provision the supported LTS line there so a fresh install never receives a prerelease runtime.
 NODE_LINUX_DEFAULT_MAJOR=24
-NODE_MIN_MAJOR=22
-NODE_22_MIN_MINOR=22
-NODE_22_MIN_PATCH=3
-NODE_24_MIN_MINOR=15
+NODE_24_MIN_MINOR=16
 NODE_24_MIN_PATCH=0
-NODE_25_MIN_MINOR=9
-NODE_25_MIN_PATCH=0
-NODE_SUPPORTED_VERSION_LABEL="22.22.3+, 24.15.0+, or 25.9.0+"
+NODE_26_MIN_MINOR=1
+NODE_26_MIN_PATCH=0
+NODE_SUPPORTED_VERSION_LABEL="24.16.0+ or 26.1.0+"
 
 ORIGINAL_PATH="${PATH:-}"
 
@@ -130,23 +158,25 @@ download_file() {
     if [[ "$DOWNLOADER" == "curl" ]]; then
         if [[ "$redirect_mode" == "deny" ]]; then
             curl -fsSL --max-redirs 0 --proto '=https' --tlsv1.2 \
-                --speed-limit 1 --speed-time 30 \
+                --connect-timeout "$UPDATE_NETWORK_TIMEOUT_SECONDS" \
+                --speed-limit 1 --speed-time "$UPDATE_NETWORK_TIMEOUT_SECONDS" \
                 --retry 3 --retry-delay 1 --retry-connrefused \
                 -o "$output" "$url"
             return
         fi
-        # Bound post-connect stalls without imposing a total download duration.
+        # Bound connection and transfer stalls without a total download duration.
         curl -fsSL --proto '=https' --tlsv1.2 \
-            --speed-limit 1 --speed-time 30 \
+            --connect-timeout "$UPDATE_NETWORK_TIMEOUT_SECONDS" \
+            --speed-limit 1 --speed-time "$UPDATE_NETWORK_TIMEOUT_SECONDS" \
             --retry 3 --retry-delay 1 --retry-connrefused \
             -o "$output" "$url"
         return
     fi
     if [[ "$redirect_mode" == "deny" ]]; then
-        wget -q --max-redirect=0 --https-only --secure-protocol=TLSv1_2 --tries=3 --timeout=20 -O "$output" "$url"
+        wget -q --max-redirect=0 --https-only --secure-protocol=TLSv1_2 --tries=3 --timeout="$UPDATE_NETWORK_TIMEOUT_SECONDS" -O "$output" "$url"
         return
     fi
-    wget -q --https-only --secure-protocol=TLSv1_2 --tries=3 --timeout=20 -O "$output" "$url"
+    wget -q --https-only --secure-protocol=TLSv1_2 --tries=3 --timeout="$UPDATE_NETWORK_TIMEOUT_SECONDS" -O "$output" "$url"
 }
 
 # Managed setup endpoints must return a non-empty script with a raw shebang.
@@ -590,24 +620,6 @@ run_with_spinner() {
         else
             "$GUM" spin --spinner dot --title "$title" -- "$@" >"$gum_out" 2>"$gum_err" || gum_status=$?
         fi
-        if [[ "$gum_status" -eq 0 ]]; then
-            if is_gum_raw_mode_failure "$gum_out" || is_gum_raw_mode_failure "$gum_err"; then
-                GUM=""
-                GUM_STATUS="skipped"
-                GUM_REASON="gum raw mode unavailable"
-                ui_warn "Spinner unavailable in this terminal; continuing without spinner"
-                if needs_stdin_isolation; then
-                    "$@" < /dev/null
-                else
-                    "$@"
-                fi
-                return $?
-            fi
-            if [[ -s "$gum_out" ]]; then
-                cat "$gum_out"
-            fi
-            return 0
-        fi
         if is_gum_raw_mode_failure "$gum_err" || is_gum_raw_mode_failure "$gum_out"; then
             GUM=""
             GUM_STATUS="skipped"
@@ -619,6 +631,12 @@ run_with_spinner() {
                 "$@"
             fi
             return $?
+        fi
+        if [[ "$gum_status" -eq 0 ]]; then
+            if [[ -s "$gum_out" ]]; then
+                cat "$gum_out"
+            fi
+            return 0
         fi
         if [[ -s "$gum_err" ]]; then
             cat "$gum_err" >&2
@@ -644,8 +662,6 @@ run_quiet_step() {
 
     local log
     mktempfile log
-    local showed_progress=false
-
     local cmd_exit=0
 
     if [[ -n "$GUM" ]] && gum_is_tty && ! is_shell_function "${1:-}"; then
@@ -657,11 +673,9 @@ run_quiet_step() {
         if (( cmd_exit == 0 )); then
             return 0
         fi
-        showed_progress=true
     else
         # Keep users informed even when gum spinner cannot run (for example shell functions).
         ui_info "${title}"
-        showed_progress=true
         if needs_stdin_isolation; then
             "$@" < /dev/null >"$log" 2>&1 || cmd_exit=$?
         else
@@ -670,10 +684,6 @@ run_quiet_step() {
         if (( cmd_exit == 0 )); then
             return 0
         fi
-    fi
-
-    if [[ "$showed_progress" == "false" ]]; then
-        ui_info "${title}"
     fi
 
     ui_error "${title} failed — re-run with --verbose for details"
@@ -1064,11 +1074,32 @@ const normalized = spec.trim();
 const unaliased = normalized.toLowerCase().startsWith("openclaw@") ? normalized.slice(9).trim() : normalized;
 const explicit = (value) => /\.(?:tgz|tar\.gz)$/i.test(value) || value.includes("://") || value.includes("#") || /^(?:file|github|git\+(?:ssh|https|http|file)|npm):/i.test(value);
 let identity = !normalized || explicit(normalized) || explicit(unaliased) || /^\.{1,2}(?:[\\/]|$)/.test(unaliased) || path.isAbsolute(normalized) || path.isAbsolute(unaliased) ? unaliased : "openclaw";
-if (/^npm:/i.test(identity)) identity = /^npm:(@[^/]+\/[^@]+|[^@]+?)(?:@.*)?$/i.exec(identity)?.[1] ?? "";
-const relative = cwd && path.isAbsolute(identity) ? path.relative(cwd, identity) || "." : "";
-if (relative) identity = path.isAbsolute(relative) || relative === "." || relative === ".." || relative.startsWith(`..${path.sep}`) ? relative : `.${path.sep}${relative}`;
+const alias = /^npm:/i.test(identity);
+if (alias) identity = /^npm:(@[^/]+\/[^@]+|[^@]+?)(?:@.*)?$/i.exec(identity)?.[1] ?? "";
+const filePrefix = /^file:/i.test(identity) ? "file:" : "";
+const archivePath = identity.slice(filePrefix.length);
+const gitShorthand = !/^~[\\/]/.test(identity) && /^[^./@\s:#][^/\s:@#]*\/[^/\s:@#]+(?:#[\s\S]*)?$/.test(identity);
+const localArchive = !alias && !gitShorthand && /\.(?:tgz|tar\.gz|tar)$/i.test(archivePath) && (filePrefix || path.isAbsolute(archivePath) || !/^[a-z][a-z0-9+.-]*:/i.test(archivePath));
+let absoluteArchive = "";
+if (localArchive) {
+  const npmPath = process.platform === "win32" ? archivePath.replaceAll("\\", "/") : archivePath;
+  // Escape raw paths before URL normalization so literal %, #, and ? retain their identity.
+  let fileUrl = `file:${encodeURI(npmPath).replace(/[?#]/g, encodeURIComponent)}`;
+  fileUrl = fileUrl.replace(/^file:\/\/(?=[^/])/, "file:/").replace(/^file:\/{1,3}(?=\.\.?(?:\/|$))/, "file:");
+  const specPath = decodeURIComponent(new URL(fileUrl).pathname);
+  let resolvedPath = decodeURIComponent(new URL(fileUrl, `${require("node:url").pathToFileURL(path.resolve(cwd || process.cwd())).href}/`).pathname);
+  if (process.platform === "win32") resolvedPath = resolvedPath.replace(/^\/+([a-z]:\/)/i, "$1");
+  absoluteArchive = /^\/~(?:\/|$)/.test(specPath) ? path.resolve(require("node:os").homedir(), specPath.slice(3)) : path.resolve(cwd || process.cwd(), resolvedPath);
+}
+// Tarballs match the absolute npm resolved identity; directory links accept relative paths.
+// Keep the npm 11 comma-path identity: its advisory/strict decision stays npm-owned.
+if (absoluteArchive && (+parsed[1] >= 12 || !absoluteArchive.includes(","))) identity = `${filePrefix}${absoluteArchive}`;
+else {
+  const relative = cwd && path.isAbsolute(identity) ? path.relative(cwd, identity) || "." : "";
+  if (relative) identity = path.isAbsolute(relative) || relative === "." || relative === ".." || relative.startsWith(`..${path.sep}`) ? relative : `.${path.sep}${relative}`;
+}
 if (exactIdentity) identity = exactIdentity;
-if (!identity || identity.includes(",")) fail(`npm cannot allow lifecycle scripts for install target '${spec}'.`);
+if (!identity || identity.includes(",")) fail(`npm cannot allow lifecycle scripts for install target '${spec}'; use a package URL or local path without commas.`);
 process.stdout.write(`--allow-scripts=${identity}\n`);
 NODE
 )" || return 1
@@ -1079,9 +1110,9 @@ verify_npm_lifecycle_completed() {
     local npm_cmd="$1" npm_root=""
     npm_root="$("$npm_cmd" root -g 2>/dev/null | awk 'NF { value = $0 } END { print value }')" || true
     [[ -n "$npm_root" ]] || { echo "Unable to resolve npm global root after install." >&2; return 1; }
-    [[ ! -e "${npm_root%/}/openclaw/dist/openclaw-install-guard" ]] || {
-        echo "OpenClaw lifecycle scripts did not complete; refusing installer success." >&2
-        return 1
+    [[ ! -e "${npm_root%/}/openclaw/.openclaw-lifecycle-pending" && ! -e "${npm_root%/}/openclaw/dist/openclaw-install-guard" ]] || {
+      echo "OpenClaw lifecycle scripts did not complete; refusing installer success." >&2
+      return 1
     }
 }
 
@@ -1108,9 +1139,6 @@ run_npm_global_install() {
 
     local -a cmd
     cmd=(env -u NPM_CONFIG_BEFORE -u npm_config_before -u NPM_CONFIG_MIN_RELEASE_AGE -u npm_config_min_release_age -u npm_config_min-release-age "$npm_cmd" --loglevel "$NPM_LOGLEVEL")
-    if [[ -n "$NPM_SILENT_FLAG" ]]; then
-        cmd+=("$NPM_SILENT_FLAG")
-    fi
     cmd+=(--no-fund --no-audit "$freshness_flag" install -g)
     [[ -z "$lifecycle_arg" ]] || cmd+=("$lifecycle_arg")
     cmd+=("$spec")
@@ -1191,7 +1219,7 @@ print_npm_failure_diagnostics() {
     if [[ -n "${LAST_NPM_INSTALL_CMD}" ]]; then
         echo "  Command: ${LAST_NPM_INSTALL_CMD}"
     fi
-    echo "  Installer log: ${log}"
+    # EXIT cleanup removes this capture; expose its contents and npm-owned log instead.
 
     error_code="$(extract_npm_error_code "$log")"
     if [[ -n "$error_code" ]]; then
@@ -1398,7 +1426,6 @@ GIT_DIR=${OPENCLAW_GIT_DIR:-"$(resolve_openclaw_effective_home)/openclaw"}
 GIT_DIR_EXPLICIT=${OPENCLAW_GIT_DIR:+1}
 GIT_UPDATE=${OPENCLAW_GIT_UPDATE:-1}
 NPM_LOGLEVEL="${OPENCLAW_NPM_LOGLEVEL:-error}"
-NPM_SILENT_FLAG="--silent"
 VERBOSE="${OPENCLAW_VERBOSE:-0}"
 VERIFY_INSTALL="${OPENCLAW_VERIFY_INSTALL:-0}"
 OPENCLAW_BIN=""
@@ -1480,20 +1507,19 @@ parse_args() {
                 HELP=1
                 shift
                 ;;
-            --install-method|--method)
+            --install-method|--method|--version|--git-dir|--dir)
                 if [[ $# -lt 2 || "${2:-}" == --* ]]; then
                     ui_error "Missing value for $1"
                     return 2
                 fi
-                INSTALL_METHOD="$2"
-                shift 2
-                ;;
-            --version)
-                if [[ $# -lt 2 || "${2:-}" == --* ]]; then
-                    ui_error "Missing value for $1"
-                    return 2
-                fi
-                OPENCLAW_VERSION="$2"
+                case "$1" in
+                    --install-method|--method) INSTALL_METHOD="$2" ;;
+                    --version) OPENCLAW_VERSION="$2" ;;
+                    --git-dir|--dir)
+                        GIT_DIR="$2"
+                        GIT_DIR_EXPLICIT=${2:+1}
+                        ;;
+                esac
                 shift 2
                 ;;
             --beta)
@@ -1507,15 +1533,6 @@ parse_args() {
             --git|--github)
                 INSTALL_METHOD="git"
                 shift
-                ;;
-            --git-dir|--dir)
-                if [[ $# -lt 2 || "${2:-}" == --* ]]; then
-                    ui_error "Missing value for $1"
-                    return 2
-                fi
-                GIT_DIR="$2"
-                GIT_DIR_EXPLICIT=${2:+1}
-                shift 2
                 ;;
             --no-git-update)
                 GIT_UPDATE=0
@@ -1536,7 +1553,6 @@ configure_verbose() {
     if [[ "$NPM_LOGLEVEL" == "error" ]]; then
         NPM_LOGLEVEL="notice"
     fi
-    NPM_SILENT_FLAG=""
     set -x
 }
 
@@ -1732,20 +1748,16 @@ node_version_components_are_supported() {
     local patch="$3"
 
     case "$major" in
-        "$NODE_MIN_MAJOR")
-            ((minor > NODE_22_MIN_MINOR)) ||
-                ((minor == NODE_22_MIN_MINOR && patch >= NODE_22_MIN_PATCH))
-            ;;
         24)
             ((minor > NODE_24_MIN_MINOR)) ||
                 ((minor == NODE_24_MIN_MINOR && patch >= NODE_24_MIN_PATCH))
             ;;
-        25)
-            ((minor > NODE_25_MIN_MINOR)) ||
-                ((minor == NODE_25_MIN_MINOR && patch >= NODE_25_MIN_PATCH))
+        26)
+            ((minor > NODE_26_MIN_MINOR)) ||
+                ((minor == NODE_26_MIN_MINOR && patch >= NODE_26_MIN_PATCH))
             ;;
         *)
-            ((major > 25))
+            ((major > 26))
             ;;
     esac
 }
@@ -1768,11 +1780,27 @@ node_binary_has_safe_sqlite() {
                         (minor === 51 && patch >= 3) ||
                         (minor === 50 && patch >= 7) ||
                         (minor === 44 && patch >= 6)));
-            if (!safe) process.exitCode = 1;
+            const text = "a\u0000b\u0000";
+            const bytes = Buffer.from(text, "utf8");
+            const json = JSON.stringify({ value: text });
+            db.exec("CREATE TABLE probe (text_value TEXT, blob_value BLOB, json_value TEXT)");
+            db.prepare("INSERT INTO probe VALUES (?, ?, ?)").run(text, bytes, json);
+            const row = db.prepare("SELECT text_value, blob_value, json_value FROM probe").get();
+            const textSafe = typeof row?.text_value === "string" && row.text_value.length === text.length && Buffer.from(row.text_value, "utf8").equals(bytes);
+            const blobSafe = row?.blob_value instanceof Uint8Array && Buffer.from(row.blob_value).equals(bytes);
+            const jsonSafe = row?.json_value === json && JSON.parse(row.json_value).value === text;
+            if (!textSafe) {
+                console.error("Node " + process.versions.node + ": node:sqlite truncates TEXT at embedded NUL (nodejs/node#61954); use 24.16+/26.1+ or a build with the fix");
+            } else if (!blobSafe || !jsonSafe) {
+                console.error("Node " + process.versions.node + ": node:sqlite NUL round-trip capability probe failed; use 24.16+/26.1+ or a build with the fix");
+            } else if (!safe) {
+                console.error("Node " + process.versions.node + ": SQLite " + value + " is not WAL-reset-safe");
+            }
+            if (!safe || !textSafe || !blobSafe || !jsonSafe) process.exitCode = 1;
         } finally {
             db.close();
         }
-    ' >/dev/null 2>&1
+    ' --no-warnings >/dev/null
 }
 
 node_binary_sqlite_version() {
@@ -1790,15 +1818,18 @@ node_binary_sqlite_version() {
     printf '%s\n' "${version:-unavailable}"
 }
 
-node_is_supported() {
+node_version_is_supported() {
     local version_components major minor patch
     version_components="$(parse_node_version_components || true)"
     read -r major minor patch <<< "$version_components"
     if [[ ! "$major" =~ ^[0-9]+$ || ! "$minor" =~ ^[0-9]+$ || ! "$patch" =~ ^[0-9]+$ ]]; then
         return 1
     fi
-    node_version_components_are_supported "$major" "$minor" "$patch" &&
-        node_binary_has_safe_sqlite node
+    node_version_components_are_supported "$major" "$minor" "$patch"
+}
+
+node_is_supported() {
+    node_binary_is_supported node
 }
 
 node_binary_is_supported() {
@@ -2044,7 +2075,7 @@ promote_supported_node_binary() {
         seen_dirs="${seen_dirs}${dir}:"
         if node_binary_is_supported "$candidate"; then
             prepend_path_dir "$dir" || continue
-            if [[ "$OS" == "linux" ]]; then
+            if [[ "$OS" == "linux" && "${NVM_DETECTED:-0}" != "1" ]]; then
                 persist_shell_path_prepend "$dir" || true
             fi
             ui_info "Using Node.js runtime at ${candidate}"
@@ -2112,7 +2143,6 @@ ensure_macos_default_node_active() {
 }
 
 ensure_default_node_active_shell() {
-    promote_supported_node_binary || true
     if node_is_supported; then
         return 0
     fi
@@ -2124,48 +2154,111 @@ ensure_default_node_active_shell() {
     ui_error "Active Node.js must be ${NODE_SUPPORTED_VERSION_LABEL} but this shell is using ${active_version} (${active_path})"
     print_active_node_paths || true
 
-    local nvm_detected=0
-    if [[ -n "${NVM_DIR:-}" || "$active_path" == *"/.nvm/"* ]]; then
-        nvm_detected=1
-    fi
-    if command -v nvm >/dev/null 2>&1; then
-        nvm_detected=1
-    fi
-
-    if [[ "$nvm_detected" -eq 1 ]]; then
-        echo "nvm appears to be managing Node for this shell."
-        echo "Run:"
-        echo "  nvm install ${NODE_DEFAULT_MAJOR}"
-        echo "  nvm use ${NODE_DEFAULT_MAJOR}"
-        echo "  nvm alias default ${NODE_DEFAULT_MAJOR}"
-        echo "Then open a new shell and rerun:"
-        echo "  curl -fsSL https://openclaw.ai/install.sh | bash"
-    else
-        echo "Install/select Node.js ${NODE_DEFAULT_MAJOR} and ensure it is first on PATH, then rerun installer."
-    fi
-
+    echo "Install/select Node.js ${NODE_DEFAULT_MAJOR} and ensure it is first on PATH, then rerun installer."
     return 1
 }
 
 load_nvm_for_node_detection() {
-    local nvm_dir="${NVM_DIR:-}"
-    if [[ -n "$nvm_dir" && ! -s "$nvm_dir/nvm.sh" ]]; then
-        nvm_dir=""
+    NVM_DETECTED=0
+    local nvm_dir="${NVM_DIR:-}" profile
+    if [[ -n "$nvm_dir" || -d "$HOME/.nvm" ]] || command -v nvm >/dev/null 2>&1; then
+        NVM_DETECTED=1
     fi
-    if [[ -z "$nvm_dir" && -s "$HOME/.nvm/nvm.sh" ]]; then
+    # Detect custom/lazy hooks without executing arbitrary shell startup files.
+    for profile in "$HOME/.bashrc" "$HOME/.bash_profile" "$HOME/.bash_login" "$HOME/.profile" \
+        "${ZDOTDIR:-$HOME}/.zshrc" "${ZDOTDIR:-$HOME}/.zprofile"; do
+        if [[ -r "$profile" ]] && grep -Eq '^[[:space:]]*([^#[:space:]].*)?(NVM_DIR|nvm[.]sh)' "$profile"; then
+            NVM_DETECTED=1
+        fi
+    done
+    if [[ ! -s "$nvm_dir/nvm.sh" && -s "$HOME/.nvm/nvm.sh" ]]; then
         nvm_dir="$HOME/.nvm"
     fi
-    if [[ -z "$nvm_dir" || ! -s "$nvm_dir/nvm.sh" ]]; then
-        return 0
-    fi
-
-    export NVM_DIR="$nvm_dir"
-    # shellcheck disable=SC1090,SC1091
-    . "$NVM_DIR/nvm.sh" --no-use >/dev/null 2>&1 || . "$NVM_DIR/nvm.sh" >/dev/null 2>&1 || true
-    if command -v nvm >/dev/null 2>&1; then
-        nvm use default --silent >/dev/null 2>&1 || nvm use node --silent >/dev/null 2>&1 || true
+    if [[ -n "$nvm_dir" && -s "$nvm_dir/nvm.sh" ]]; then
+        NVM_DETECTED=1
+        export NVM_DIR="$nvm_dir"
+        # --no-use preserves the caller's selected system or managed runtime.
+        # shellcheck disable=SC1090,SC1091
+        if ! . "$NVM_DIR/nvm.sh" --no-use; then
+            ui_error "Could not load existing nvm at ${NVM_DIR}; load it in your shell and rerun the installer"
+            return 1
+        fi
     fi
     refresh_shell_command_cache
+}
+
+use_supported_nvm_node() {
+    command -v nvm >/dev/null 2>&1 || return 1
+    local candidate version
+    for candidate in "${NVM_DIR:-$HOME/.nvm}"/versions/node/*/bin/node; do
+        [[ -x "$candidate" ]] || continue
+        node_binary_is_supported "$candidate" || continue
+        version="${candidate%/bin/node}"
+        version="${version##*/}"
+        nvm use --silent "$version" || return 1
+        refresh_shell_command_cache
+        node_is_supported || return 1
+        ui_info "Using existing nvm Node.js ${version} for this installation (${NVM_DIR})"
+        echo "  Shell profiles and the nvm default are unchanged. For later commands, run: nvm use ${version}"
+        return 0
+    done
+    return 1
+}
+
+install_node_with_existing_nvm() {
+    local reason="${1:-no compatible Node.js runtime is available}"
+    local default_version="" default_note="Your existing default alias setting will be preserved."
+    if command -v nvm >/dev/null 2>&1; then
+        default_version="$(nvm version default 2>/dev/null || true)"
+    fi
+    case "$default_version" in
+        v*|system) default_note="Keep current default ${default_version}; if nvm refreshes aliases, pin default to ${default_version}." ;;
+        *)
+            if [[ -n "${NVM_DIR:-}" && ! -e "$NVM_DIR/alias/default" ]]; then
+                default_note="nvm will also create its currently unset default alias."
+            fi
+            ;;
+    esac
+    ui_warn "Existing nvm detected; ${reason}"
+    echo "Load your existing nvm in your shell, then run:"
+    echo "  nvm install ${NODE_DEFAULT_MAJOR}"
+    echo "  nvm use ${NODE_DEFAULT_MAJOR}"
+    echo "nvm install can refresh LTS aliases; check your default with: nvm version default"
+    echo "Then rerun the installer. Shell profiles will not be changed."
+
+    local answer=""
+    if command -v nvm >/dev/null 2>&1 && is_promptable; then
+        answer="$(prompt_choice "Install Node.js ${NODE_DEFAULT_MAJOR} in your existing nvm (${NVM_DIR}) for this session? ${default_note} [y/N]" || true)"
+    fi
+    case "$answer" in
+        y|Y|yes|YES)
+            ui_info "Installing Node.js ${NODE_DEFAULT_MAJOR} in existing nvm (${NVM_DIR}). ${default_note}"
+            local install_result=0
+            nvm install "$NODE_DEFAULT_MAJOR" || install_result=$?
+            # Remote LTS metadata can move an existing default even on download failure.
+            case "$default_version" in
+                v*|system)
+                    if [[ "$(nvm version default 2>/dev/null || true)" != "$default_version" ]]; then
+                        ui_info "Preserving the previous default: nvm alias default ${default_version} (approved)"
+                        nvm alias default "$default_version" || return 1
+                    fi
+                    ;;
+            esac
+            if [[ "$install_result" -ne 0 ]]; then
+                ui_error "nvm install failed; any downloaded files remain in ${NVM_DIR}. Fix the reported error and rerun the command above."
+                return 1
+            fi
+            nvm use --silent "$NODE_DEFAULT_MAJOR" || return 1
+            refresh_shell_command_cache
+            ensure_default_node_active_shell || return 1
+            ui_info "nvm default now resolves to: $(nvm version default 2>/dev/null || true)"
+            ui_success "Using nvm Node.js $(node -v) for this installation; shell profiles unchanged"
+            ;;
+        *)
+            ui_error "Installation stopped without changing Node.js; run the nvm commands above to continue"
+            return 1
+            ;;
+    esac
 }
 
 check_node() {
@@ -2190,7 +2283,9 @@ check_node() {
 }
 
 finish_linux_node_install() {
-    activate_supported_node_on_path || true
+    if ! node_is_supported; then
+        activate_supported_node_on_path || true
+    fi
     if ! node_is_supported; then
         local active_path active_version
         active_path="$(command -v node 2>/dev/null || echo "not found")"
@@ -2243,6 +2338,30 @@ install_node_with_apk() {
     exit 1
 }
 
+install_node_with_user_prefix() {
+    local cli_installer prefix node_bin_dir
+    prefix="${HOME}/.openclaw"
+    node_bin_dir="${prefix}/tools/node/bin"
+    mktempfile cli_installer
+
+    ui_info "Using a user-space Node.js runtime because the system Node.js links unsafe SQLite"
+    run_required_step "Downloading user-space Node.js installer" \
+        download_validated_script "https://openclaw.ai/install-cli.sh" "$cli_installer"
+    # The child Bash expands this script's positional arguments, not this shell.
+    # shellcheck disable=SC2016
+    run_required_step "Installing user-space Node.js" \
+        env OPENCLAW_INSTALL_CLI_SH_NO_RUN=1 OPENCLAW_PREFIX="$prefix" \
+        bash -c '
+            set -euo pipefail
+            source "$1"
+            install_node "$(os_detect)" "$(arch_detect)"
+        ' openclaw-install-node "$cli_installer"
+
+    prepend_path_dir "$node_bin_dir"
+    persist_shell_path_prepend "$node_bin_dir" "\$HOME/.openclaw/tools/node/bin" || true
+    finish_linux_node_install
+}
+
 # Install Node.js
 install_node() {
     if [[ "$OS" == "macos" ]]; then
@@ -2265,6 +2384,14 @@ install_node() {
             ui_success "Build tools installed"
         else
             ui_warn "Continuing without auto-installing build tools"
+        fi
+
+        # RPM distributions can link a supported Node release to a vulnerable
+        # system SQLite. Preserve distro packages and use the managed runtime.
+        if { command -v dnf &> /dev/null || command -v yum &> /dev/null; } &&
+            node_version_is_supported && ! node_binary_has_safe_sqlite node; then
+            install_node_with_user_prefix
+            return 0
         fi
 
         # Arch-based distros: use pacman with official repos
@@ -2370,37 +2497,26 @@ install_git() {
         run_quiet_step "Installing Git" brew install git
     elif [[ "$OS" == "linux" ]]; then
         require_sudo
+        local -a git_cmd=()
         if command -v apk &> /dev/null && is_alpine_linux; then
-            if is_root; then
-                run_quiet_step "Installing Git" apk add --no-cache git
-            else
-                run_quiet_step "Installing Git" sudo apk add --no-cache git
-            fi
+            git_cmd=(apk add --no-cache git)
         elif command -v apt-get &> /dev/null; then
             run_quiet_step "Updating package index" apt_get_update
-            run_quiet_step "Installing Git" apt_get_install git
+            git_cmd=(apt_get_install git)
         elif command -v pacman &> /dev/null && is_arch_linux; then
-            if is_root; then
-                run_quiet_step "Installing Git" pacman -Sy --noconfirm git
-            else
-                run_quiet_step "Installing Git" sudo pacman -Sy --noconfirm git
-            fi
+            git_cmd=(pacman -Sy --noconfirm git)
         elif command -v dnf &> /dev/null; then
-            if is_root; then
-                run_quiet_step "Installing Git" dnf install -y -q git
-            else
-                run_quiet_step "Installing Git" sudo dnf install -y -q git
-            fi
+            git_cmd=(dnf install -y -q git)
         elif command -v yum &> /dev/null; then
-            if is_root; then
-                run_quiet_step "Installing Git" yum install -y -q git
-            else
-                run_quiet_step "Installing Git" sudo yum install -y -q git
-            fi
+            git_cmd=(yum install -y -q git)
         else
             ui_error "Could not detect package manager for Git"
             exit 1
         fi
+        if [[ "${git_cmd[0]}" != "apt_get_install" ]] && ! is_root; then
+            git_cmd=(sudo "${git_cmd[@]}")
+        fi
+        run_quiet_step "Installing Git" "${git_cmd[@]}"
     fi
     ui_success "Git installed"
 }
@@ -2419,6 +2535,18 @@ fix_npm_permissions() {
 
     if [[ -w "$npm_prefix" || -w "$npm_prefix/lib" ]]; then
         return 0
+    fi
+
+    if [[ "${NVM_DETECTED:-0}" == "1" ]]; then
+        # npm's persistent prefix setting makes subsequent nvm use commands fail.
+        ui_warn "npm global prefix is not writable: ${npm_prefix}; preserving nvm-compatible npm settings"
+        use_supported_nvm_node || install_node_with_existing_nvm "the active npm prefix is not writable" || return 1
+        npm_prefix="$(npm config get prefix 2>/dev/null || true)"
+        if [[ -n "$npm_prefix" && ( -w "$npm_prefix" || -w "$npm_prefix/lib" ) ]]; then
+            return 0
+        fi
+        ui_error "The selected nvm runtime still has an unwritable npm prefix (${npm_prefix}); check your npm config before rerunning"
+        return 1
     fi
 
     ui_warn "npm global prefix is not writable: ${npm_prefix}"
@@ -2486,7 +2614,7 @@ ensure_pnpm() {
     local repo_dir="${1:-$PWD}"
     local spec version pnpm_dir corepack_cmd="" npm_cmd lifecycle_arg selected_version
     spec="$(repo_pnpm_spec "$repo_dir" || true)"
-    [[ "$spec" == pnpm@* ]] || spec="pnpm@12.0.0"
+    [[ "$spec" == pnpm@* ]] || spec="pnpm@12.5.1"
     version="${spec#pnpm@}"
     version="${version%%+*}"
     pnpm_dir="$(mktemp -d "${TMPDIR:-/tmp}/openclaw-pnpm.XXXXXX")" || return 1
@@ -2545,30 +2673,15 @@ resolve_git_openclaw_ref() {
     local resolved_version=""
 
     case "$requested" in
-        ""|latest)
+        ""|latest|next|beta)
             resolved_version="$(npm view "openclaw" "dist-tags.${requested:-latest}" 2>/dev/null || true)"
             if [[ -n "$resolved_version" ]]; then
                 echo "v${resolved_version}"
-                return 0
+            elif [[ -z "$requested" || "$requested" == "latest" ]]; then
+                echo "main"
+            else
+                echo "$requested"
             fi
-            echo "main"
-            return 0
-            ;;
-        next|beta)
-            resolved_version="$(npm view "openclaw" "dist-tags.${requested:-latest}" 2>/dev/null || true)"
-            if [[ -n "$resolved_version" ]]; then
-                echo "v${resolved_version}"
-                return 0
-            fi
-            echo "$requested"
-            return 0
-            ;;
-        main)
-            echo "main"
-            return 0
-            ;;
-        v[0-9]*)
-            echo "$requested"
             return 0
             ;;
         [0-9]*.[0-9]*.[0-9]*)
@@ -3006,12 +3119,31 @@ warn_shell_path_missing_dir() {
         return 0
     fi
 
+    if [[ -n "${NVM_DIR:-}" && "$dir" == "$NVM_DIR"/versions/node/*/bin ]]; then
+        local version="${dir%/bin}"
+        version="${version##*/}"
+        ui_info "OpenClaw was installed under nvm Node.js ${version}"
+        echo "  For this shell and future shells, run: nvm use ${version}"
+        echo "  Shell profiles were not changed."
+        return 0
+    fi
+
     # persist_shell_path_prepend may already have written the export line; in
     # that case new shells are fine and the user only needs to reload this one.
     # RC lines may spell the home dir as $HOME instead of the expanded path.
     local dir_home_form="\$HOME${dir#"$HOME"}"
+    local managed_node_bin="$HOME/.openclaw/tools/node/bin"
+    local managed_node_home_form="\$HOME/.openclaw/tools/node/bin"
+    if [[ ! -d "$managed_node_bin" || ! -d "$dir" ||
+        "$(canonicalize_dir "$managed_node_bin" || true)" != "$(canonicalize_dir "$dir" || true)" ]]; then
+        managed_node_bin=""
+        managed_node_home_form=""
+    fi
     for rc in "$HOME/.bashrc" "$HOME/.bash_profile" "$HOME/.bash_login" "$HOME/.profile" "$HOME/.zshrc" "$HOME/.zprofile" "$HOME/.config/fish/conf.d/openclaw.fish"; do
-        if [[ -f "$rc" ]] && { grep -Fq "$dir" "$rc" || grep -Fq "$dir_home_form" "$rc"; }; then
+        if [[ -f "$rc" ]] && {
+            grep -Fq "$dir" "$rc" || grep -Fq "$dir_home_form" "$rc" ||
+                { [[ -n "$managed_node_bin" ]] && { grep -Fq "$managed_node_bin" "$rc" || grep -Fq "$managed_node_home_form" "$rc"; }; }
+        }; then
             echo ""
             ui_info "PATH updated in ${rc}: added ${label} (${dir})"
             echo "  New terminals pick this up automatically."
@@ -3086,11 +3218,23 @@ bounded_probe_output() {
     pid="$!"
 
     (
-        sleep "$timeout_seconds"
+        local sleeper
+        # Builtin wait lets TERM interrupt the watchdog; a foreground sleep
+        # would outlive it and hold the caller's command-substitution pipe open.
+        trap 'exit' TERM
+        trap '
+            for sleeper in $(jobs -p); do
+                kill "$sleeper" 2>/dev/null || true
+                wait "$sleeper" 2>/dev/null || true
+            done
+        ' EXIT
+        sleep "$timeout_seconds" &
+        wait "$!"
         if kill -0 "$pid" 2>/dev/null; then
             printf '1' >"$timeout_file"
             kill "$pid" 2>/dev/null || true
-            sleep 0.1
+            sleep 0.1 &
+            wait "$!"
             kill -9 "$pid" 2>/dev/null || true
             printf 'timeout' >"$status_file"
         fi
@@ -3263,7 +3407,7 @@ install_openclaw_from_git() {
     if should_prefer_offline_pnpm_install "$repo_dir"; then
         pnpm_prefer_offline_args=(--prefer-offline)
     fi
-    CI="${CI:-true}" run_quiet_step "Installing dependencies" run_pnpm -C "$repo_dir" install "${pnpm_prefer_offline_args[@]}" "$install_lockfile_flag"
+    CI="${CI:-true}" run_quiet_step "Installing dependencies" run_pnpm -C "$repo_dir" install ${pnpm_prefer_offline_args[@]+"${pnpm_prefer_offline_args[@]}"} "$install_lockfile_flag"
 
     if ! run_quiet_step "Building UI" run_pnpm -C "$repo_dir" ui:build; then
         ui_warn "UI build failed; continuing (CLI may still work)"
@@ -3585,7 +3729,8 @@ refresh_gateway_service_if_loaded() {
     fi
 
     ui_info "Refreshing loaded gateway service"
-    if ! refresh_output="$({ set +x; "$claw" gateway install --force; } 2>&1 | sed -n -e 's/.*SERVICE_DEFINITION_SEALED:.*/ask the privileged deployment owner to manually repair it/p' -e 's/.*SERVICE_DEFINITION_UNKNOWN:.*/inspect service-definition access and manually repair it/p')"; then
+    if ! refresh_output="$({ set +x; "$claw" gateway install --force; } 2>&1 | sed -n -e 's/^Replacing unsupported Gateway service Node .*; refreshing the install\.$/node-runtime-replaced/p' -e 's/^Replacing missing Gateway service Node .*; refreshing the install\.$/node-runtime-replaced/p' -e 's/.*SERVICE_DEFINITION_SEALED:.*/ask the privileged deployment owner to manually repair it/p' -e 's/.*SERVICE_DEFINITION_UNKNOWN:.*/inspect service-definition access and manually repair it/p')"; then
+        refresh_output="$(printf '%s\n' "$refresh_output" | sed '/^node-runtime-replaced$/d')"
         if [[ -n "$refresh_output" ]]; then
             ui_warn "Code installed; gateway service definition left unchanged; ${refresh_output}"
             ui_info "Run openclaw gateway status --deep, verify the installation owner, and restart it manually if needed."
@@ -3595,6 +3740,9 @@ refresh_gateway_service_if_loaded() {
             return 0
         fi
     else
+        if [[ "$refresh_output" == *node-runtime-replaced* ]]; then
+            ui_success "Gateway service Node runtime replaced"
+        fi
         ui_success "Gateway service metadata refreshed"
     fi
 
@@ -3642,17 +3790,29 @@ verify_installation() {
 
 retire_npm_owner_after_git_install() {
     local wrapper="$HOME/.local/bin/openclaw" npm_cmd="" npm_root="" npm_bin="" package_root="" package_name=""
-    npm_cmd="$(npm_command_path npm)" || return 1
+    if ! npm_cmd="$(npm_command_path npm)"; then
+        ui_error "Could not retire the previous npm install: npm not found on PATH"
+        return 1
+    fi
     npm_root="$("$npm_cmd" root -g 2>/dev/null | awk 'NF { value = $0 } END { print value }')" || true
     package_root="${npm_root%/}/openclaw"
     [[ -n "$npm_root" && -f "$package_root/package.json" ]] || return 0
     package_name="$(node -e 'const p=require(process.argv[1]); process.stdout.write(String(p.name || ""))' "$package_root/package.json" 2>/dev/null || true)"
-    [[ "$package_name" == "openclaw" ]] || return 1
+    if [[ "$package_name" != "openclaw" ]]; then
+        ui_error "Could not retire the previous npm install: ${package_root} contains package '${package_name:-unknown}', not openclaw"
+        return 1
+    fi
     npm_bin="$(npm_global_bin_dir "$npm_cmd" || true)"
     if [[ "${npm_bin%/}/openclaw" == "$wrapper" ]]; then
-        rm -rf "$package_root" || return 1
+        if ! rm -rf "$package_root"; then
+            ui_error "Could not retire the previous npm install: failed to remove ${package_root}"
+            return 1
+        fi
     else
-        "$npm_cmd" uninstall -g openclaw >/dev/null 2>&1 || return 1
+        if ! "$npm_cmd" uninstall -g openclaw >/dev/null 2>&1; then
+            ui_error "Could not retire the previous npm install: npm uninstall -g openclaw failed"
+            return 1
+        fi
     fi
     ui_success "Previous npm install retired"
 }
@@ -3668,10 +3828,13 @@ is_installer_git_wrapper() {
 
 prepare_git_wrapper_backup_for_npm() {
     local npm_cmd="" npm_root="" npm_bin="" target="" launcher=""
-    npm_cmd="$(npm_command_path npm)" || return 1
+    # Without a resolvable npm there is nothing to back up; let the npm
+    # install step report the missing npm with its own remediation text
+    # instead of silently exiting here (Arch splits node and npm packages).
+    npm_cmd="$(npm_command_path npm)" || return 0
     npm_root="$("$npm_cmd" root -g 2>/dev/null || true)"
     npm_bin="$(npm_global_bin_dir "$npm_cmd" || true)"
-    [[ -n "$npm_root" && -n "$npm_bin" ]] || return 1
+    [[ -n "$npm_root" && -n "$npm_bin" ]] || return 0
     target="${npm_bin%/}/openclaw"
     is_installer_git_wrapper "$target" || return 0
     launcher="${npm_root%/}/openclaw/openclaw.mjs"
@@ -3681,7 +3844,10 @@ prepare_git_wrapper_backup_for_npm() {
 retire_git_wrapper_after_npm_install() {
     local wrapper="$HOME/.local/bin/openclaw"
     is_installer_git_wrapper "$wrapper" || return 0
-    rm -f "$wrapper" || return 1
+    if ! rm -f "$wrapper"; then
+        ui_error "Could not retire the previous git wrapper: failed to remove ${wrapper}"
+        return 1
+    fi
     ui_success "Previous git wrapper retired"
 }
 
@@ -3692,11 +3858,15 @@ main() {
         return 0
     fi
 
-    # bootstrap_gum_temp may perform network downloads before any spinner is available.
-    echo -e "${INFO}Preparing installer interface...${NC}"
-    bootstrap_gum_temp || true
+    # A dry run must stay side-effect free; gum bootstrap may download binaries.
+    if [[ "$DRY_RUN" != "1" ]]; then
+        echo -e "${INFO}Preparing installer interface...${NC}"
+        bootstrap_gum_temp || true
+    fi
     print_installer_banner
-    print_gum_status
+    if [[ "$DRY_RUN" != "1" ]]; then
+        print_gum_status
+    fi
     detect_os_or_die
 
     if [[ "$OS" == "linux" ]]; then
@@ -3757,12 +3927,18 @@ main() {
 
     # Step 1: Node.js. macOS package-manager branches install Homebrew lazily
     # only when they are about to call brew.
-    load_nvm_for_node_detection
-    if ! check_node; then
-        install_homebrew
-        install_node
+    load_nvm_for_node_detection || exit 1
+    if ! node_is_supported; then
+        use_supported_nvm_node || activate_supported_node_on_path || true
     fi
-    activate_supported_node_on_path || true
+    if ! check_node; then
+        if [[ "${NVM_DETECTED:-0}" == "1" ]]; then
+            install_node_with_existing_nvm || exit 1
+        else
+            install_homebrew
+            install_node
+        fi
+    fi
     if ! ensure_default_node_active_shell; then
         exit 1
     fi
@@ -3791,7 +3967,7 @@ main() {
         fi
 
         # Step 4: npm permissions (Linux)
-        fix_npm_permissions
+        fix_npm_permissions || exit 1
 
         # Step 5: OpenClaw
         prepare_git_wrapper_backup_for_npm || return $?

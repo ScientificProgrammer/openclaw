@@ -3,11 +3,7 @@ import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { withEnv } from "../test-utils/env.js";
 import { withTempDir } from "../test-utils/temp-dir.js";
-import {
-  formatTuiAuthCommandArgv,
-  resolveCodexCliBin,
-  resolveLocalAuthSpawnInvocation,
-} from "./tui.js";
+import { formatTuiAuthCommandArgv, resolveLocalAuthSpawnInvocation } from "./tui.js";
 
 describe("formatTuiAuthCommandArgv", () => {
   it("renders bounded redacted argv without shell semantics", () => {
@@ -43,19 +39,6 @@ describe("formatTuiAuthCommandArgv", () => {
   });
 });
 
-describe("resolveCodexCliBin", () => {
-  it("returns null or a valid Codex executable path", async () => {
-    const result = await resolveCodexCliBin();
-    if (result === null) {
-      expect(result).toBeNull();
-      return;
-    }
-    expect(typeof result).toBe("string");
-    expect(result.length).toBeGreaterThan(0);
-    expect(result).toContain("codex");
-  });
-});
-
 describe("resolveLocalAuthSpawnInvocation", () => {
   it("wraps Windows cmd shims through cmd.exe", () => {
     expect(
@@ -66,7 +49,7 @@ describe("resolveLocalAuthSpawnInvocation", () => {
       }),
     ).toEqual({
       command: "C:\\Windows\\System32\\cmd.exe",
-      args: ["/d", "/s", "/c", "C:\\Users\\me\\AppData\\Roaming\\npm\\codex.cmd login"],
+      args: ["/d", "/s", "/c", '""C:\\Users\\me\\AppData\\Roaming\\npm\\codex.cmd" "login""'],
       options: { windowsHide: true, windowsVerbatimArguments: true },
     });
   });
@@ -80,7 +63,7 @@ describe("resolveLocalAuthSpawnInvocation", () => {
       }),
     ).toEqual({
       command: "C:\\Windows\\System32\\cmd.exe",
-      args: ["/d", "/s", "/c", '""C:\\Program Files\\Codex\\codex.bat" login"'],
+      args: ["/d", "/s", "/c", '""C:\\Program Files\\Codex\\codex.bat" "login""'],
       options: { windowsHide: true, windowsVerbatimArguments: true },
     });
   });

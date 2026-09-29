@@ -78,7 +78,7 @@ extension GatewayUsageSummary {
                     displayName: provider.displayName,
                     plan: provider.plan,
                     windowLabel: window.label,
-                    usedPercent: window.usedPercent,
+                    usedPercent: window.usedPercent.isFinite ? min(100, max(0, window.usedPercent)) : nil,
                     resetAt: window.resetAt.map { Date(timeIntervalSince1970: $0 / 1000) },
                     errorText: nil)
             }
@@ -97,16 +97,5 @@ extension GatewayUsageSummary {
                 resetAt: nil,
                 errorText: error)
         }
-    }
-}
-
-@MainActor
-enum UsageLoader {
-    static func loadSummary() async throws -> GatewayUsageSummary {
-        let data = try await ControlChannel.shared.request(
-            method: "usage.status",
-            params: nil,
-            timeoutMs: 5000)
-        return try JSONDecoder().decode(GatewayUsageSummary.self, from: data)
     }
 }

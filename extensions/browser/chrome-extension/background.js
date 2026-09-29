@@ -2,6 +2,7 @@ import {
   createNativeBootstrapController,
   discardRetiredCopilotState,
   prepareRetiredCopilotState,
+  requestRelayEnsure,
 } from "./modules/native-bootstrap.js";
 import { createPopupMessageHandler } from "./modules/popup-background.js";
 import { createRelayCommandHandler } from "./modules/relay-command-handler.js";
@@ -16,6 +17,7 @@ import { openAuthenticatedRelaySocket } from "./modules/relay-connection.js";
 import {
   ACCESS_MODE_SELECTED,
   createPairingConfigStore,
+  directLoopbackRelayPort,
   reconnectDelayMs,
   toRelayTabInfo,
 } from "./modules/relay-core.js";
@@ -30,6 +32,7 @@ const BADGE = {
   on: { text: "ON", color: "#0F9D58" },
   error: { text: "!", color: "#B91C1C" },
 };
+const RELAY_ENSURE_MIN_INTERVAL_MS = 60_000;
 const RELAY_WATCHDOG_ALARM = "openclaw-relay-watchdog";
 const RELAY_OPENING_DEADLINE_ALARM = "openclaw-relay-opening-deadline";
 const RELAY_AUTH_TIMEOUT_MS = 10_000;
@@ -44,6 +47,7 @@ let relayOpeningDeadlineTimer = null;
 let relayAuthenticatedSocket = null;
 let relaySocketOwner = null;
 let relayStatusHint = "";
+let lastRelayEnsureAtMs = 0;
 let reconciledPairingInvalidationRevision = 0;
 let relayConnectionGeneration = 0;
 let relayConnectionsSuspended = false;
@@ -74,15 +78,12 @@ const tabAccessReady = (async () => {
   }
 })();
 
-const custodyError = () =>
-  new Error(
-    "Automation is paused to protect a pre-upgrade copilot session. Open Settings to disconnect before reconnecting.",
-  );
-
 async function requireAutomationAllowed() {
   await tabAccessReady;
   if (retiredCopilotCustodyBlocked) {
-    throw custodyError();
+    throw new Error(
+      "Automation is paused to protect a pre-upgrade copilot session. Open Settings to disconnect before reconnecting.",
+    );
   }
 }
 
@@ -190,7 +191,14 @@ async function syncTabsToRelay() {
     return;
   }
   const generations = [...attachments].filter(([, record]) => !record.retired);
-  const accessible = await tabAccessPolicy.listAccessibleTabs();
+  let accessible;
+  let inventoryRevision;
+  // A handoff can overtake even a completed read before this caller resumes.
+  // Publish and retire attachments only from the current inventory generation.
+  do {
+    inventoryRevision = tabAccessPolicy.discoveryRevision;
+    accessible = await tabAccessPolicy.listAccessibleTabs();
+  } while (inventoryRevision !== tabAccessPolicy.discoveryRevision);
   if (
     relayWs !== socket ||
     relayAuthenticatedSocket !== socket ||
@@ -338,7 +346,12 @@ function failRelayAuthentication(ws, error) {
 }
 
 async function sendHello(socket) {
-  const accessible = await tabAccessPolicy.listAccessibleTabs();
+  let accessible;
+  let inventoryRevision;
+  do {
+    inventoryRevision = tabAccessPolicy.discoveryRevision;
+    accessible = await tabAccessPolicy.listAccessibleTabs();
+  } while (inventoryRevision !== tabAccessPolicy.discoveryRevision);
   const uaMatch = /Chrom(?:e|ium)\/[\d.]+/.exec(navigator.userAgent);
   send(
     {
@@ -390,6 +403,7 @@ async function connectRelay(isConnectionAllowed = () => true) {
     return;
   }
   closeRelaySocket();
+  void maybeEnsureRelayDaemon(relayUrl, connectionIsCurrent).catch(() => {});
   setBadge("connecting");
   let ws;
   const owner = relayDebugger.createOwner(
@@ -496,6 +510,29 @@ function handleRelayOpeningDeadline() {
   scheduleReconnect();
 }
 
+/**
+ * On a reconnect cycle against a direct loopback relay URL, ask the native
+ * host (rate-limited) to spawn the standalone relay daemon so the extension
+ * has something to connect to without a running Gateway.
+ */
+async function maybeEnsureRelayDaemon(relayUrl, connectionIsCurrent) {
+  const relayPort = directLoopbackRelayPort(relayUrl);
+  if (reconnectAttempt === 0 || relayPort === null) {
+    return;
+  }
+  const { disabled } = await nativeBootstrap.status();
+  // Opt-out or pair revocation can win the storage read above.
+  if (disabled || retiredCopilotCustodyBlocked || !connectionIsCurrent()) {
+    return;
+  }
+  const now = Date.now();
+  if (now - lastRelayEnsureAtMs < RELAY_ENSURE_MIN_INTERVAL_MS) {
+    return;
+  }
+  lastRelayEnsureAtMs = now;
+  await requestRelayEnsure(relayPort, chrome);
+}
+
 function scheduleReconnect() {
   if (reconnectTimer) {
     return;
@@ -572,7 +609,7 @@ const handlePopupMessage = createPopupMessageHandler({
 });
 nativeBootstrap = createNativeBootstrapController({
   getPairing: getConfig,
-  applyPairing: async (request) => await handlePopupMessage.applyPairing(request),
+  applyPairing: handlePopupMessage.applyPairing,
 });
 chrome.runtime.onMessage.addListener((msg, _sender, reply) => handlePopupMessage(msg, reply));
 

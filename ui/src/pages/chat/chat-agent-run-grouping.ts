@@ -1,17 +1,19 @@
 import { readSessionMessageIdentity } from "@openclaw/gateway-client/browser";
 import { asNullableRecord as asRecord } from "@openclaw/normalization-core/record-coerce";
-import { resolveAssistantMessagePhase } from "../../../../src/shared/chat-message-content.js";
 import type { MessageGroup } from "../../lib/chat/chat-types.ts";
 import { extractTextCached } from "../../lib/chat/message-extract.ts";
+import {
+  assistantMessageIsInterrupted,
+  resolveAssistantReplyPhase,
+} from "./chat-assistant-reply.ts";
 import type {
   ActivityRunRenderItem,
   CompletedTurnRenderItem,
   StreamRunRenderItem,
   WorkGroupRenderItem,
 } from "./chat-thread-grouping.ts";
-import { isKeyedAssistantStreamFallbackMessage } from "./chat-thread-run-identity.ts";
 import { assistantGroupIsForwardedBoundary, chatItemStartsUserTurn } from "./chat-turn-boundary.ts";
-import { readLiveTerminalDisposition } from "./terminal-message-identity.ts";
+import { extractMessageMediaText } from "./components/chat-message-media.ts";
 
 type AgentRunFramePart =
   | MessageGroup
@@ -52,20 +54,11 @@ function itemRunId(item: AgentRunFramePart): string | undefined {
   return runId && groups.every((group) => group.runId === runId) ? runId : undefined;
 }
 
-function messageIsInterrupted(message: unknown): boolean {
-  const record = asRecord(message);
-  const stopReason = typeof record?.stopReason === "string" ? record.stopReason.toLowerCase() : "";
-  return (
-    readLiveTerminalDisposition(message) !== null ||
-    asRecord(record?.openclawAbort)?.aborted === true ||
-    ["aborted", "cancelled", "canceled", "timeout", "timed_out"].includes(stopReason)
-  );
-}
-
 function itemFailsFrame(item: AgentRunFramePart): boolean {
   return itemGroups(item).some((group) =>
     group.messages.some(
-      ({ message }) => messageIsInterrupted(message) || asRecord(message)?.stopReason === "error",
+      ({ message }) =>
+        assistantMessageIsInterrupted(message) || asRecord(message)?.stopReason === "error",
     ),
   );
 }
@@ -79,30 +72,14 @@ function itemIsActive(item: AgentRunFramePart): boolean {
   return itemGroups(item).some((group) => group.isStreaming);
 }
 
-function itemBoundaryId(item: AgentRunFramePart): string | undefined {
-  return item.kind === "stream-run" ? item.boundaryId : undefined;
-}
-
 function groupBoundaryId(group: MessageGroup): string | undefined {
   const firstMessage = group.messages[0]?.message;
   const identity = readSessionMessageIdentity(firstMessage);
-  if (!chatItemStartsUserTurn(group)) {
-    return undefined;
-  }
   const runId = identity?.runId;
   if (runId) {
     return `send:${runId}`;
   }
   return identity?.id ? `entry:${identity.id}` : undefined;
-}
-
-function isExternalBoundary(group: MessageGroup): boolean {
-  return group.role === "user" || assistantGroupIsForwardedBoundary(group);
-}
-
-function itemBoundaryGroup(item: AgentRunFramePart): MessageGroup | undefined {
-  const first = itemGroups(item)[0];
-  return first && chatItemStartsUserTurn(first) ? first : undefined;
 }
 
 function frameKey(runId: string, boundaryId: string, segmentId: string | undefined): string {
@@ -127,17 +104,15 @@ export function agentRunFrameGroups(frame: AgentRunFrameRenderItem): MessageGrou
 
 function messageCanOwnCompletedFrame(message: unknown, explicitOnly: boolean): boolean {
   const record = asRecord(message);
-  const phase = resolveAssistantMessagePhase(message);
+  const phase = resolveAssistantReplyPhase(message);
   const stopReason = record?.stopReason;
   const metadata = asRecord(record?.["__openclaw"]);
   if (
-    !extractTextCached(message)?.trim() ||
-    isKeyedAssistantStreamFallbackMessage(message) ||
-    messageIsInterrupted(message) ||
+    !(extractTextCached(message)?.trim() || extractMessageMediaText(message)) ||
+    assistantMessageIsInterrupted(message) ||
     phase === "commentary" ||
     stopReason === "toolUse" ||
     stopReason === "error" ||
-    metadata?.runtimeActivityKind === "context_compaction" ||
     (metadata?.mirrorOrigin === "codex-app-server" && metadata.runTerminal !== true)
   ) {
     return false;
@@ -159,12 +134,8 @@ function completedFrameActionOwner(
   if (lastPart?.kind !== "group" || lastPart.role !== "assistant") {
     return null;
   }
-  const lastMessage = lastPart.messages.at(-1);
-  return lastMessage
-    ? messageCanOwnCompletedFrame(lastMessage.message, false)
-      ? lastMessage
-      : null
-    : null;
+  const last = lastPart.messages.at(-1);
+  return last && messageCanOwnCompletedFrame(last.message, false) ? last : null;
 }
 
 export function agentRunFrameActiveStatusParts(
@@ -203,6 +174,8 @@ export function coalesceAgentRunFrames(
   }
   const result: Array<AgentRunFrameInput | AgentRunFrameRenderItem> = [];
   let boundaryId: string | undefined;
+  let presentationBoundaryKey: string | undefined;
+  const emittedFrameKeys = new Set<string>();
   let segmentId: string | undefined;
   let runId: string | undefined;
   let parts: AgentRunFramePart[] = [];
@@ -210,9 +183,16 @@ export function coalesceAgentRunFrames(
     if (!runId || !boundaryId || parts.length === 0) {
       return;
     }
+    const semanticKey = frameKey(runId, boundaryId, frameSegmentId(parts, segmentId));
+    // A peer input can split one causal run into separate presentation rows.
+    // Reopening it must not reuse the earlier row’s DOM or measured height.
+    const key = emittedFrameKeys.has(semanticKey)
+      ? frameKey(runId, boundaryId, JSON.stringify([presentationBoundaryKey, parts[0]!.key]))
+      : semanticKey;
+    emittedFrameKeys.add(semanticKey);
     result.push({
       kind: "agent-run-frame",
-      key: frameKey(runId, boundaryId, frameSegmentId(parts, segmentId)),
+      key,
       runId,
       boundaryId,
       outcome: failed
@@ -233,34 +213,43 @@ export function coalesceAgentRunFrames(
       segmentId = boundaryId ? undefined : item.key;
       continue;
     }
-    const candidate = item;
-    const boundaryGroup = itemBoundaryGroup(candidate);
-    if (boundaryGroup) {
+    const boundaryGroup = itemGroups(item)[0];
+    if (boundaryGroup && chatItemStartsUserTurn(boundaryGroup)) {
       flush();
+      presentationBoundaryKey = boundaryGroup.key;
       segmentId = undefined;
       const nextBoundaryId = groupBoundaryId(boundaryGroup);
-      if (isExternalBoundary(boundaryGroup) || !nextBoundaryId) {
+      if (
+        boundaryGroup.role === "user" ||
+        assistantGroupIsForwardedBoundary(boundaryGroup) ||
+        !nextBoundaryId
+      ) {
         result.push(item);
         boundaryId = nextBoundaryId;
         continue;
       }
       boundaryId = nextBoundaryId;
     }
-    const candidateBoundaryId = itemBoundaryId(candidate);
+    const candidateBoundaryId = item.kind === "stream-run" ? item.boundaryId : undefined;
     if (candidateBoundaryId && candidateBoundaryId !== boundaryId) {
       flush();
       boundaryId = candidateBoundaryId;
     }
-    const candidateRunId = itemRunId(candidate);
-    if (boundaryId && candidateRunId && itemFailsFrame(candidate)) {
-      if (runId && runId !== candidateRunId) {
-        flush();
+    const candidateRunId = itemRunId(item);
+    if (item.kind === "activity-run" && !candidateRunId) {
+      flush();
+      result.push(item);
+      // A mixed-run log owns no frame, but does not end its surrounding turn.
+      // Retain the latest projected boundary for subsequent replies and status.
+      const lastBoundary = item.groups.findLast(chatItemStartsUserTurn);
+      if (lastBoundary) {
+        boundaryId = groupBoundaryId(lastBoundary);
+        presentationBoundaryKey = lastBoundary.key;
+        segmentId = undefined;
+      } else if (item.groups.some((group) => group.runId === undefined)) {
+        boundaryId = undefined;
+        segmentId = item.key;
       }
-      runId = candidateRunId;
-      parts.push(candidate);
-      flush(true);
-      boundaryId = undefined;
-      segmentId = item.key;
       continue;
     }
     if (!boundaryId || !candidateRunId) {
@@ -270,11 +259,17 @@ export function coalesceAgentRunFrames(
       segmentId = item.key;
       continue;
     }
+    const failed = itemFailsFrame(item);
     if (runId && runId !== candidateRunId) {
       flush();
     }
     runId = candidateRunId;
-    parts.push(candidate);
+    parts.push(item);
+    if (failed) {
+      flush(true);
+      boundaryId = undefined;
+      segmentId = item.key;
+    }
   }
   flush();
   return result;

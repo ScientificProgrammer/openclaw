@@ -10,7 +10,6 @@ import type {
   Tool,
   ToolResultMessage,
 } from "@openclaw/llm-core";
-// Agent Core type module defines shared TypeScript contracts.
 import type { Static, TSchema } from "typebox";
 
 /**
@@ -75,6 +74,13 @@ export interface ToolLoopIntervention {
   reason: string;
 }
 
+/** Bucketed feedback for an admitted call, not a veto or recovery attempt. */
+export interface ToolLoopWarning {
+  kind: "tool-loop-warning";
+  toolCallId: string;
+  count: number;
+}
+
 /** Context for OpenClaw-owned whole-batch tool admission. */
 export interface InternalBeforeToolBatchContext {
   assistantMessage: AssistantMessage;
@@ -83,9 +89,9 @@ export interface InternalBeforeToolBatchContext {
 }
 
 /** Result of OpenClaw-owned whole-batch tool admission. */
-export interface InternalBeforeToolBatchResult {
-  intervention?: ToolLoopIntervention;
-}
+export type InternalBeforeToolBatchResult =
+  | { intervention: ToolLoopIntervention; warnings?: never }
+  | { intervention?: never; warnings?: ToolLoopWarning[] };
 
 export interface DeferredToolCallContext {
   /** The assistant message that requested the deferred tool call. */
@@ -187,6 +193,8 @@ export interface ShouldStopAfterTurnContext {
 
 /** Replacement runtime state used by the agent loop before starting another provider request. */
 export interface AgentLoopTurnUpdate {
+  /** Commit accepted steering and settle this invocation without another model request. */
+  stop?: boolean;
   /** Context for the next provider request. */
   context?: AgentContext;
   /** Model for the next provider request. */

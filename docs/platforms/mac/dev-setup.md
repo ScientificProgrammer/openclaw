@@ -9,12 +9,22 @@ title: "macOS dev setup"
 
 Build and run the OpenClaw macOS application from source.
 
+The packaged app requires macOS 15.0 or later. The build host must also meet
+the Xcode requirements below.
+
 ## Prerequisites
 
 - **Xcode 26.4+** (Swift 6.3 toolchain), on the latest macOS available in
   Software Update.
-- **Node.js 24.15+ & pnpm** for the gateway, CLI, and packaging scripts. Node
-  22.22.3+ also works.
+- **Node.js 24.16+ or 26.1+ & pnpm** for the gateway, CLI, and packaging scripts.
+
+macOS shell tooling uses the system `/bin/bash` (3.2); Homebrew Bash is not
+required. Run scripts directly or with `/bin/bash`. Bash 5.3+ can stall on a
+heredoc before its reader starts, leaving packaging or signing logs empty under
+pipe-buffer pressure. Portable script entrypoints switch to `/bin/bash` on
+macOS, and the streamed installers (`curl ... | bash`) do the same by capturing
+the rest of their input into a private temporary file before re-executing, so
+the documented install commands need no change.
 
 ## 1. Install dependencies
 
@@ -29,8 +39,52 @@ pnpm install
 ```
 
 Outputs `dist/OpenClaw.app`. Packaging requires a real signing identity by
-default; ad-hoc signing is an explicit opt-in and does not preserve TCC grants.
-See [macOS signing](/platforms/mac/signing).
+default and fails if none is available. Ad-hoc signing is an explicit opt-in;
+it does not preserve TCC permissions. See [macOS signing](/platforms/mac/signing).
+
+Packaging builds the JavaScript runtime and Control UI, then provisions a
+private Node worker from the canonical package artifact for every requested
+`BUILD_ARCHS` architecture. The root worker tarball uses the repository-pinned
+pnpm packer; Corepack-only setups are supported. Packaging verifies native
+capabilities and worker readiness in temporary state before and after signing,
+then replaces the previous app. `scripts/restart-mac.sh` uses
+the same path; `SKIP_TSC=1` does not bypass the runtime build. Existing
+content-checked build caches still avoid unnecessary declaration work.
+
+Worker pruning follows module imports, runtime launch descriptors, and named
+worker entrypoints transitively. Helpers launched by another retained worker
+remain packaged with their imports and runtime dependencies.
+
+The private worker preserves the app's saved desktop-sharing preference and
+profile selection. Packaging checks startup with sharing enabled, disabled,
+and unspecified, including named-profile launches, before and after signing.
+
+Set `OPENCLAW_NODE_VERSION=<version>` when packaging to select a supported Node
+version for every private worker. If unset or empty, the CLI installer's default
+applies. Packaging installs and verifies the complete worker with that runtime.
+
+Each worker keeps native binaries that support its architecture and omits
+incompatible macOS, Linux, and Windows prebuilds. This prevents unused Intel-only
+dependencies from triggering macOS compatibility warnings in Apple silicon
+builds. Compatible universal binaries, JavaScript, WASM, and other resources
+remain intact.
+
+Universal builds require both arm64 and x86_64 runtimes to execute during
+validation. Building x86_64 on Apple Silicon requires Rosetta; a missing
+architecture or nonportable native dependency fails packaging. Node downloads
+and package installation need network access. The larger app includes its
+complete private runtime; it does not update an independently managed Gateway.
+
+Packaging builds the MLX voice helper with Swift Build (`--build-system swiftbuild`)
+and copies its SwiftPM resource bundles into `Contents/Resources`. The native
+SwiftPM backend does not compile MLX's Metal shaders. Packaging fails if the
+helper's `mlx-swift_Cmlx.bundle/Contents/Resources/default.metallib` is missing,
+rather than shipping a helper that fails on its first speech request.
+
+The private worker uses read-only core config bootstrap rather than Gateway-wide
+Doctor preflight. Node plugin validation, MCP lifecycle, and node-owned identity
+and exec-approval startup migrations remain enabled. See
+[Gateway ownership](/platforms/mac/bundled-gateway) for the boundary.
 
 Set `OPENCLAW_SKIP_MLX_TTS=1` to package a dev/proof build without the local
 MLX voice helper. This skips the `openclaw-mlx-tts` binary and its large
@@ -54,7 +108,9 @@ The packaged app embeds the canonical `scripts/install-cli.sh` installer. On a
 fresh profile, choose **This Mac** during onboarding; the app installs the
 matching user-space CLI and runtime before starting the Gateway wizard.
 
-For manual development recovery, install the matching CLI yourself:
+For manual development recovery, install the matching CLI yourself. Read the
+version from the app: choose **About OpenClaw** in the menu bar, or run
+`openclaw-mac status --json`, which reports the app version and build.
 
 The npm command below is for npm 12 or npm 11.16+. On npm 11.15 and earlier,
 omit `--allow-scripts=openclaw`.
@@ -76,6 +132,13 @@ windows, and WebKit starts helper processes. A temporary `HOME`, `TMPDIR`, or
 named app profile alone is not a sandbox: fixed preferences domains and
 Keychain access can still reach macOS services outside those directories.
 
+The native test bundle links `OpenClawWebKitTestSupport`, which suppresses WebKit
+Screen Time observation for every `WKWebView` in the test process. WebKit removes
+its KVO observer on the main thread during deallocation while ScreenTime delivers
+configuration on a private queue. Tearing down a windowed HTTP(S) web view right
+after its first commit can hit this race and abort the process with
+`NSInternalInconsistencyException`. Product builds keep Screen Time.
+
 The `macos-swift` GitHub CI job builds the tests with the runner's normal
 SwiftPM caches, then runs the built suite through `scripts/test-macos-native.mts`.
 Each invocation selects private `HOME` and `CFFIXED_USER_HOME`,
@@ -83,8 +146,8 @@ Each invocation selects private `HOME` and `CFFIXED_USER_HOME`,
 bundle loads. Tools honoring `TMPDIR` use that launcher-owned directory;
 Foundation uses Darwin's per-user temp directory, owned and discarded by the
 disposable OS worker. The full suite explicitly selects the default profile, preserving
-its local Gateway lifecycle contracts. AppState isolation tests run separately
-with a unique named profile; no test is run twice. The child environment excludes
+its local Gateway lifecycle contracts. AppState lifecycle tests and the interactive
+chat fixture run separately with a unique named profile; no test is run twice. The child environment excludes
 inherited app settings and credentials while retaining toolchain and runtime
 loader paths. Before Swift starts, the launcher creates an empty-password test
 Keychain under its private `HOME/Library/Keychains`, unlocks it, disables automatic
@@ -108,11 +171,18 @@ test build:
 ```bash
 node scripts/test-macos-native.mts named \
   --package-path apps/macos --build-system native --enable-code-coverage \
-  --skip-build --filter AppStateIsolationTests
+  --skip-build --filter "AppStateIsolationTests|ProfileChatPreferencesTests"
 ```
 
-The ordinary CI invocation preserves its existing serial/parallel selection and
-coverage. Local `scripts/prepush-ci.sh` runs Swift lint/format checks and a release
+The ordinary CI invocation bounds Swift Testing parallelism to the runner's logical
+CPU count, capped at 12. It runs three disjoint partitions sequentially with coverage
+instrumentation: the default-profile suite, rendered Quick Chat in a fresh default-profile
+process, and named-profile fixtures. The rendered partition preserves catalog, disclosure,
+and shortcut order without sharing process-wide executor changes from other tests.
+Both interactive fixtures use Swift Testing and start an AppKit-owned run loop before
+exercising native menus, so XCTest does not have to regain its outer wait loop afterward. Historical targets
+with the launcher keep their original default- and named-profile partitions.
+Local `scripts/prepush-ci.sh` runs Swift lint/format checks and a release
 build, but does not run native tests. For native changes it exits nonzero with a
 requirement to obtain the exact commit's `macos-swift` CI result; local build
 success is not native test success.
@@ -146,9 +216,12 @@ isolate unrelated tests or the process from the host.
 If packaging stops at `Freezing authenticated Peekaboo sources in a read-only snapshot`,
 check the `hdiutil` error on stderr. Routine image creation and attachment output stays
 quiet, but failures such as `hdiutil: attach failed - Permission denied` are preserved.
-Check the temporary location selected by `TMPDIR` and its filesystem or mount permissions
-before retrying. This step runs before signing; source verification and the read-only
-snapshot remain required.
+Snapshot images and build outputs stay in the checkout. Their read-only mount directories
+use macOS's per-user temporary location (`getconf DARWIN_USER_TEMP_DIR`), independently of
+`TMPDIR`, so an external checkout does not need to support nested mounts. If attachment
+still fails, check that location's mount permissions. Unverified cleanup retains the
+mount directories and build locks at the paths printed in the error. This step runs before
+signing; source verification and the read-only snapshot remain required.
 
 ### Build fails: toolchain or SDK mismatch
 

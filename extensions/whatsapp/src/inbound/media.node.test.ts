@@ -104,11 +104,8 @@ describe("downloadInboundMedia", () => {
     await expectMimetype({ audioMessage: { mimetype: "audio/mp4", ptt: true } }, "audio/mp4");
   });
 
-  it.each([
-    { name: "voice messages without explicit MIME", audioMessage: { ptt: true } },
-    { name: "audio messages without MIME or ptt flag", audioMessage: {} },
-  ])("defaults to audio/ogg for $name", async ({ audioMessage }) => {
-    await expectMimetype({ audioMessage }, "audio/ogg; codecs=opus");
+  it("defaults audio messages without MIME to OGG Opus", async () => {
+    await expectMimetype({ audioMessage: {} }, "audio/ogg; codecs=opus");
   });
 
   it("uses explicit mimetype from imageMessage when present", async () => {
@@ -156,6 +153,19 @@ describe("downloadInboundMedia", () => {
       ),
     ).rejects.toThrow(/Media exceeds/i);
     expect(downloadMediaMessage.mock.calls[0]?.[1]).toBe("stream");
+  });
+
+  it("preserves the store's fractional limit error for the message owner", async () => {
+    const limitError = Object.assign(new Error("Media exceeds 256KB limit"), { code: "too-large" });
+    saveMediaStream.mockRejectedValueOnce(limitError);
+
+    await expect(
+      downloadInboundMedia(
+        { message: { imageMessage: { mimetype: "image/jpeg" } } } as never,
+        mockSock as never,
+        0.25 * 1024 * 1024,
+      ),
+    ).rejects.toBe(limitError);
   });
 
   it("propagates transport download failures to the message owner", async () => {

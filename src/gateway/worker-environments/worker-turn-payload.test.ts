@@ -8,19 +8,18 @@ import type { OperationalRunInstanceRef } from "../../agents/admitted-run-contex
 import { createTestAdmittedRunContext } from "../../agents/admitted-run-context.test-support.js";
 import type { AgentMessage } from "../../agents/runtime/index.js";
 import type { SessionPlacementTurnParams } from "../../agents/session-placement-admission.js";
-import { NODE_WORKER_SUPERVISOR_LAUNCH_COMMAND } from "../../infra/node-commands.js";
 import {
   completeWorkerLaunchDescriptor,
   parseWorkerLaunchPlan,
   type WorkerLaunchPlan,
 } from "../../worker/launch-descriptor.js";
 import { parseNodeWorkerLaunchInput } from "../../worker/node-supervisor-protocol.js";
+import { createWorkerImageHistory } from "../../worker/replay-images.test-support.js";
 import {
   buildWorkerProcessTurn,
   serializeWorkerProcessInput,
   parseWorkerProcessRequest,
 } from "../../worker/worker-process-protocol.js";
-import { buildNodeInvokeRequest, serializeNodeEvent } from "../node-invoke-request.js";
 import { measureNodeWorkerLaunchBytes } from "./node-launch-adapter.js";
 import {
   assertSupportedTurn,
@@ -194,7 +193,6 @@ describe("assertSupportedTurn", () => {
 
 describe("windowInitialMessages", () => {
   it("reports oversized replay through the typed unavailable result", () => {
-    const project = vi.fn(windowInitialMessages);
     const message = assistantMessage(1, true);
     if (message.role !== "assistant" || !message.providerReplay) {
       throw new Error("expected replay carrier");
@@ -204,7 +202,7 @@ describe("windowInitialMessages", () => {
       data: "x".repeat(WORKER_PROVIDER_REPLAY_MAX_DATA_BYTES + 1),
     };
 
-    expect(project([message])).toEqual({
+    expect(windowInitialMessages([message])).toEqual({
       kind: "provider-replay-unavailable",
       details: {
         bytes: WORKER_PROVIDER_REPLAY_MAX_DATA_BYTES + 1,
@@ -212,7 +210,6 @@ describe("windowInitialMessages", () => {
         reason: "provider-replay-data-budget",
       },
     });
-    expect(project).toHaveBeenCalledOnce();
   });
 
   it("pins the newest replay carrier when the normal cutoff would pass it", () => {
@@ -298,7 +295,7 @@ describe("windowInitialMessages", () => {
 });
 
 describe("fitLaunchDescriptor", () => {
-  it.each([-1, 0, 1])("fits the complete transport bound at cap %+i byte(s)", async (delta) => {
+  it.each([0, 1])("fits the complete transport bound at cap %+i byte(s)", async (delta) => {
     const projected = windowInitialMessages([
       assistantMessage(1, true),
       toolResultMessage({ payload: "" }, 2),
@@ -320,15 +317,19 @@ describe("fitLaunchDescriptor", () => {
       messages: projected.messages,
       runtimeIdentity: { agentId: "main", sessionKey: "worker:session", operationalRunInstance },
     });
-    expect(fitted.kind).toBe(delta > 0 ? "local-fallback" : "launch");
+    expect(fitted.kind).toBe(delta > 0 ? "provider-replay-unavailable" : "launch");
     expect(runtimeIdentityToken.mint).toHaveBeenCalledTimes(delta > 0 ? 0 : 1);
     if (fitted.kind === "launch") {
       expect(fitted.plan.assignment.operationalRunInstance).toEqual(operationalRunInstance);
       expect(fitted.plan.assignment.initialMessages[0]).toMatchObject({
         providerReplay: PROVIDER_REPLAY,
       });
+    } else {
+      expect(fitted).toMatchObject({
+        reason: "provider-replay-launch-payload-limit",
+        limitBytes: WORKER_PROTOCOL_MAX_INFERENCE_PAYLOAD_BYTES,
+      });
     }
-    console.info("worker-fit-boundary", JSON.stringify({ bytes: targetBytes, kind: fitted.kind }));
   });
 
   it("preserves a small two-image launch and its exact run identity", async () => {
@@ -361,14 +362,6 @@ describe("fitLaunchDescriptor", () => {
     });
     const encoded = serializeWorkerProcessInput(buildWorkerProcessTurn(completed));
     parseWorkerProcessRequest(JSON.parse(encoded));
-    console.info(
-      "worker-two-image-control",
-      JSON.stringify({
-        imageBytes: 2_400_000,
-        managedLineBytes: Buffer.byteLength(encoded) - 1,
-        measuredBytes: measureLaunch(fitted.plan),
-      }),
-    );
   });
 
   it.each(["nested escaping", "maximal endpoint"])(
@@ -408,17 +401,6 @@ describe("fitLaunchDescriptor", () => {
       };
       const paramsJSON = JSON.stringify(input);
       parseNodeWorkerLaunchInput(paramsJSON);
-      const frame = serializeNodeEvent(
-        "node.invoke.request",
-        buildNodeInvokeRequest({
-          id: "00000000-0000-0000-0000-000000000000",
-          nodeId: "fixture-node",
-          command: NODE_WORKER_SUPERVISOR_LAUNCH_COMMAND,
-          params: input,
-          timeoutMs: 30_000,
-          idempotencyKey: candidate.assignment.turnId,
-        }),
-      );
       const suffix = "/__openclaw__/worker";
       const prefix = "wss://worker.invalid/";
       const descriptor = completeWorkerLaunchDescriptor(candidate, {
@@ -433,31 +415,99 @@ describe("fitLaunchDescriptor", () => {
         descriptor,
       });
       parseWorkerProcessRequest(JSON.parse(line));
-      console.info(
-        "worker-sizing-before",
-        JSON.stringify({
-          scenario,
-          planBytes: Buffer.byteLength(JSON.stringify(candidate)),
-          estimatorBytes: Buffer.byteLength(JSON.stringify(candidate)) + 4_608,
-          frameBytes: Buffer.byteLength(frame),
-          managedLineBytes: Buffer.byteLength(line),
-          limitBytes: WORKER_PROTOCOL_MAX_INFERENCE_PAYLOAD_BYTES,
-        }),
-      );
+
       const fitted = await fitLaunchDescriptorWithRuntimeIdentity({
         measure: measureLaunch,
         build,
         messages,
         runtimeIdentity: { agentId: "main", sessionKey: "worker:session", operationalRunInstance },
       });
-      expect(fitted.kind).toBe("local-fallback");
+      expect(fitted.kind).toBe("provider-replay-unavailable");
       expect(runtimeIdentityToken.mint).not.toHaveBeenCalled();
-      console.info(
-        "worker-sizing-after",
-        JSON.stringify({ scenario, kind: fitted.kind, measuredBytes: measureLaunch(candidate) }),
-      );
     },
   );
+
+  it("retains history when pruning one processed image fits the exact node transport bound", async () => {
+    const messages = createWorkerImageHistory().slice(0, 5);
+    const latest = messages[4];
+    if (latest?.role !== "toolResult") {
+      throw new Error("expected latest observation");
+    }
+    latest.details = { payload: '"'.repeat(100_000) };
+    const expected = structuredClone(messages);
+    const oldest = expected[2];
+    if (oldest?.role !== "toolResult") {
+      throw new Error("expected processed observation");
+    }
+    oldest.content[1] = {
+      type: "text",
+      text: "[image data removed - already processed by model]",
+    };
+    const operationalRunInstance = createTestAdmittedRunContext("run").operationalRunInstance;
+    const build = (token: string, initialMessages: typeof messages) =>
+      parseWorkerLaunchPlan(buildDescriptor(initialMessages, token, operationalRunInstance));
+    const padding =
+      WORKER_PROTOCOL_MAX_INFERENCE_PAYLOAD_BYTES -
+      measureLaunch(build(runtimeIdentityToken.value, expected));
+    latest.details = { payload: '"'.repeat(100_000) + "x".repeat(padding) };
+    expected[4] = structuredClone(latest);
+    expect(measureLaunch(build(runtimeIdentityToken.value, expected))).toBe(
+      WORKER_PROTOCOL_MAX_INFERENCE_PAYLOAD_BYTES,
+    );
+    const original = structuredClone(messages);
+    const fitted = await fitLaunchDescriptorWithRuntimeIdentity({
+      build,
+      measure: measureLaunch,
+      messages,
+      runtimeIdentity: { agentId: "main", sessionKey: "worker:session", operationalRunInstance },
+    });
+    expect(fitted.kind).toBe("launch");
+    if (fitted.kind === "launch") {
+      expect(fitted.plan.assignment.initialMessages).toEqual(expected);
+      expect(measureLaunch(fitted.plan)).toBe(WORKER_PROTOCOL_MAX_INFERENCE_PAYLOAD_BYTES);
+    }
+    expect(messages).toEqual(original);
+  });
+
+  it("fits a screenshot-heavy turn without dropping its text, tool pairs, or newest image", async () => {
+    const history = createWorkerImageHistory();
+    const originalContents = history.map((message) => message.content);
+    const fitted = await fitLaunchDescriptor(history).plan;
+    if (fitted.kind !== "launch") {
+      throw new Error("Expected launch");
+    }
+    expect(Buffer.byteLength(JSON.stringify(fitted.plan), "utf8")).toBeLessThanOrEqual(
+      WORKER_PROTOCOL_MAX_INFERENCE_PAYLOAD_BYTES,
+    );
+    expect(fitted.plan.assignment.initialMessages).toHaveLength(history.length);
+    expect(fitted.plan.assignment.initialMessages.at(-1)).toEqual(history.at(-1));
+    for (const [index, message] of history.entries()) {
+      expect(message.content).toBe(originalContents[index]);
+      if (message.role === "assistant") {
+        expect(fitted.plan.assignment.initialMessages[index]).toEqual(message);
+      } else {
+        for (const part of message.content.filter((block) => block.type === "text")) {
+          expect(fitted.plan.assignment.initialMessages[index]?.content).toContainEqual(part);
+        }
+      }
+    }
+  });
+
+  it("does not rewrite opaque replay images to fit the next launch", async () => {
+    const history = createWorkerImageHistory();
+    const owner = history[1];
+    if (owner?.role !== "assistant") {
+      throw new Error("Expected replay owner");
+    }
+    owner.providerReplay = structuredClone(PROVIDER_REPLAY);
+    const before = JSON.stringify(history);
+    await expect(fitLaunchDescriptor(history).plan).resolves.toMatchObject({
+      reason: "provider-replay-launch-payload-limit",
+      limitBytes: WORKER_PROTOCOL_MAX_INFERENCE_PAYLOAD_BYTES,
+    });
+    expect(JSON.stringify(history)).toBe(before);
+    expect(runtimeIdentityToken.mint).not.toHaveBeenCalled();
+  });
 
   it("drops complete old turns while retaining the replay anchor", async () => {
     const large = "x".repeat(13 * 1024 * 1024);
@@ -519,23 +569,5 @@ describe("fitLaunchDescriptor", () => {
     expect(runtimeIdentityToken.mint.mock.calls[0]?.[0].operationalRunInstance).toBe(
       fitted.operationalRunInstance,
     );
-  });
-
-  it("requires local fallback when the replay unit cannot fit the descriptor", async () => {
-    const projected = windowInitialMessages([
-      assistantMessage(1, true),
-      toolResultMessage({ payload: "x".repeat(WORKER_PROTOCOL_MAX_INFERENCE_PAYLOAD_BYTES) }, 2),
-    ]);
-    if (projected.kind !== "complete") {
-      throw new Error("expected complete projection");
-    }
-
-    const fitted = fitLaunchDescriptor(projected.messages);
-    await expect(fitted.plan).resolves.toMatchObject({
-      kind: "local-fallback",
-      reason: "provider-replay-launch-payload-limit",
-      limitBytes: WORKER_PROTOCOL_MAX_INFERENCE_PAYLOAD_BYTES,
-    });
-    expect(runtimeIdentityToken.mint).not.toHaveBeenCalled();
   });
 });

@@ -37,9 +37,6 @@ const parseDateParts = (raw: unknown): DateParts | undefined => {
   const year = Number(yearStr);
   const monthIndex = Number(monthStr) - 1;
   const day = Number(dayStr);
-  if (!Number.isFinite(year) || !Number.isFinite(monthIndex) || !Number.isFinite(day)) {
-    return undefined;
-  }
   // The regex only checks shape; Date.* silently rolls impossible calendar dates over
   // (e.g. 2026-02-30 -> 2026-03-02), so a typo'd day would return usage for the wrong day.
   // Reject parts that don't round-trip through a UTC probe (also catches the JS 2-digit-year remap).
@@ -100,11 +97,7 @@ const datePartsToEndMs = (
   return undefined;
 };
 
-// usage.cost / sessions.usage accept optional startDate/endDate. parseDateParts returns
-// undefined for both absent and invalid input, so an explicitly supplied but unparseable
-// date (bad format or impossible calendar date like 2026-02-30) would otherwise silently
-// fall through to the default range and return a successful response for an unrelated range.
-// Return the offending field so range resolution can reject it instead of querying the wrong window.
+// Invalid explicit dates must not fall through to the unrelated default range.
 const findInvalidExplicitDate = (params: {
   startDate?: unknown;
   endDate?: unknown;
@@ -136,12 +129,6 @@ const parseUtcOffsetToMinutes = (raw: unknown): number | undefined => {
   const sign = match[1] === "+" ? 1 : -1;
   const hours = Number(match[2]);
   const minutes = Number(match[3] ?? "0");
-  if (!Number.isInteger(hours) || !Number.isInteger(minutes)) {
-    return undefined;
-  }
-  if (hours > 14 || (hours === 14 && minutes !== 0)) {
-    return undefined;
-  }
   const totalMinutes = sign * (hours * 60 + minutes);
   if (totalMinutes < -12 * 60 || totalMinutes > 14 * 60) {
     return undefined;
@@ -182,6 +169,13 @@ export const resolveDateInterpretation = (params: {
     if (utcOffsetMinutes !== undefined) {
       return { ok: true, value: { mode: "utc-offset", utcOffsetMinutes } };
     }
+    // Only omission or blank text requests UTC; malformed offsets must not select another day.
+    if (
+      params.utcOffset != null &&
+      (typeof params.utcOffset !== "string" || params.utcOffset.trim() !== "")
+    ) {
+      return { ok: false, error: "invalid utcOffset: expected UTC-12:00 through UTC+14:00" };
+    }
   }
   // Backward compatibility: when mode is missing (or invalid), keep current UTC interpretation.
   return { ok: true, value: { mode: "utc" } };
@@ -213,18 +207,14 @@ const getDateParts = (date: Date, interpretation: DateInterpretation): DateParts
     }
     return parts;
   }
-  if (interpretation.mode === "utc-offset") {
-    const shifted = new Date(date.getTime() + interpretation.utcOffsetMinutes * 60 * 1000);
-    return {
-      year: shifted.getUTCFullYear(),
-      monthIndex: shifted.getUTCMonth(),
-      day: shifted.getUTCDate(),
-    };
-  }
+  const utcDate =
+    interpretation.mode === "utc-offset"
+      ? new Date(date.getTime() + interpretation.utcOffsetMinutes * 60 * 1000)
+      : date;
   return {
-    year: date.getUTCFullYear(),
-    monthIndex: date.getUTCMonth(),
-    day: date.getUTCDate(),
+    year: utcDate.getUTCFullYear(),
+    monthIndex: utcDate.getUTCMonth(),
+    day: utcDate.getUTCDate(),
   };
 };
 
@@ -269,19 +259,6 @@ const resolveRangeDays = (raw: unknown): number | "all" | undefined => {
     return 365;
   }
   return undefined;
-};
-
-const resolveTrailingDays = (
-  endDateParts: DateParts,
-  days: number,
-  interpretation: DateInterpretation,
-): DateRangeResolution => {
-  const startMs = datePartsToStartMs(shiftDateParts(endDateParts, -(days - 1)), interpretation);
-  const endMs = datePartsToEndMs(endDateParts, interpretation);
-  if (startMs === undefined || endMs === undefined) {
-    return { ok: false, error: "calendar day does not exist in requested time zone" };
-  }
-  return { ok: true, value: { startMs, endMs } };
 };
 
 /**
@@ -350,16 +327,10 @@ export const resolveDateRange = (
       value: { startMs: 0, endMs: todayEndMs, includeUntimestamped: true },
     };
   }
-  if (rangeDays !== undefined) {
-    return resolveTrailingDays(todayDateParts, rangeDays, interpretation);
+  const days = Math.max(1, rangeDays ?? parseDays(params.days) ?? 30);
+  const startMs = datePartsToStartMs(shiftDateParts(todayDateParts, -(days - 1)), interpretation);
+  if (startMs === undefined) {
+    return { ok: false, error: "calendar day does not exist in requested time zone" };
   }
-
-  const days = parseDays(params.days);
-  if (days !== undefined) {
-    const clampedDays = Math.max(1, days);
-    return resolveTrailingDays(todayDateParts, clampedDays, interpretation);
-  }
-
-  // Default to last 30 days
-  return resolveTrailingDays(todayDateParts, 30, interpretation);
+  return { ok: true, value: { startMs, endMs: todayEndMs } };
 };

@@ -139,6 +139,17 @@ describe("attempt trajectory status", () => {
     ).toEqual({ status: "success" });
   });
 
+  it("keeps media-only committed delivery as terminal progress", () => {
+    expect(
+      resolveAttemptTrajectoryTerminal(
+        baseParams({
+          messagingToolSentMediaUrls: ["file:///tmp/render.png"],
+          lastAssistantStopReason: "toolUse",
+        }),
+      ),
+    ).toEqual({ status: "success" });
+  });
+
   it("keeps accepted session spawns as terminal progress", () => {
     expect(
       resolveAttemptTrajectoryTerminal(
@@ -188,6 +199,21 @@ describe("attempt trajectory status", () => {
       status: "success",
     });
   });
+
+  it.each([
+    ["stop", { status: "success" }],
+    ["toolUse", { status: "error", terminalError: NON_DELIVERABLE_TERMINAL_TURN_REASON }],
+    ["length", { status: "error", terminalError: NON_DELIVERABLE_TERMINAL_TURN_REASON }],
+  ] as const)(
+    "classifies cron-only progress after a %s stop",
+    (lastAssistantStopReason, expected) => {
+      expect(
+        resolveAttemptTrajectoryTerminal(
+          baseParams({ lastAssistantStopReason, successfulCronAdds: 1 }),
+        ),
+      ).toEqual(expected);
+    },
+  );
 
   it("keeps heartbeat responses as success", () => {
     expect(

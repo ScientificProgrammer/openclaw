@@ -6,14 +6,18 @@ import {
 } from "openclaw/plugin-sdk/agent-runtime";
 import { createDeferred } from "openclaw/plugin-sdk/extension-shared";
 import type { MemoryEmbeddingProvider } from "openclaw/plugin-sdk/memory-core-host-engine-embeddings";
+import type { OpenClawPluginApi } from "openclaw/plugin-sdk/plugin-entry";
 import { describe, expect, it, vi } from "vitest";
-import type { OpenClawPluginApi } from "./api.js";
 import type { MemoryConfig } from "./config.js";
 
 const providerMocks = vi.hoisted(() => ({
   getMemoryEmbeddingProvider: vi.fn(),
   authMutationListeners: new Set<
-    (event: { agentDir?: string; affectsInheritedStores: boolean }) => void
+    (event: {
+      agentDir?: string;
+      affectsInheritedStores: boolean;
+      profileSetChanged: boolean;
+    }) => void
   >(),
 }));
 
@@ -206,6 +210,7 @@ describe("memory-lancedb provider lifecycle", () => {
     listener?.({
       agentDir: "/tmp/agent-private/../agent-private",
       affectsInheritedStores: false,
+      profileSetChanged: false,
     });
 
     await embed(embeddings, "other", "other warm provider");

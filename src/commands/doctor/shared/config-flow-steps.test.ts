@@ -1,7 +1,6 @@
 // Config-flow step tests cover doctor repair step ordering and mutation planning.
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { OpenClawConfig } from "../../../config/config.js";
-import type { DoctorConfigPreflightResult } from "../../doctor-config-preflight.js";
+import type { ConfigFileSnapshot, OpenClawConfig } from "../../../config/types.openclaw.js";
 
 const { migrateLegacyConfigMock, stripUnknownConfigKeysMock } = vi.hoisted(() => ({
   migrateLegacyConfigMock: vi.fn(),
@@ -19,8 +18,7 @@ vi.mock("../../doctor-config-analysis.js", () => ({
 import { applyLegacyCompatibilityStep, applyUnknownConfigKeyStep } from "./config-flow-steps.js";
 
 function createLegacyStepResult(
-  snapshot: Pick<DoctorConfigPreflightResult["snapshot"], "parsed" | "legacyIssues"> &
-    Partial<DoctorConfigPreflightResult["snapshot"]>,
+  snapshot: Pick<ConfigFileSnapshot, "parsed" | "legacyIssues"> & Partial<ConfigFileSnapshot>,
   doctorFixCommand = "openclaw doctor --fix",
 ) {
   return applyLegacyCompatibilityStep({
@@ -61,15 +59,15 @@ describe("doctor config flow steps", () => {
   it("collects legacy compatibility issue lines and preview fix hints", () => {
     migrateLegacyConfigMock.mockReturnValueOnce({
       config: {},
-      changes: ["Moved heartbeat → agents.defaults.heartbeat."],
+      changes: ["Moved session.typingMode → agents.defaults.typingMode."],
     });
 
     const result = createLegacyStepResult({
-      parsed: { heartbeat: { enabled: true } },
-      legacyIssues: [{ path: "heartbeat", message: "use agents.defaults.heartbeat" }],
+      parsed: { session: { typingMode: "thinking" } },
+      legacyIssues: [{ path: "session.typingMode", message: "use agents.defaults.typingMode" }],
     });
 
-    expect(result.issueLines).toEqual(["- heartbeat: use agents.defaults.heartbeat"]);
+    expect(result.issueLines).toEqual(["- session.typingMode: use agents.defaults.typingMode"]);
     expect(result.changeLines).not.toStrictEqual([]);
     expect(result.state.fixHints).toStrictEqual([
       'Run "openclaw doctor --fix" to migrate legacy config keys.',
@@ -101,8 +99,11 @@ describe("doctor config flow steps", () => {
     });
 
     expect(migrateLegacyConfigMock).toHaveBeenCalledWith(sourceConfig, {
-      authoredRaw: { mcp: { $include: "./mcp.json5" } },
-      resolvedRaw: sourceConfig,
+      sourceConfigBeforeMigrations: undefined,
+      context: {
+        authoredRaw: { mcp: { $include: "./mcp.json5" } },
+        resolvedRaw: sourceConfig,
+      },
     });
     expect(result.state.pendingChanges).toBe(true);
     expect(result.state.candidate.mcp?.servers?.local?.enabled).toBe(false);
@@ -120,6 +121,7 @@ describe("doctor config flow steps", () => {
           path: ["diagnostics"],
           kind: "multiple",
           hasSiblingOverrides: false,
+          hasArrayAncestor: false,
           targetPaths: ["/tmp/a.json5", "/tmp/b.json5"],
         },
       ],
@@ -196,23 +198,19 @@ describe("doctor config flow steps", () => {
   );
 
   it("commits migration even when post-migration validation has unrelated issues (#76798)", () => {
-    const migratedConfig = { agents: { defaults: { model: { primary: "openai/gpt-5.4" } } } };
+    const migratedConfig = { agents: { defaults: { typingMode: "thinking" } }, session: {} };
     migrateLegacyConfigMock.mockReturnValueOnce({
       config: migratedConfig,
-      changes: [
-        "Removed agents.defaults.llm; model idle timeout now follows models.providers within the agent/run timeout ceiling.",
-      ],
+      changes: ["Moved session.typingMode → agents.defaults.typingMode."],
       partiallyValid: true,
     });
 
     const result = createLegacyStepResult({
       parsed: {
-        agents: {
-          defaults: { llm: { idleTimeoutSeconds: 120 }, model: { primary: "openai/gpt-5.4" } },
-        },
+        session: { typingMode: "thinking" },
         tools: { web: { search: { provider: "brave" } } },
       },
-      legacyIssues: [{ path: "agents.defaults.llm", message: "deprecated key" }],
+      legacyIssues: [{ path: "session.typingMode", message: "deprecated key" }],
       valid: false,
       issues: [
         {

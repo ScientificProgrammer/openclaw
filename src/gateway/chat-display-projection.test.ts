@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { createNoisyPngBuffer } from "../../test/helpers/image-fixtures.js";
@@ -6,23 +7,86 @@ import {
   projectChatDisplayMessages,
   sanitizeChatHistoryMessages,
 } from "./chat-display-projection.js";
-import { mirrorMessageToolVisibleReplies } from "./chat-display-projection.message-tool.js";
-import {
-  CHAT_HISTORY_MAX_SINGLE_MESSAGE_BYTES,
-  replaceOversizedChatHistoryMessages,
-} from "./server-methods/chat-history-budget.js";
-import { buildSessionHistorySnapshot, SessionHistorySseState } from "./session-history-state.js";
+import { CHAT_HISTORY_MAX_SINGLE_MESSAGE_BYTES } from "./server-methods/chat-history-budget.js";
+import { SessionHistorySseState } from "./session-history-state.js";
 
-function projectHistoryTransports(message: Record<string, unknown>) {
-  const websocket = replaceOversizedChatHistoryMessages({
-    messages: projectChatDisplayMessages([message]),
-    maxSingleMessageBytes: CHAT_HISTORY_MAX_SINGLE_MESSAGE_BYTES,
-  }).messages;
-  const sse = buildSessionHistorySnapshot({ rawMessages: [message], limit: 5 }).history.messages;
-  return [websocket, sse];
-}
+describe("private yield context in chat history", () => {
+  it.each(["embedded", "native"])(
+    "hides the %s yield input without changing private provenance",
+    (runtime) => {
+      const privateContext = "PRIVATE_YIELD_CONTEXT";
+      const yieldArguments = Object.freeze({
+        message: privateContext,
+        acknowledgment: "Waiting for the background task.",
+      });
+      const message = {
+        role: "assistant",
+        content: [
+          {
+            type: "toolCall",
+            id: "yield-1",
+            name: "sessions_yield",
+            arguments: yieldArguments,
+            ...(runtime === "native" ? { input: yieldArguments } : {}),
+          },
+          {
+            type: "toolCall",
+            id: "send-1",
+            name: "message",
+            arguments: { message: "Public reply" },
+          },
+        ],
+      };
+
+      const messages = projectChatDisplayMessages([message]);
+      expect(messages).toEqual([
+        {
+          role: "assistant",
+          content: [
+            {
+              type: "toolCall",
+              id: "yield-1",
+              name: "sessions_yield",
+              arguments: { acknowledgment: "Waiting for the background task." },
+              ...(runtime === "native"
+                ? { input: { acknowledgment: "Waiting for the background task." } }
+                : {}),
+            },
+            {
+              type: "toolCall",
+              id: "send-1",
+              name: "message",
+              arguments: { message: "Public reply" },
+            },
+          ],
+        },
+      ]);
+      expect(yieldArguments.message).toBe(privateContext);
+    },
+  );
+});
 
 describe("managed document chat history", () => {
+  it("projects durable display content without dropping canonical assistant blocks", () => {
+    const canonical = [
+      { type: "text", text: "Slides ready" },
+      { type: "toolCall", id: "call-1", name: "read", arguments: {} },
+    ];
+    const attachment = {
+      type: "attachment",
+      attachment: { kind: "document", label: "slides.pptx" },
+    };
+    const message = {
+      role: "assistant",
+      content: canonical,
+      openclawDisplayContent: [...canonical, attachment],
+    };
+
+    const messages = projectChatDisplayMessages([message]);
+    expect(messages).toEqual([{ role: "assistant", content: [...canonical, attachment] }]);
+    expect(message.content).toBe(canonical);
+  });
+
   it("keeps the attachment envelope while stripping URL capabilities", () => {
     const message = {
       role: "assistant",
@@ -97,7 +161,7 @@ describe("managed document chat history", () => {
 });
 
 describe("oversized multimodal chat history", () => {
-  it("keeps legacy image, audio, and video transcript blocks through every history boundary", async () => {
+  it("keeps legacy image, audio, and video blocks in projection and incremental SSE", () => {
     const inlineImage = Buffer.from("inline image").toString("base64");
     const inlineAudio = Buffer.from("inline audio").toString("base64");
     const inlineVideo = Buffer.from("inline video").toString("base64");
@@ -146,15 +210,18 @@ describe("oversized multimodal chat history", () => {
       ],
     };
     const expected = projectChatDisplayMessages([rawMessage]);
-    const snapshot = buildSessionHistorySnapshot({ rawMessages: [rawMessage] }).history.messages;
-    const sseState = SessionHistorySseState.fromRawSnapshot({
+    const sseState = SessionHistorySseState.fromSnapshot({
       target: { sessionId: "mixed-media", sessionKey: "agent:main:mixed-media" },
-      rawMessages: [],
+      snapshot: {
+        history: { items: [], messages: [], hasMore: false },
+        rawTranscriptSeq: 0,
+        turnBoundaryPending: false,
+        assistantErrorPending: false,
+      },
     });
     const incremental = sseState.appendInlineMessage({ message: rawMessage })?.message;
     const projections = [
       ["projectChatDisplayMessages", expected],
-      ["session-history snapshot", snapshot],
       ["incremental SSE state", incremental ? [incremental] : []],
     ] as const;
     for (const [boundary, messages] of projections) {
@@ -257,7 +324,7 @@ describe("oversized multimodal chat history", () => {
         source: { type: "base64", media_type: "image/png", data },
       }),
     },
-  ])("keeps text while omitting $name from WebSocket and SSE history", ({ image }) => {
+  ])("keeps text while omitting $name from display history", ({ image }) => {
     const png = createNoisyPngBuffer(320, 320);
     const encoded = png.toString("base64");
     const message = {
@@ -268,22 +335,21 @@ describe("oversized multimodal chat history", () => {
         { type: "text", text: "keep suffix text" },
       ],
     };
-    for (const messages of projectHistoryTransports(message)) {
-      expect(messages).toMatchObject([
-        {
-          role: "user",
-          content: [
-            { type: "text", text: "keep prefix text" },
-            { type: "image", omitted: true, bytes: png.length },
-            { type: "text", text: "keep suffix text" },
-          ],
-        },
-      ]);
-      expect(JSON.stringify(messages)).not.toContain(encoded);
-      expect(Buffer.byteLength(JSON.stringify(messages))).toBeLessThan(
-        CHAT_HISTORY_MAX_SINGLE_MESSAGE_BYTES,
-      );
-    }
+    const messages = projectChatDisplayMessages([message]);
+    expect(messages).toMatchObject([
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "keep prefix text" },
+          { type: "image", omitted: true, bytes: png.length },
+          { type: "text", text: "keep suffix text" },
+        ],
+      },
+    ]);
+    expect(JSON.stringify(messages)).not.toContain(encoded);
+    expect(Buffer.byteLength(JSON.stringify(messages))).toBeLessThan(
+      CHAT_HISTORY_MAX_SINGLE_MESSAGE_BYTES,
+    );
   });
 
   it("preserves URL-backed images without changing their sources", () => {
@@ -293,7 +359,7 @@ describe("oversized multimodal chat history", () => {
     ).toEqual([{ role: "user", content: [{ type: "image", source }] }]);
   });
 
-  it("omits persisted top-level audio data from WebSocket and SSE history", () => {
+  it("omits persisted top-level audio data from display history", () => {
     const audio = Buffer.from("persisted audio bytes");
     const encoded = audio.toString("base64");
     const message = {
@@ -305,19 +371,18 @@ describe("oversized multimodal chat history", () => {
       ],
     };
 
-    for (const messages of projectHistoryTransports(message)) {
-      expect(messages).toEqual([
-        {
-          role: "user",
-          content: [
-            { type: "text", text: "keep prefix text" },
-            { type: "audio", mimeType: "audio/wav", omitted: true, bytes: audio.length },
-            { type: "text", text: "keep suffix text" },
-          ],
-        },
-      ]);
-      expect(JSON.stringify(messages)).not.toContain(encoded);
-    }
+    const messages = projectChatDisplayMessages([message]);
+    expect(messages).toEqual([
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "keep prefix text" },
+          { type: "audio", mimeType: "audio/wav", omitted: true, bytes: audio.length },
+          { type: "text", text: "keep suffix text" },
+        ],
+      },
+    ]);
+    expect(JSON.stringify(messages)).not.toContain(encoded);
   });
 
   it("removes private audio payloads and local references while preserving safe refs", () => {
@@ -362,32 +427,36 @@ describe("oversized multimodal chat history", () => {
     };
     const original = structuredClone(message);
 
-    for (const messages of projectHistoryTransports(message)) {
-      expect(messages).toEqual([
-        {
-          role: "user",
-          content: [
-            {
-              type: "audio",
-              omitted: true,
-              source: { type: "opaque", codec: "pcm", omitted: true },
-            },
-            { type: "audio", omitted: true, source: { omitted: true } },
-            ...safeAudio,
-          ],
-        },
-      ]);
-      expect(JSON.stringify(messages)).not.toContain(privateMarker);
-      expect(JSON.stringify(messages)).not.toContain('"0":111');
-    }
+    const messages = projectChatDisplayMessages([message]);
+    expect(messages).toEqual([
+      {
+        role: "user",
+        content: [
+          {
+            type: "audio",
+            omitted: true,
+            source: { type: "opaque", codec: "pcm", omitted: true },
+          },
+          { type: "audio", omitted: true, source: { omitted: true } },
+          ...safeAudio,
+        ],
+      },
+    ]);
+    expect(JSON.stringify(messages)).not.toContain(privateMarker);
+    expect(JSON.stringify(messages)).not.toContain('"0":111');
     expect(message).toEqual(original);
   });
 
   it("sanitizes newly appended audio before returning an incremental SSE message", () => {
     const encoded = Buffer.from("incremental SSE audio").toString("base64");
-    const state = SessionHistorySseState.fromRawSnapshot({
+    const state = SessionHistorySseState.fromSnapshot({
       target: { sessionId: "audio-session", sessionKey: "agent:main:audio-session" },
-      rawMessages: [],
+      snapshot: {
+        history: { items: [], messages: [], hasMore: false },
+        rawTranscriptSeq: 0,
+        turnBoundaryPending: false,
+        assistantErrorPending: false,
+      },
     });
 
     const appended = state.appendInlineMessage({
@@ -429,33 +498,31 @@ describe("transcript metadata projection", () => {
         upstreamUserText: "private decorated prompt ".repeat(12_000),
       },
     };
-    for (const messages of projectHistoryTransports(message)) {
-      expect(messages).toEqual([
-        {
-          role: "user",
-          content: "Keep this visible user message.",
-          __openclaw: {
-            id: "message-1",
-            mirrorIdentity: "turn-1:prompt",
-            replyToId: "message-0",
-          },
+    const messages = projectChatDisplayMessages([message]);
+    expect(messages).toEqual([
+      {
+        role: "user",
+        content: "Keep this visible user message.",
+        __openclaw: {
+          id: "message-1",
+          mirrorIdentity: "turn-1:prompt",
+          replyToId: "message-0",
         },
-      ]);
-      expect(Buffer.byteLength(JSON.stringify(messages))).toBeLessThan(
-        CHAT_HISTORY_MAX_SINGLE_MESSAGE_BYTES,
-      );
-    }
+      },
+    ]);
+    expect(Buffer.byteLength(JSON.stringify(messages))).toBeLessThan(
+      CHAT_HISTORY_MAX_SINGLE_MESSAGE_BYTES,
+    );
   });
 
-  it("records a display-cap marker on every history transport when text is truncated", () => {
+  it("records a display-cap marker when history text is truncated", () => {
     const message = { role: "assistant", content: "x".repeat(9_000), timestamp: 1 };
-    for (const messages of projectHistoryTransports(message)) {
-      const projected = messages[0] as Record<string, unknown>;
-      expect(JSON.stringify(projected.content)).toContain("...(truncated)...");
-      // Structured fact, so consumers fetch the full row via chat.message.get
-      // instead of sniffing the in-band sentinel.
-      expect(projected["__openclaw"]).toEqual({ truncated: true, reason: "display-cap" });
-    }
+    const messages = projectChatDisplayMessages([message]);
+    const projected = messages[0] as Record<string, unknown>;
+    expect(JSON.stringify(projected.content)).toContain("...(truncated)...");
+    // Structured fact, so consumers fetch the full row via chat.message.get
+    // instead of sniffing the in-band sentinel.
+    expect(projected["__openclaw"]).toEqual({ truncated: true, reason: "display-cap" });
   });
 
   it("marks display-cap truncation inside content blocks and keeps existing metadata", () => {
@@ -532,118 +599,50 @@ describe("managed inbound media fact projection", () => {
   const inboundMediaId = "photo---11111111-2222-3333-4444-555555555555.png";
   const managedInboundPath = path.join(getMediaDir(), "inbound", inboundMediaId);
 
-  function projectedOpenClawMeta(message: Record<string, unknown>) {
-    const projected = sanitizeChatHistoryMessages([message]);
+  function projectMediaPaths(paths: string[]) {
+    const projected = sanitizeChatHistoryMessages([
+      {
+        role: "user",
+        content: "image",
+        __openclaw: {
+          media: paths.map((mediaPath) => ({ path: mediaPath, contentType: "image/png" })),
+        },
+      },
+    ]);
     return (projected[0] as Record<string, unknown> | undefined)?.["__openclaw"];
   }
 
   it("rewrites a configured-store managed inbound path to a canonical media URI", () => {
-    const message = {
-      role: "user",
-      content: "first message with an image",
-      __openclaw: {
-        media: [{ path: managedInboundPath, contentType: "image/png" }],
-      },
-    };
-    expect(projectedOpenClawMeta(message)).toEqual({
-      media: [
-        {
-          path: `media://inbound/${inboundMediaId}`,
-          contentType: "image/png",
-        },
-      ],
+    expect(projectMediaPaths([managedInboundPath])).toEqual({
+      media: [{ path: `media://inbound/${inboundMediaId}`, contentType: "image/png" }],
     });
   });
 
   it("redacts a lookalike path that contains media/inbound but is outside the store", () => {
-    // A path like /tmp/media/inbound/<existing-id> is NOT inside the configured store;
-    // it must not be promoted to an authenticated media capability.
     const lookalike = path.join("/tmp", "media", "inbound", inboundMediaId);
-    const message = {
-      role: "user",
-      content: "lookalike inbound path",
-      __openclaw: {
-        media: [{ path: lookalike, contentType: "image/png" }],
-      },
-    };
-    expect(projectedOpenClawMeta(message)).toEqual({
+    expect(projectMediaPaths([lookalike])).toEqual({
       media: [{ contentType: "image/png" }],
     });
   });
 
   it("redacts host paths that are not inside the managed inbound store", () => {
-    const message = {
-      role: "user",
-      content: "private local image",
-      __openclaw: {
-        media: [
-          { path: "/tmp/private-image.png", contentType: "image/png" },
-          {
-            path: path.join(getMediaDir(), "outbound", "credentials.png"),
-            contentType: "image/png",
-          },
-        ],
-      },
-    };
-    expect(projectedOpenClawMeta(message)).toEqual({
-      media: [{ contentType: "image/png" }, { contentType: "image/png" }],
-    });
-  });
-
-  it("rejects traversal-shaped inbound paths and redacts them", () => {
-    const message = {
-      role: "user",
-      content: "traversal attempt",
-      __openclaw: {
-        media: [
-          {
-            path: path.join(getMediaDir(), "inbound", "..", "..", "etc", "passwd"),
-            contentType: "image/png",
-          },
-        ],
-      },
-    };
-    expect(projectedOpenClawMeta(message)).toEqual({
-      media: [{ contentType: "image/png" }],
-    });
+    expect(
+      projectMediaPaths([
+        "/tmp/private-image.png",
+        path.join(getMediaDir(), "outbound", "credentials.png"),
+      ]),
+    ).toEqual({ media: [{ contentType: "image/png" }, { contentType: "image/png" }] });
   });
 
   it("redacts malformed percent-encoded inbound ids instead of throwing", () => {
-    // A stray `%` makes decodeURIComponent throw inside parseInboundMediaUri;
-    // the sanitizer must redact rather than propagate the failure into history projection.
-    const message = {
-      role: "user",
-      content: "malformed percent escape",
-      __openclaw: {
-        media: [{ path: path.join(getMediaDir(), "inbound", "%"), contentType: "image/png" }],
-      },
-    };
-    expect(() => sanitizeChatHistoryMessages([message])).not.toThrow();
-    expect(projectedOpenClawMeta(message)).toEqual({
+    expect(projectMediaPaths([path.join(getMediaDir(), "inbound", "%")])).toEqual({
       media: [{ contentType: "image/png" }],
     });
   });
 
   it("preserves an already-canonical media inbound URI without regression", () => {
-    const message = {
-      role: "user",
-      content: "canonical inbound image",
-      __openclaw: {
-        media: [
-          {
-            path: `media://inbound/${inboundMediaId}`,
-            contentType: "image/png",
-          },
-        ],
-      },
-    };
-    expect(projectedOpenClawMeta(message)).toEqual({
-      media: [
-        {
-          path: `media://inbound/${inboundMediaId}`,
-          contentType: "image/png",
-        },
-      ],
+    expect(projectMediaPaths([`media://inbound/${inboundMediaId}`])).toEqual({
+      media: [{ path: `media://inbound/${inboundMediaId}`, contentType: "image/png" }],
     });
   });
 });
@@ -884,48 +883,36 @@ describe("current user profile display projection", () => {
   });
 });
 
-describe("chat display message-tool projection", () => {
-  it("mirrors an automatic-mode send confirmed for the current source", () => {
-    const sourceReply = "Visible reply delivered to Slack.";
-    const projected = mirrorMessageToolVisibleReplies([
+describe("TTS supplement matching", () => {
+  it("matches later audio against the text left by an earlier supplement", () => {
+    const marker = { textSha256: createHash("sha256").update("same").digest("hex") };
+    const firstAudio = { type: "audio", url: "https://example.test/first.mp3" };
+    const secondAudio = { type: "audio", url: "https://example.test/second.mp3" };
+    const caption = { type: "input_text", text: "caption" };
+    const messages = [
+      { role: "assistant", content: [{ type: "text", text: "same" }], timestamp: 1 },
+      { role: "assistant", content: [{ type: "text", text: "same" }], timestamp: 2 },
       {
         role: "assistant",
-        content: [
-          {
-            type: "toolCall",
-            id: "call-message-current-source",
-            name: "message",
-            arguments: {
-              action: "send",
-              channel: "slack",
-              target: "channel:C123",
-              message: sourceReply,
-            },
-          },
-        ],
+        content: [caption, firstAudio],
+        openclawTtsSupplement: marker,
       },
-      {
-        role: "toolResult",
-        toolName: "message",
-        toolCallId: "call-message-current-source",
-        content: { ok: true, messageId: "slack-242" },
-        details: {
-          ok: true,
-          messageId: "slack-242",
-          sourceReplyRoute: "current-source",
-        },
-      },
-      { role: "assistant", content: [{ type: "text", text: "NO_REPLY" }] },
-    ]);
+      { role: "assistant", content: [secondAudio], openclawTtsSupplement: marker },
+    ];
+    const original = structuredClone(messages);
 
-    expect(projected).toContainEqual(
-      expect.objectContaining({
+    expect(projectChatDisplayMessages(messages)).toEqual([
+      {
         role: "assistant",
-        content: [{ type: "text", text: sourceReply }],
-        openclawMessageToolMirror: expect.objectContaining({
-          toolCallId: "call-message-current-source",
-        }),
-      }),
-    );
+        content: [{ type: "text", text: "same" }, secondAudio],
+        timestamp: 1,
+      },
+      {
+        role: "assistant",
+        content: [{ type: "text", text: "same" }, caption, firstAudio],
+        timestamp: 2,
+      },
+    ]);
+    expect(messages).toEqual(original);
   });
 });

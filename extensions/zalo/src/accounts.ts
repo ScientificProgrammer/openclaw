@@ -1,4 +1,3 @@
-// Zalo plugin module implements accounts behavior.
 import { createAccountListHelpers } from "openclaw/plugin-sdk/account-helpers";
 import { normalizeAccountId } from "openclaw/plugin-sdk/account-id";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
@@ -61,9 +60,16 @@ export function resolveZaloAccount(params: {
   return resolveZaloAccountWithMode({ ...params, mode: "strict" });
 }
 
-export function inspectZaloAccount(params: {
-  cfg: OpenClawConfig;
-  accountId?: string | null;
-}): ResolvedZaloAccount {
-  return resolveZaloAccountWithMode({ ...params, mode: "inspect" });
+export function inspectZaloAccount(params: { cfg: OpenClawConfig; accountId?: string | null }) {
+  const account = resolveZaloAccountWithMode({ ...params, mode: "inspect" });
+  return {
+    ...account,
+    configured: isZaloAccountConfigured(account),
+    mode: account.config.webhookUrl ? "webhook" : "polling",
+    dmPolicy: account.config.dmPolicy ?? "pairing",
+  };
+}
+
+export function isZaloAccountConfigured(account: ResolvedZaloAccount): boolean {
+  return account.tokenStatus ? account.tokenStatus !== "missing" : Boolean(account.token?.trim());
 }

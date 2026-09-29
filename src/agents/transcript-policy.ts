@@ -3,6 +3,8 @@
  * Combines provider plugin replay hooks with core transport fallbacks so chat
  * history sanitization, tool IDs, thinking blocks, and turn validation align.
  */
+import { bindsClaudeThinkingPrefix } from "@openclaw/llm-core";
+import { normalizeProviderId } from "@openclaw/model-catalog-core/provider-id";
 import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { resolvePluginControlPlaneFingerprint } from "../plugins/plugin-control-plane-context.js";
@@ -11,8 +13,8 @@ import { resolveProviderRuntimePlugin } from "../plugins/provider-hook-runtime.j
 import { shouldDropClaudeThinkingBlocks } from "../plugins/provider-replay-helpers.js";
 import type { ProviderRuntimeModel } from "../plugins/provider-runtime-model.types.js";
 import type { ProviderReplayPolicy } from "../plugins/types.js";
+import { isAnthropicApi } from "./embedded-agent-helpers/anthropic-api.js";
 import { isGoogleModelApi } from "./embedded-agent-helpers/google.js";
-import { normalizeProviderId } from "./model-selection.js";
 import type { ToolCallIdMode } from "./tool-call-id.js";
 
 /** Scope of transcript content sanitization before provider replay. */
@@ -27,6 +29,7 @@ export type TranscriptPolicy = {
   preserveNativeAnthropicToolUseIds: boolean;
   repairToolUseResultPairing: boolean;
   preserveSignatures: boolean;
+  appendOnlyRuntimeContext?: boolean;
   sanitizeThoughtSignatures?: {
     allowBase64Only?: boolean;
     includeCamelCase?: boolean;
@@ -39,32 +42,6 @@ export type TranscriptPolicy = {
   allowSyntheticToolResults: boolean;
 };
 
-const SIGNED_THINKING_PROVIDERS = new Set(["anthropic", "amazon-bedrock", "anthropic-vertex"]);
-
-/** Return true when a provider family owns signed thinking blocks. */
-export function providerRequiresSignedThinking(provider?: string | null): boolean {
-  return SIGNED_THINKING_PROVIDERS.has(normalizeProviderId(provider ?? ""));
-}
-
-/** Decide whether signed thinking can be replayed under the current provider policy. */
-export function shouldAllowProviderOwnedThinkingReplay(params: {
-  modelApi?: string | null;
-  provider?: string | null;
-  policy: Pick<
-    TranscriptPolicy,
-    "validateAnthropicTurns" | "preserveSignatures" | "dropThinkingBlocks"
-  >;
-}): boolean {
-  const hasProviderOwnedSignedThinking =
-    params.policy.preserveSignatures || providerRequiresSignedThinking(params.provider);
-  return (
-    isAnthropicApi(params.modelApi) &&
-    params.policy.validateAnthropicTurns &&
-    hasProviderOwnedSignedThinking &&
-    !params.policy.dropThinkingBlocks
-  );
-}
-
 const DEFAULT_TRANSCRIPT_POLICY: TranscriptPolicy = {
   sanitizeMode: "images-only",
   sanitizeToolCallIds: false,
@@ -73,6 +50,7 @@ const DEFAULT_TRANSCRIPT_POLICY: TranscriptPolicy = {
   preserveNativeAnthropicToolUseIds: false,
   repairToolUseResultPairing: true,
   preserveSignatures: false,
+  appendOnlyRuntimeContext: false,
   sanitizeThoughtSignatures: undefined,
   dropThinkingBlocks: false,
   dropReasoningFromHistory: false,
@@ -81,10 +59,6 @@ const DEFAULT_TRANSCRIPT_POLICY: TranscriptPolicy = {
   validateAnthropicTurns: false,
   allowSyntheticToolResults: false,
 };
-
-function isAnthropicApi(modelApi?: string | null): boolean {
-  return modelApi === "anthropic-messages" || modelApi === "bedrock-converse-stream";
-}
 
 function isOpenAiResponsesCompatibleApi(modelApi?: string | null): boolean {
   return (
@@ -153,7 +127,15 @@ function buildUnownedProviderTransportReplayFallback(params: {
           toolCallIdMode: "strict" as const,
         }
       : {}),
-    ...(isAnthropic ? { preserveSignatures: true } : {}),
+    ...(isAnthropic
+      ? {
+          preserveSignatures: true,
+          appendOnlyRuntimeContext: bindsClaudeThinkingPrefix({
+            id: modelId,
+            params: params.model?.params,
+          }),
+        }
+      : {}),
     ...(isGoogle
       ? {
           sanitizeThoughtSignatures: {
@@ -195,7 +177,9 @@ const REASONING_CONTENT_REPLAY_MODEL_IDS = new Set([
   "mimo-v2-omni",
   "mimo-v2.5",
   "mimo-v2.5-pro",
+  "mimo-v2.6-flash",
   "mimo-v2.6-pro",
+  "mimo-v2.6-pro-ultraspeed",
 ]);
 
 function requiresReasoningContentReplay(modelId: string | null | undefined): boolean {
@@ -221,47 +205,37 @@ function mergeTranscriptPolicy(
     return basePolicy;
   }
 
-  return {
+  const merged = {
     ...basePolicy,
     ...(policy.sanitizeMode != null ? { sanitizeMode: policy.sanitizeMode } : {}),
-    ...(typeof policy.sanitizeToolCallIds === "boolean"
-      ? { sanitizeToolCallIds: policy.sanitizeToolCallIds }
-      : {}),
-    ...(policy.toolCallIdMode ? { toolCallIdMode: policy.toolCallIdMode as ToolCallIdMode } : {}),
+    ...(policy.toolCallIdMode ? { toolCallIdMode: policy.toolCallIdMode } : {}),
     ...(policy.duplicateToolCallIdStyle
       ? { duplicateToolCallIdStyle: policy.duplicateToolCallIdStyle }
-      : {}),
-    ...(typeof policy.preserveNativeAnthropicToolUseIds === "boolean"
-      ? { preserveNativeAnthropicToolUseIds: policy.preserveNativeAnthropicToolUseIds }
-      : {}),
-    ...(typeof policy.repairToolUseResultPairing === "boolean"
-      ? { repairToolUseResultPairing: policy.repairToolUseResultPairing }
-      : {}),
-    ...(typeof policy.preserveSignatures === "boolean"
-      ? { preserveSignatures: policy.preserveSignatures }
       : {}),
     ...(policy.sanitizeThoughtSignatures
       ? { sanitizeThoughtSignatures: policy.sanitizeThoughtSignatures }
       : {}),
-    ...(typeof policy.dropThinkingBlocks === "boolean"
-      ? { dropThinkingBlocks: policy.dropThinkingBlocks }
-      : {}),
-    ...(typeof policy.dropReasoningFromHistory === "boolean"
-      ? { dropReasoningFromHistory: policy.dropReasoningFromHistory }
-      : {}),
     ...(typeof policy.applyAssistantFirstOrderingFix === "boolean"
       ? { applyGoogleTurnOrdering: policy.applyAssistantFirstOrderingFix }
       : {}),
-    ...(typeof policy.validateGeminiTurns === "boolean"
-      ? { validateGeminiTurns: policy.validateGeminiTurns }
-      : {}),
-    ...(typeof policy.validateAnthropicTurns === "boolean"
-      ? { validateAnthropicTurns: policy.validateAnthropicTurns }
-      : {}),
-    ...(typeof policy.allowSyntheticToolResults === "boolean"
-      ? { allowSyntheticToolResults: policy.allowSyntheticToolResults }
-      : {}),
   };
+  for (const key of [
+    "sanitizeToolCallIds",
+    "preserveNativeAnthropicToolUseIds",
+    "repairToolUseResultPairing",
+    "preserveSignatures",
+    "appendOnlyRuntimeContext",
+    "dropThinkingBlocks",
+    "dropReasoningFromHistory",
+    "validateGeminiTurns",
+    "validateAnthropicTurns",
+    "allowSyntheticToolResults",
+  ] as const) {
+    if (typeof policy[key] === "boolean") {
+      merged[key] = policy[key];
+    }
+  }
+  return merged;
 }
 
 const transcriptPolicyCache = new WeakMap<OpenClawConfig, Map<string, TranscriptPolicy>>();

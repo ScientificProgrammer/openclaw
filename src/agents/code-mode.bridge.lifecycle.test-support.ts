@@ -17,6 +17,7 @@ export function createSubscribedCodeModeHarness(params: {
   onToolResult?: EmbeddedRunAttemptParams["onToolResult"];
   onBlockReply?: EmbeddedRunAttemptParams["onBlockReply"];
   onPartialReply?: EmbeddedRunAttemptParams["onPartialReply"];
+  sourceReplyDeliveryMode?: EmbeddedRunAttemptParams["sourceReplyDeliveryMode"];
   timeoutMs?: number;
   observeToolTerminal?: EmbeddedRunAttemptParams["observeToolTerminal"];
   onToolStreamBoundary?: EmbeddedRunAttemptParams["onToolStreamBoundary"];
@@ -50,14 +51,25 @@ export function createSubscribedCodeModeHarness(params: {
       observeToolTerminal: params.observeToolTerminal,
       onToolStreamBoundary: params.onToolStreamBoundary,
       onPartialReply: params.onPartialReply,
+      sourceReplyDeliveryMode: params.sourceReplyDeliveryMode,
       blockReplyBreak: "message_end",
     } as never,
-    activeSession: activeSession as never,
-    hookRunner: undefined as never,
+    agentSession: {
+      activeSession: activeSession as never,
+      hookRunner: undefined as never,
+      clientToolCallSlots: [],
+      hasDeliveredSourceReply: () => false,
+      markSourceReplyDelivered: () => undefined,
+      builtinToolNames: new Set(),
+      coreBuiltinToolNames: new Set(),
+      replaySafeToolNames: new Set(),
+      codeModeExecToolNames: new Set(),
+      sideEffectToolOwners: new Map(),
+      trustedLocalMediaToolNames: new Set(),
+    },
     hookAgentId: "main",
     diagnosticTrace: {} as never,
     diagnosticOwner: createDiagnosticEmbeddedRunOwner({ sessionId, sessionKey, runId }),
-    clientToolCallSlots: [],
     nestedToolActivities,
     isReplaySafeTool: () => false,
     runAbortController,
@@ -69,13 +81,8 @@ export function createSubscribedCodeModeHarness(params: {
       timedOut: false,
       yieldDetected: false,
     }),
-    hasDeliveredSourceReply: () => false,
-    markSourceReplyDelivered: () => undefined,
     onBlockReply: params.onBlockReply,
     onBlockReplyFlush: params.onBlockReplyFlush,
-    sandboxSessionKey: sessionKey,
-    builtinToolNames: new Set(),
-    replaySafeToolNames: new Set(),
   });
   const context = {
     config,

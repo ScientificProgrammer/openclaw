@@ -49,8 +49,6 @@ internal interface VoiceWakeRecognizer {
   )
 
   fun stop(operationId: Long)
-
-  fun destroy(operationId: Long)
 }
 
 internal class VoiceWakeRecognitionSession(
@@ -118,14 +116,6 @@ internal class AndroidOnDeviceVoiceWakeRecognizer(
   }
 
   override fun stop(operationId: Long) {
-    if (!claimOperation(operationId)) return
-    if (platformOwnerOperationId.get() == 0L) return
-    runOnMainSync {
-      if (operationId == latestOperationId.get()) retireRecognizer()
-    }
-  }
-
-  override fun destroy(operationId: Long) {
     if (!claimOperation(operationId)) return
     if (platformOwnerOperationId.get() == 0L) return
     runOnMainSync {
@@ -267,10 +257,6 @@ internal class VoiceWakeManager(
     data class Stop(
       override val operationId: Long,
     ) : RecognizerAction
-
-    data class Destroy(
-      override val operationId: Long,
-    ) : RecognizerAction
   }
 
   private val lock = Any()
@@ -350,7 +336,7 @@ internal class VoiceWakeManager(
       synchronized(lock) {
         enabled = false
         foreground = false
-        val pendingAction = stopSessionLocked(destroy = true)
+        val pendingAction = stopSessionLocked(force = true)
         _statusText.value = nativeText("Off")
         pendingAction
       }
@@ -360,7 +346,7 @@ internal class VoiceWakeManager(
   private fun reconcileLocked(): RecognizerAction? {
     val blockedStatus = blockedStatusLocked()
     if (blockedStatus != null) {
-      val action = stopSessionLocked(destroy = !enabled || !foreground)
+      val action = stopSessionLocked(force = !enabled || !foreground)
       _statusText.value = blockedStatus
       return action
     }
@@ -401,6 +387,7 @@ internal class VoiceWakeManager(
             _statusText.value = nativeText("Listening")
             null
           }
+
           is VoiceWakeRecognitionEvent.Transcript -> {
             // Android partials routinely stop mid-command. Only a final transcript
             // has the recognizer's end-of-utterance boundary and is safe to dispatch.
@@ -413,6 +400,7 @@ internal class VoiceWakeManager(
             }
             transcriptAction
           }
+
           is VoiceWakeRecognitionEvent.Error -> {
             sessionActive = false
             _isListening.value = false
@@ -485,16 +473,18 @@ internal class VoiceWakeManager(
   private fun retryDelayMs(errorCode: Int): Long =
     when (errorCode) {
       SpeechRecognizer.ERROR_TOO_MANY_REQUESTS -> 15_000L
+
       SpeechRecognizer.ERROR_RECOGNIZER_BUSY,
       SpeechRecognizer.ERROR_SERVER,
       SpeechRecognizer.ERROR_SERVER_DISCONNECTED,
       SpeechRecognizer.ERROR_AUDIO,
       SpeechRecognizer.ERROR_CLIENT,
       -> 1_500L
+
       else -> restartDelayMs
     }
 
-  private fun stopSessionLocked(destroy: Boolean): RecognizerAction? {
+  private fun stopSessionLocked(force: Boolean): RecognizerAction? {
     restartJob?.cancel()
     restartJob = null
     commandJob?.cancel()
@@ -504,11 +494,7 @@ internal class VoiceWakeManager(
     val wasActive = sessionActive
     sessionActive = false
     _isListening.value = false
-    return when {
-      destroy -> RecognizerAction.Destroy(nextRecognizerOperationIdLocked())
-      wasActive -> RecognizerAction.Stop(nextRecognizerOperationIdLocked())
-      else -> null
-    }
+    return if (force || wasActive) RecognizerAction.Stop(nextRecognizerOperationIdLocked()) else null
   }
 
   private fun nextRecognizerOperationIdLocked(): Long {
@@ -518,13 +504,17 @@ internal class VoiceWakeManager(
 
   private fun performRecognizerAction(action: RecognizerAction?) {
     when (action) {
-      is RecognizerAction.Start ->
+      is RecognizerAction.Start -> {
         recognizer.start(action.operationId) { event ->
           handleRecognitionEvent(action.sessionGeneration, event)
         }
-      is RecognizerAction.Stop -> recognizer.stop(action.operationId)
-      is RecognizerAction.Destroy -> recognizer.destroy(action.operationId)
-      null -> Unit
+      }
+
+      is RecognizerAction.Stop -> {
+        recognizer.stop(action.operationId)
+      }
+
+      null -> {}
     }
   }
 }
@@ -540,6 +530,4 @@ internal class PreviewVoiceWakeRecognizer : VoiceWakeRecognizer {
   }
 
   override fun stop(operationId: Long) = Unit
-
-  override fun destroy(operationId: Long) = Unit
 }

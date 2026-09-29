@@ -4,8 +4,9 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { prepareSystemAgentRunAdmission } from "../agents/admitted-run-context.js";
-import { extractAgentRunText } from "../agents/agent-run-result.js";
+import { extractAgentRunTerminalError, extractAgentRunText } from "../agents/agent-run-result.js";
 import { SessionManager } from "../agents/sessions/session-manager.js";
+import { CommandLane } from "../process/lanes.js";
 import {
   SYSTEM_AGENT_ASSISTANT_SYSTEM_PROMPT,
   SYSTEM_AGENT_GREETING_SYSTEM_PROMPT,
@@ -62,19 +63,8 @@ const SYSTEM_AGENT_PLANNER_RESPONSE_SCHEMA = {
   additionalProperties: false,
 } as const;
 
-export async function planSystemAgentCommand(params: {
-  input: string;
-  overview: SystemAgentOverview;
-  history?: SystemAgentAssistantTurn[];
-  pendingOperation?: string;
-  readonly verifiedInference: SystemAgentVerifiedInferenceBinding;
-  deps?: SystemAgentConfiguredModelPlannerDeps;
-}): Promise<SystemAgentAssistantPlan | null> {
-  return await planSystemAgentCommandWithConfiguredModel(params);
-}
-
 /** Plan only through the configured default agent's verified route. */
-export async function planSystemAgentCommandWithConfiguredModel(params: {
+export async function planSystemAgentCommand(params: {
   input: string;
   overview: SystemAgentOverview;
   history?: SystemAgentAssistantTurn[];
@@ -143,6 +133,9 @@ async function runConfiguredSystemAgentText(params: {
   } catch (error) {
     throw new SystemAgentInferenceUnavailableError("planner", [error]);
   }
+  // Provider transport options can select a different runtime. Plugin-owned
+  // inference keeps its verified runtime and uses the JSON prompt/parser contract.
+  const responseFormat = expectedAgentHarnessRuntimeArtifact ? undefined : params.responseFormat;
   const tempDir = await (params.deps?.createTempDir ?? createTempPlannerDir)();
   let text: string | undefined;
   let preparedRunAdmission: ReturnType<typeof prepareSystemAgentRunAdmission> | undefined;
@@ -180,7 +173,7 @@ async function runConfiguredSystemAgentText(params: {
       messageProvider: "openclaw",
       disableTools: true,
       disableTrajectory: true,
-      ...(params.responseFormat ? { streamParams: { responseFormat: params.responseFormat } } : {}),
+      ...(responseFormat ? { streamParams: { responseFormat } } : {}),
       ...(route.authProfileId ? { authProfileId: route.authProfileId } : {}),
     };
     const result =
@@ -198,6 +191,7 @@ async function runConfiguredSystemAgentText(params: {
             (await import("../agents/embedded-agent.js")).runEmbeddedAgent
           )({
             ...shared,
+            lane: CommandLane.SystemAgentInference,
             preparedRunAdmission,
             toolsAllow: [],
             agentHarnessRuntimeOverride: route.agentHarnessRuntimeOverride,
@@ -205,6 +199,10 @@ async function runConfiguredSystemAgentText(params: {
             cleanupBundleMcpOnRunEnd: true,
             ...(route.authProfileId ? { authProfileIdSource: "user" as const } : {}),
           });
+    const terminalError = extractAgentRunTerminalError(result);
+    if (terminalError) {
+      throw new SystemAgentInferenceUnavailableError("planner", [new Error(terminalError)]);
+    }
     text = extractAgentRunText(result)?.trim();
   } catch (error) {
     if (error instanceof SystemAgentInferenceUnavailableError) {

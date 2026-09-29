@@ -18,7 +18,11 @@ import { resolveWorkspaceRoot } from "./workspace-dir.js";
 /** Options provided by agent runtime callers when invoking OpenClaw plugin tools. */
 export type OpenClawPluginToolOptions = {
   agentSessionKey?: string;
+  runSessionKey?: string;
   runId?: string;
+  /** Host-bound standalone request/grant authority, never supplied by tool arguments. */
+  assertInvocationCurrent?: () => void;
+  assertInputCommitAllowed?: () => void;
   agentChannel?: string;
   agentAccountId?: string;
   agentTo?: string;
@@ -63,8 +67,9 @@ export function resolveOpenClawPluginToolInputs(params: {
   getRuntimeConfig?: () => OpenClawConfig | undefined;
 }) {
   const { options, resolvedConfig, runtimeConfig, getRuntimeConfig } = params;
+  const sessionKey = options?.runSessionKey ?? options?.agentSessionKey;
   const { sessionAgentId } = resolveSessionAgentIds({
-    sessionKey: options?.agentSessionKey,
+    sessionKey,
     config: resolvedConfig,
     agentId: options?.requesterAgentIdOverride,
   });
@@ -97,11 +102,12 @@ export function resolveOpenClawPluginToolInputs(params: {
       config: options?.config,
       runtimeConfig,
       getRuntimeConfig,
+      assertInputCommitAllowed: options?.assertInputCommitAllowed,
       fsPolicy: options?.fsPolicy,
       workspaceDir,
       agentDir: options?.agentDir,
       agentId: sessionAgentId,
-      sessionKey: options?.agentSessionKey,
+      sessionKey,
       sessionId: options?.sessionId,
       toolBindings: options?.toolBindings,
       activeProjectKeys: options?.activeProjectKeys,

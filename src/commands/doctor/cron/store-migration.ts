@@ -1,6 +1,6 @@
 // Cron store row normalization for doctor repair and quarantine decisions.
 import { randomUUID } from "node:crypto";
-import { isRecord } from "@openclaw/normalization-core/record-coerce";
+import { asNullableRecord, isRecord } from "@openclaw/normalization-core/record-coerce";
 import { timestampMsToIsoString } from "../../../../packages/normalization-core/src/number-coercion.js";
 import {
   normalizeLowercaseStringOrEmpty,
@@ -8,11 +8,14 @@ import {
   normalizeOptionalString,
   normalizeOptionalStringifiedId,
 } from "../../../../packages/normalization-core/src/string-coerce.js";
+import { classifyCronAgentTurnShellPrompt } from "../../../cron/agent-turn-command-prompt.js";
 import { parseAbsoluteTimeMs } from "../../../cron/parse.js";
 import { getInvalidPersistedCronJobReason } from "../../../cron/persisted-shape.js";
 import { coerceFiniteScheduleNumber } from "../../../cron/schedule-number.js";
 import { inferCronJobName } from "../../../cron/service/normalize.js";
+import { resolveCronCurrentSessionTarget } from "../../../cron/session-target.js";
 import { normalizeCronStaggerMs, resolveDefaultCronStaggerMs } from "../../../cron/stagger.js";
+import type { CronQuarantinedJob, QuarantinedCronConfigJob } from "../../../cron/store/types.js";
 import {
   isBlockedLegacyCodexModelRef,
   type LegacyCodexModelIdentity,
@@ -25,10 +28,8 @@ import {
 import { normalizeLegacyDeliveryInput } from "./legacy-delivery.js";
 import { resolveLegacyCronMigrationId } from "./legacy-store-migration.js";
 import {
-  classifyUnresolvedAgentTurnShellToolPrompt,
   collectLegacyOpenAICodexCronModelRoutes,
   copyTopLevelAgentTurnFields,
-  hasLegacyOpenAICodexCronModelRef,
   inferPayloadIfMissing,
   migrateLegacyAgentTurnCommandPayload,
   migrateLegacyCronPayload,
@@ -44,6 +45,7 @@ type CronStoreIssueKey =
   | "nonStringId"
   | "legacyScheduleString"
   | "legacyScheduleCron"
+  | "legacyScheduleKind"
   | "legacyPayloadKind"
   | "legacyPayloadCodexModel"
   | "legacyImageInspectionToolName"
@@ -55,6 +57,7 @@ type CronStoreIssueKey =
   | "legacyTopLevelDeliveryFields"
   | "legacyDeliveryMode"
   | "migratedScheduledToolPolicy"
+  | "reconciledOwnerAccount"
   | "invalidSchedule"
   | "invalidPayload";
 
@@ -77,10 +80,7 @@ export function collectStoredCronCodexRuntimePolicyTargets(
   const targets = new Map<string, CronCodexRuntimePolicyTarget>();
   for (const job of jobs) {
     const agentId = normalizeOptionalString(job.agentId);
-    const payload =
-      job.payload && typeof job.payload === "object" && !Array.isArray(job.payload)
-        ? (job.payload as Record<string, unknown>)
-        : {};
+    const payload = isRecord(job.payload) ? job.payload : {};
     const routes = [
       ...collectLegacyOpenAICodexCronModelRoutes(payload),
       ...collectLegacyOpenAICodexCronModelRoutes({ model: job.model }),
@@ -205,8 +205,7 @@ export function normalizeStoredCronJobs(
       trackIssue("nonStringId");
     }
 
-    const state = raw.state;
-    if (!state || typeof state !== "object" || Array.isArray(state)) {
+    if (!isRecord(raw.state)) {
       raw.state = {};
       mutated = true;
     }
@@ -255,8 +254,7 @@ export function normalizeStoredCronJobs(
     }
 
     if ("sessionKey" in raw) {
-      const sessionKey =
-        typeof raw.sessionKey === "string" ? normalizeOptionalString(raw.sessionKey) : undefined;
+      const sessionKey = normalizeOptionalString(raw.sessionKey);
       if (raw.sessionKey !== sessionKey) {
         raw.sessionKey = sessionKey;
         mutated = true;
@@ -268,35 +266,21 @@ export function normalizeStoredCronJobs(
       mutated = true;
     }
 
-    const wakeModeRaw = normalizeOptionalLowercaseString(raw.wakeMode) ?? "";
-    if (wakeModeRaw === "next-heartbeat") {
-      if (raw.wakeMode !== "next-heartbeat") {
-        raw.wakeMode = "next-heartbeat";
-        mutated = true;
-      }
-    } else if (wakeModeRaw === "now") {
-      if (raw.wakeMode !== "now") {
-        raw.wakeMode = "now";
-        mutated = true;
-      }
-    } else {
-      raw.wakeMode = "now";
+    const wakeMode =
+      normalizeOptionalLowercaseString(raw.wakeMode) === "next-heartbeat"
+        ? "next-heartbeat"
+        : "now";
+    if (raw.wakeMode !== wakeMode) {
+      raw.wakeMode = wakeMode;
       mutated = true;
     }
 
-    const payload = raw.payload;
-    if (
-      (!payload || typeof payload !== "object" || Array.isArray(payload)) &&
-      inferPayloadIfMissing(raw)
-    ) {
+    if (!isRecord(raw.payload) && inferPayloadIfMissing(raw)) {
       mutated = true;
       trackIssue("legacyTopLevelPayloadFields");
     }
 
-    const payloadRecord =
-      raw.payload && typeof raw.payload === "object" && !Array.isArray(raw.payload)
-        ? (raw.payload as Record<string, unknown>)
-        : null;
+    const payloadRecord = asNullableRecord(raw.payload);
 
     if (payloadRecord) {
       if (normalizePayloadKind(payloadRecord)) {
@@ -328,29 +312,13 @@ export function normalizeStoredCronJobs(
       }
     }
 
-    const hadLegacyTopLevelPayloadFields =
-      "model" in raw ||
-      "thinking" in raw ||
-      "timeoutSeconds" in raw ||
-      "allowUnsafeExternalContent" in raw ||
-      "message" in raw ||
-      "text" in raw ||
-      "command" in raw ||
-      "timeout" in raw;
-    const hadLegacyTopLevelDeliveryFields =
-      "deliver" in raw ||
-      "channel" in raw ||
-      "to" in raw ||
-      "threadId" in raw ||
-      "bestEffortDeliver" in raw ||
-      "provider" in raw;
-    if (hadLegacyTopLevelPayloadFields || hadLegacyTopLevelDeliveryFields) {
-      stripLegacyTopLevelFields(raw);
+    const removedTopLevel = stripLegacyTopLevelFields(raw);
+    if (removedTopLevel.payload || removedTopLevel.delivery) {
       mutated = true;
-      if (hadLegacyTopLevelPayloadFields) {
+      if (removedTopLevel.payload) {
         trackIssue("legacyTopLevelPayloadFields");
       }
-      if (hadLegacyTopLevelDeliveryFields) {
+      if (removedTopLevel.delivery) {
         trackIssue("legacyTopLevelDeliveryFields");
       }
     }
@@ -369,7 +337,6 @@ export function normalizeStoredCronJobs(
         }
       }
       const hadLegacyPayloadProvider = Boolean(normalizeOptionalString(payloadRecord.provider));
-      const hadLegacyPayloadCodexModel = hasLegacyOpenAICodexCronModelRef(payloadRecord);
       const hadLegacyTaskSuggestionToolName = hasLegacyToolNameList(
         payloadRecord.toolsAllow,
         TASK_SUGGESTION_TOOL_NAME_MIGRATION,
@@ -379,6 +346,7 @@ export function normalizeStoredCronJobs(
         IMAGE_INSPECTION_TOOL_NAME_MIGRATION,
       );
       const legacyCodexModelRoutes = collectLegacyOpenAICodexCronModelRoutes(payloadRecord);
+      const hadLegacyPayloadCodexModel = legacyCodexModelRoutes.length > 0;
       const agentId = normalizeOptionalString(raw.agentId);
       const shouldMigrateCodexModelRef = (modelRef: string, legacyModelRef: string) =>
         options.shouldMigrateCodexRuntimePolicyTarget?.({
@@ -422,7 +390,7 @@ export function normalizeStoredCronJobs(
         mutated = true;
         trackIssue("legacyAgentTurnCommandPayload");
       } else {
-        const unresolvedPromptKind = classifyUnresolvedAgentTurnShellToolPrompt(payloadRecord);
+        const unresolvedPromptKind = classifyCronAgentTurnShellPrompt(payloadRecord);
         if (unresolvedPromptKind) {
           trackIssue("unresolvedAgentTurnShellToolPrompt");
           const name = normalizeOptionalString(raw.name) ?? normalizeOptionalString(raw.id);
@@ -433,10 +401,30 @@ export function normalizeStoredCronJobs(
       }
     }
 
-    const schedule = raw.schedule;
-    if (schedule && typeof schedule === "object" && !Array.isArray(schedule)) {
-      const sched = schedule as Record<string, unknown>;
+    const sched = raw.schedule;
+    if (isRecord(sched)) {
       const kind = normalizeOptionalLowercaseString(sched.kind) ?? "";
+      const canonicalKind =
+        kind === "at" ||
+        kind === "every" ||
+        kind === "cron" ||
+        kind === "on-exit" ||
+        kind === "stream"
+          ? kind
+          : undefined;
+      if (canonicalKind && sched.kind !== canonicalKind) {
+        sched.kind = canonicalKind;
+        mutated = true;
+        trackIssue("legacyScheduleKind");
+      }
+      if (canonicalKind === "stream") {
+        const streamMode = normalizeOptionalLowercaseString(sched.mode);
+        if ((streamMode === "line" || streamMode === "match") && sched.mode !== streamMode) {
+          sched.mode = streamMode;
+          mutated = true;
+          trackIssue("legacyScheduleKind");
+        }
+      }
       if (!kind && ("at" in sched || "atMs" in sched)) {
         sched.kind = "at";
         mutated = true;
@@ -521,24 +509,23 @@ export function normalizeStoredCronJobs(
       }
     }
 
-    const delivery = raw.delivery;
-    if (delivery && typeof delivery === "object" && !Array.isArray(delivery)) {
-      const modeRaw = (delivery as { mode?: unknown }).mode;
+    const delivery = asNullableRecord(raw.delivery);
+    if (delivery) {
+      const modeRaw = delivery.mode;
       if (typeof modeRaw === "string") {
         const lowered = normalizeOptionalLowercaseString(modeRaw) ?? "";
         if (lowered === "deliver") {
-          (delivery as { mode?: unknown }).mode = "announce";
+          delivery.mode = "announce";
           mutated = true;
           trackIssue("legacyDeliveryMode");
         }
       } else if (modeRaw === undefined || modeRaw === null) {
-        (delivery as { mode?: unknown }).mode = "announce";
+        delivery.mode = "announce";
         mutated = true;
       }
     }
 
-    const isolation = raw.isolation;
-    if (isolation && typeof isolation === "object" && !Array.isArray(isolation)) {
+    if (isRecord(raw.isolation)) {
       delete raw.isolation;
       mutated = true;
     }
@@ -547,9 +534,17 @@ export function normalizeStoredCronJobs(
       payloadRecord && typeof payloadRecord.kind === "string" ? payloadRecord.kind : "";
     const rawSessionTarget = normalizeOptionalString(raw.sessionTarget) ?? "";
     const loweredSessionTarget = normalizeLowercaseStringOrEmpty(rawSessionTarget);
-    if (loweredSessionTarget === "main" || loweredSessionTarget === "isolated") {
-      if (raw.sessionTarget !== loweredSessionTarget) {
-        raw.sessionTarget = loweredSessionTarget;
+    if (
+      loweredSessionTarget === "main" ||
+      loweredSessionTarget === "isolated" ||
+      loweredSessionTarget === "current"
+    ) {
+      const sessionTarget = resolveCronCurrentSessionTarget({
+        sessionTarget: loweredSessionTarget,
+        sessionKey: normalizeOptionalString(raw.sessionKey),
+      });
+      if (raw.sessionTarget !== sessionTarget) {
+        raw.sessionTarget = sessionTarget;
         mutated = true;
       }
     } else if (loweredSessionTarget.startsWith("session:")) {
@@ -560,11 +555,6 @@ export function normalizeStoredCronJobs(
           raw.sessionTarget = normalizedSessionTarget;
           mutated = true;
         }
-      }
-    } else if (loweredSessionTarget === "current") {
-      if (raw.sessionTarget !== "isolated") {
-        raw.sessionTarget = "isolated";
-        mutated = true;
       }
     } else {
       const inferredSessionTarget =
@@ -584,51 +574,41 @@ export function normalizeStoredCronJobs(
       sessionTarget.startsWith("session:") ||
       (sessionTarget === "" &&
         (payloadKind === "agentTurn" || payloadKind === "command" || payloadKind === "script"));
-    const hasDelivery = delivery && typeof delivery === "object" && !Array.isArray(delivery);
     const normalizedLegacy = normalizeLegacyDeliveryInput({
-      delivery: hasDelivery ? (delivery as Record<string, unknown>) : null,
+      delivery,
       payload: payloadRecord,
     });
 
     if (
+      !delivery &&
       isIsolatedRunnablePayload &&
       (payloadKind === "agentTurn" || payloadKind === "command" || payloadKind === "script")
     ) {
-      if (!hasDelivery && normalizedLegacy.delivery) {
-        raw.delivery = normalizedLegacy.delivery;
-        mutated = true;
-      } else if (!hasDelivery) {
-        raw.delivery = { mode: "announce" };
-        mutated = true;
-      } else if (normalizedLegacy.mutated && normalizedLegacy.delivery) {
-        raw.delivery = normalizedLegacy.delivery;
-        mutated = true;
-      }
+      raw.delivery = normalizedLegacy.delivery ?? { mode: "announce" };
+      mutated = true;
     } else if (normalizedLegacy.mutated && normalizedLegacy.delivery) {
       raw.delivery = normalizedLegacy.delivery;
       mutated = true;
     }
 
-    const scheduledPolicyMutated = scheduledToolPolicyMigrations.migrate(raw, () =>
-      trackIssue("migratedScheduledToolPolicy"),
+    const scheduledPolicyMutated = scheduledToolPolicyMigrations.migrate(raw, (kind) =>
+      trackIssue(kind === "owner" ? "reconciledOwnerAccount" : "migratedScheduledToolPolicy"),
     );
     mutated ||= scheduledPolicyMutated;
 
     const invalidPersistedReason = getInvalidPersistedCronJobReason(raw);
-    if (
-      invalidPersistedReason === "missing-schedule" ||
-      invalidPersistedReason === "invalid-schedule"
-    ) {
-      trackIssue("invalidSchedule");
-      removedJobs.push({ job: structuredClone(raw), reason: invalidPersistedReason, sourceIndex });
-      mutated = true;
-      continue;
-    }
-    if (
-      invalidPersistedReason === "missing-payload" ||
-      invalidPersistedReason === "invalid-payload"
-    ) {
-      trackIssue("invalidPayload");
+    if (invalidPersistedReason) {
+      if (
+        invalidPersistedReason === "missing-schedule" ||
+        invalidPersistedReason === "invalid-schedule"
+      ) {
+        trackIssue("invalidSchedule");
+      } else if (
+        invalidPersistedReason === "missing-payload" ||
+        invalidPersistedReason === "invalid-payload"
+      ) {
+        trackIssue("invalidPayload");
+      }
       removedJobs.push({ job: structuredClone(raw), reason: invalidPersistedReason, sourceIndex });
       mutated = true;
       continue;
@@ -654,4 +634,57 @@ export function normalizeStoredCronJobs(
     mutated,
     removedJobs,
   };
+}
+
+export type QuarantinedCronJobRecovery = {
+  recoveredJobs: Array<Record<string, unknown>>;
+  recoveredEntries: Array<QuarantinedCronConfigJob | CronQuarantinedJob>;
+  retainedEntries: Array<QuarantinedCronConfigJob | CronQuarantinedJob>;
+};
+
+function restoredCronJobId(job: Record<string, unknown>): string | undefined {
+  return normalizeOptionalStringifiedId(job.id) ?? normalizeOptionalStringifiedId(job.jobId);
+}
+
+/** Revalidate quarantined schedule rows for an explicit Doctor repair. */
+export function recoverValidQuarantinedCronScheduleJobs(
+  entries: ReadonlyArray<QuarantinedCronConfigJob | CronQuarantinedJob>,
+  activeJobIds: ReadonlySet<string>,
+): QuarantinedCronJobRecovery {
+  const recoveredJobs: Array<Record<string, unknown>> = [];
+  const recoveredEntries: Array<QuarantinedCronConfigJob | CronQuarantinedJob> = [];
+  const retainedEntries: Array<QuarantinedCronConfigJob | CronQuarantinedJob> = [];
+  const recoveredJobIds = new Set<string>();
+
+  for (const entry of entries) {
+    if (entry.reason !== "invalid-schedule" || !isRecord(entry.job)) {
+      retainedEntries.push(entry);
+      continue;
+    }
+    const candidate = structuredClone(entry.job);
+    const jobId = restoredCronJobId(candidate);
+    if (jobId && (activeJobIds.has(jobId) || recoveredJobIds.has(jobId))) {
+      retainedEntries.push(entry);
+      continue;
+    }
+    if (isRecord(entry.state)) {
+      candidate.state = structuredClone(entry.state);
+    }
+    if (typeof entry.updatedAtMs === "number" && Number.isFinite(entry.updatedAtMs)) {
+      candidate.updatedAtMs = entry.updatedAtMs;
+    }
+
+    const normalized = normalizeStoredCronJobs([candidate]);
+    if (normalized.jobs.length !== 1 || normalized.removedJobs.length !== 0) {
+      retainedEntries.push(entry);
+      continue;
+    }
+    recoveredJobs.push(candidate);
+    recoveredEntries.push(entry);
+    if (jobId) {
+      recoveredJobIds.add(jobId);
+    }
+  }
+
+  return { recoveredJobs, recoveredEntries, retainedEntries };
 }

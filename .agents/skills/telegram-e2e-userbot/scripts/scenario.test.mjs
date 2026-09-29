@@ -20,7 +20,7 @@ test("normalizes Telegram and gateway actions", () => {
         },
         { type: "patchConfig", atMs: 750, patch: { channels: { telegram: { historyLimit: 9 } } } },
         { type: "systemEvent", atMs: 900, text: "heartbeat proof" },
-        { type: "cron", atMs: 950, message: "deliver the schedule" },
+        { type: "cron", atMs: 950, message: "deliver the schedule", bestEffort: true },
         { type: "command", atMs: 975, argv: ["node", "--version"], cwd: "repo" },
         { type: "telegramApiHold", atMs: 980, method: "sendMessage", skip: 1 },
         { type: "telegramApiWaitHeld", atMs: 990, method: "sendMessage" },
@@ -48,7 +48,7 @@ test("normalizes Telegram and gateway actions", () => {
           patch: { channels: { telegram: { historyLimit: 9 } } },
         },
         { type: "systemEvent", atMs: 900, text: "heartbeat proof" },
-        { type: "cron", atMs: 950, message: "deliver the schedule" },
+        { type: "cron", atMs: 950, message: "deliver the schedule", bestEffort: true },
         {
           type: "command",
           atMs: 975,
@@ -113,6 +113,10 @@ test("rejects fields and action types outside the closed schema", () => {
     () => parseScenario({ actions: [{ type: "restartGateway", atMs: -1 }] }),
     /atMs must be a non-negative integer/u,
   );
+  assert.throws(
+    () => parseScenario({ actions: [{ type: "cron", message: "deliver", bestEffort: "yes" }] }),
+    /bestEffort must be a boolean/u,
+  );
 });
 
 test("validates the recorder-ready artifact as a closed shape", () => {
@@ -150,4 +154,35 @@ test("projects DM and group recording targets into cron delivery targets", () =>
     recorderSelector: "-100123",
     cronDeliveryTarget: "-100123",
   });
+});
+
+test("forum topic selection survives scenario parsing and rejects invalid topic ids", () => {
+  const action = { type: "send", atMs: 0, text: "topic proof", forumTopicId: 42 };
+  assert.deepEqual(parseScenario({ actions: [action] }).actions, [action]);
+  for (const forumTopicId of [0, -1, 1.5])
+    assert.throws(() => parseScenario({ actions: [{ ...action, forumTopicId }] }), /forumTopicId/);
+});
+
+test("photo sends allow an empty caption and replyToPrevious targets an earlier send", () => {
+  const photo = { type: "send", atMs: 0, photo: "/tmp/fixture.png" };
+  const reply = { type: "send", atMs: 5, text: "/btw check this", replyToPrevious: true };
+  assert.deepEqual(parseScenario({ actions: [photo, reply] }).actions, [
+    { ...photo, text: "" },
+    reply,
+  ]);
+  assert.deepEqual(parseScenario({ actions: [reply, photo] }).actions, [
+    { ...photo, text: "" },
+    reply,
+  ]);
+  assert.throws(
+    () => parseScenario({ actions: [{ ...photo, atMs: 10 }, reply] }),
+    /replyToPrevious/,
+  );
+  assert.throws(() => parseScenario({ actions: [reply] }), /replyToPrevious/);
+  assert.throws(
+    () =>
+      parseScenario({ actions: [{ type: "send", atMs: 0, text: "x", replyToPrevious: false }] }),
+    /replyToPrevious/,
+  );
+  assert.throws(() => parseScenario({ actions: [{ type: "send", atMs: 0 }] }), /text/);
 });

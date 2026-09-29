@@ -1,4 +1,3 @@
-// Feishu plugin module implements reply dispatcher behavior.
 import { formatReasoningMessage, resolveHumanDelayConfig } from "openclaw/plugin-sdk/agent-runtime";
 import { logTypingFailure } from "openclaw/plugin-sdk/channel-feedback";
 import {
@@ -8,7 +7,6 @@ import {
 import {
   createChannelMessageReplyPipeline,
   formatChannelProgressDraftLineForEntry,
-  isChannelProgressDraftWorkToolName,
   resolveChannelPreviewStreamMode,
   resolveChannelStreamingBlockEnabled,
 } from "openclaw/plugin-sdk/channel-outbound";
@@ -20,16 +18,26 @@ import {
   resolveTextChunksWithFallback,
   sendMediaWithLeadingCaption,
 } from "openclaw/plugin-sdk/reply-payload";
+import type { GetReplyOptions } from "openclaw/plugin-sdk/reply-runtime";
 import { stripReasoningTagsFromText } from "openclaw/plugin-sdk/text-chunking";
 import type { ClawdbotConfig, OutboundIdentity, ReplyPayload, RuntimeEnv } from "../runtime-api.js";
 import { resolveFeishuRuntimeAccount } from "./accounts.js";
 import { resolveConfiguredHttpTimeoutMs } from "./client-timeout.js";
 import { createFeishuClient } from "./client.js";
 import { resolveFeishuIdentityEmoji } from "./identity-header.js";
-import { chunkFeishuPostMarkdown, materializeFeishuPostMarkdownSoftBreaks } from "./markdown.js";
+import {
+  chunkFeishuPostMarkdown,
+  materializeFeishuPostMarkdownSoftBreaks,
+  shouldUseFeishuCard,
+} from "./markdown.js";
 import { buildFeishuMediaFallbackText } from "./media-fallback.js";
 import { sendMediaFeishu, shouldSuppressFeishuTextForVoiceMedia } from "./media.js";
 import type { MentionTarget } from "./mention-target.types.js";
+import {
+  consumeFeishuPresentationFallbackMarker,
+  renderFeishuReplyPayload,
+  withinCardTableLimit,
+} from "./presentation-card.js";
 import {
   createFeishuPartialReplyDeliveryError,
   createFeishuReplyDeliveryResult,
@@ -43,6 +51,7 @@ import { streamingStartBackoffUntilByAccount } from "./reply-dispatcher-state.js
 import { getFeishuRuntime } from "./runtime.js";
 import {
   chunkFeishuCardMarkdown,
+  sendCardFeishu,
   sendMessageFeishu,
   sendStructuredCardFeishu,
   type CardHeaderConfig,
@@ -54,11 +63,6 @@ import {
 } from "./streaming-card.js";
 import { resolveReceiveIdType } from "./targets.js";
 import { addTypingIndicator, removeTypingIndicator, type TypingIndicatorState } from "./typing.js";
-
-/** Detect if text contains markdown elements that benefit from card rendering */
-function shouldUseCard(text: string): boolean {
-  return /```[\s\S]*?```/.test(text) || /\|.+\|[\r\n]+\|[-:| ]+\|/.test(text);
-}
 
 function mergeStreamingFinalText(
   previousText: string,
@@ -97,10 +101,9 @@ function isStreamingStartBackedOff(accountId: string, now = Date.now()): boolean
   return true;
 }
 
-function rememberStreamingStartFailure(accountId: string, now = Date.now()): number {
+function rememberStreamingStartFailure(accountId: string, now = Date.now()): void {
   const backoffUntil = now + STREAMING_START_FAILURE_BACKOFF_MS;
   streamingStartBackoffUntilByAccount.set(accountId, backoffUntil);
-  return backoffUntil;
 }
 
 function normalizeEpochMs(timestamp: number | undefined): number | undefined {
@@ -200,6 +203,14 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
     rootId !== undefined &&
     sendReplyToMessageId !== undefined &&
     sendReplyToMessageId !== rootId;
+  const replyTarget = {
+    cfg,
+    to: sendTarget,
+    replyToMessageId: sendReplyToMessageId,
+    replyInThread: effectiveReplyInThread,
+    allowTopLevelReplyFallback,
+    accountId,
+  };
   const account = resolveFeishuRuntimeAccount({ cfg, accountId });
   let typingState: TypingIndicatorState | null = null;
   // Reply text and card attribution share the same selected-model context.
@@ -302,16 +313,16 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
   // Partial previews are replaceable; only committed final text may precede an error notice.
   let hasStreamingFinalText = false;
   const deliveredFinalTexts = new Set<string>();
-  type ClosedStreamingSettlement = {
-    result: FeishuReplyDeliveryResult;
-    error?: unknown;
-    content: string;
-    contentClaimed?: boolean;
-  };
+  type StreamingDisposition = "closed" | "discarded";
   type StreamingCloseOutcome = {
+    disposition: StreamingDisposition;
     result: FeishuReplyDeliveryResult;
     generation?: number;
     error?: unknown;
+  };
+  type ClosedStreamingSettlement = StreamingCloseOutcome & {
+    content: string;
+    contentClaimed?: boolean;
   };
   const closedStreamingSettlements = new Map<number, ClosedStreamingSettlement>();
   let sentIndependentBlockText = false;
@@ -320,12 +331,20 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
   let streamingGeneration = 0;
   let activeStreamingGeneration: number | undefined;
   let inFlightStreamingClose:
-    | { generation: number; content: string; promise: Promise<StreamingCloseOutcome> }
+    | {
+        session: FeishuStreamingSession;
+        generation: number;
+        content: string;
+        disposition: StreamingDisposition;
+        promise: Promise<StreamingCloseOutcome>;
+      }
     | undefined;
   let visibleReplySent = false;
-  let skippedFinalReason: string | null = null;
-  let skippedFinalAssistantMessageIndex: number | undefined;
-  let preparedDeliveryAssistantMessageIndex: number | undefined;
+  type ReplyOutcome =
+    | { kind: "skipped"; reason: string; assistantMessageIndex?: number }
+    | { kind: "suppressed"; reason: string }
+    | { kind: "failed" };
+  let replyOutcome: ReplyOutcome | undefined;
   let idleSideEffectsPromise: Promise<void> = Promise.resolve();
   let activeIdleSideEffectsPromise: Promise<void> | null = null;
   let idleRequestedForReply = false;
@@ -339,10 +358,6 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
   };
   const pendingStreamingDeliveries: PendingStreamingDelivery[] = [];
   type StreamTextUpdateMode = "snapshot" | "delta";
-
-  const markVisibleReplySent = () => {
-    visibleReplySent = true;
-  };
 
   const formatReasoningPrefix = (thinking: string): string => {
     if (!thinking) {
@@ -512,24 +527,32 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
     content: string,
     result: FeishuReplyDeliveryResult,
     error?: unknown,
+    disposition: StreamingDisposition = "closed",
   ) => {
-    if (generation === undefined || !content) {
+    if (generation === undefined || (!content && disposition === "closed")) {
       return;
     }
     closedStreamingSettlements.set(generation, {
+      disposition,
       result,
       content,
       ...(error === undefined ? {} : { error }),
     });
   };
 
-  const performStreamingClose = async (): Promise<StreamingCloseOutcome> => {
+  const performStreamingClose = async (
+    disposition: StreamingDisposition,
+  ): Promise<StreamingCloseOutcome> => {
     const streamingToClose = streaming;
     const generationToClose = activeStreamingGeneration;
     const startPromiseToClose = streamingStartPromise;
     const updateQueueToClose = partialUpdateQueue;
     const finalizedAnswerText = streamText;
     const finalizedReasoningText = reasoningText;
+    const outcome = {
+      disposition,
+      ...(generationToClose === undefined ? {} : { generation: generationToClose }),
+    };
     // Seal this generation before provider I/O. Deliveries arriving during close were not part
     // of its captured content and must take a new/static path instead of inheriting its receipt.
     if (generationToClose !== undefined && activeStreamingGeneration === generationToClose) {
@@ -540,89 +563,88 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
         await startPromiseToClose;
       }
       await updateQueueToClose;
+      let result = noVisibleFeishuReplyDelivery;
+      let finalizationError: unknown;
       if (streamingToClose?.isActive()) {
         statusLine = "";
         const text = buildCombinedStreamText(finalizedReasoningText, finalizedAnswerText);
-        const finalNote = resolveCardNote(agentId, identity, responsePrefixContextProvider());
         let closed;
         try {
-          closed = await streamingToClose.closeWithResult(text, { note: finalNote });
+          if (disposition === "discarded") {
+            closed = await streamingToClose.discard();
+          } else {
+            const finalNote = resolveCardNote(agentId, identity, responsePrefixContextProvider());
+            closed = await streamingToClose.closeWithResult(text, { note: finalNote });
+          }
         } catch (error: unknown) {
           if (!(error instanceof FeishuStreamingFinalizationError)) {
             throw error;
           }
-          const failedResult = createFeishuReplyDeliveryResult({
-            results: [error.result],
-            visibleReplySent: error.result.visibleReplySent,
-            content: error.result.content,
-            kind: "card",
-          });
-          if (failedResult.visibleReplySent) {
-            markVisibleReplySent();
-          }
-          if (failedResult.visibleReplySent && finalizedAnswerText) {
-            const partialError = createFeishuPartialReplyDeliveryError(
-              error.cause ?? error,
-              failedResult,
-            );
-            if (failedResult.content === text) {
-              deliveredFinalTexts.add(finalizedAnswerText);
-            }
-            rememberClosedStreamingSettlement(
-              generationToClose,
-              finalizedAnswerText,
-              failedResult,
-              partialError,
-            );
-            return {
-              result: failedResult,
-              ...(generationToClose === undefined ? {} : { generation: generationToClose }),
-              error: partialError,
-            };
-          }
-          // Preserve the non-visible result so the settlement owner can recover the accepted
-          // final text through the same static-card fallback as an ordinary empty close.
-          rememberClosedStreamingSettlement(
-            generationToClose,
-            finalizedAnswerText,
-            failedResult,
-            error,
-          );
-          return {
-            result: failedResult,
-            ...(generationToClose === undefined ? {} : { generation: generationToClose }),
-            error,
-          };
+          closed = error.result;
+          finalizationError = error;
         }
-        const result = createFeishuReplyDeliveryResult({
+        result = createFeishuReplyDeliveryResult({
           results: [closed],
           visibleReplySent: closed.visibleReplySent,
           content: closed.content,
           kind: "card",
         });
-        // Track the raw streamed text so the duplicate-final check in deliver()
-        // can skip the redundant text delivery that arrives after onIdle closes
-        // the streaming card.
         if (result.visibleReplySent) {
-          markVisibleReplySent();
+          visibleReplySent = true;
         }
-        if (result.visibleReplySent && finalizedAnswerText) {
+        // Only a retained final can satisfy a duplicate text payload. Requested removal
+        // and actual accepted content are separate facts when provider cleanup fails.
+        if (
+          disposition === "closed" &&
+          result.visibleReplySent &&
+          finalizedAnswerText &&
+          (finalizationError === undefined || result.content === text)
+        ) {
           deliveredFinalTexts.add(finalizedAnswerText);
-          rememberClosedStreamingSettlement(generationToClose, finalizedAnswerText, result);
         }
-        return {
+        if (
+          finalizationError instanceof FeishuStreamingFinalizationError &&
+          result.visibleReplySent
+        ) {
+          finalizationError = createFeishuPartialReplyDeliveryError(
+            finalizationError.cause ?? finalizationError,
+            result,
+          );
+        }
+      }
+      if (
+        disposition === "discarded" ||
+        finalizationError !== undefined ||
+        (result.visibleReplySent && finalizedAnswerText)
+      ) {
+        // Pending and media-delayed payloads still own this generation. A discarded
+        // generation must never recover its obsolete prose through a new static card.
+        rememberClosedStreamingSettlement(
+          generationToClose,
+          finalizedAnswerText,
           result,
-          ...(generationToClose === undefined ? {} : { generation: generationToClose }),
-        };
+          finalizationError,
+          disposition,
+        );
       }
       return {
-        result: noVisibleFeishuReplyDelivery,
-        ...(generationToClose === undefined ? {} : { generation: generationToClose }),
+        ...outcome,
+        result,
+        ...(finalizationError === undefined ? {} : { error: finalizationError }),
       };
     } catch (error: unknown) {
+      if (disposition === "discarded") {
+        rememberClosedStreamingSettlement(
+          generationToClose,
+          finalizedAnswerText,
+          noVisibleFeishuReplyDelivery,
+          error,
+          disposition,
+        );
+      }
       return {
+        ...outcome,
         result: noVisibleFeishuReplyDelivery,
-        ...(generationToClose === undefined ? {} : { generation: generationToClose }),
         error,
       };
     } finally {
@@ -634,15 +656,20 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
     }
   };
 
-  const closeStreaming = (): Promise<StreamingCloseOutcome> => {
+  const closeStreaming = (
+    disposition: StreamingDisposition = "closed",
+  ): Promise<StreamingCloseOutcome> => {
+    const session = streaming;
     const generation = activeStreamingGeneration;
-    if (generation !== undefined && inFlightStreamingClose?.generation === generation) {
+    // Closing seals the active generation before awaiting I/O. The captured session,
+    // not that cleared generation field, owns any concurrent close/discard request.
+    if (session && inFlightStreamingClose?.session === session) {
       return inFlightStreamingClose.promise;
     }
     const content = streamText;
-    const closePromise = performStreamingClose();
-    if (generation !== undefined) {
-      const closing = { generation, content, promise: closePromise };
+    const closePromise = performStreamingClose(disposition);
+    if (session && generation !== undefined) {
+      const closing = { session, generation, content, disposition, promise: closePromise };
       inFlightStreamingClose = closing;
       const clear = () => {
         if (inFlightStreamingClose === closing) {
@@ -683,16 +710,19 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
   };
 
   const discardStreamingPreview = async () => {
-    try {
-      if (streamingStartPromise) {
-        await streamingStartPromise;
-      }
-      await partialUpdateQueue;
-      if (streaming?.isActive()) {
-        await streaming.discard();
-      }
-    } finally {
+    if (
+      streaming &&
+      inFlightStreamingClose?.session === streaming &&
+      inFlightStreamingClose.disposition === "closed"
+    ) {
+      // The earlier reply owns this sealed close and its receipt. Detach it so a
+      // new payload can progress; the idle pass still settles its captured owner.
       resetStreamingState();
+      return;
+    }
+    const outcome = await closeStreaming("discarded");
+    if (outcome.error !== undefined) {
+      throw toFeishuError(outcome.error);
     }
   };
 
@@ -715,15 +745,12 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
     useCard: boolean;
     infoKind?: string;
     firstChunkMentions?: MentionTarget[];
-    chunkMentions?: MentionTarget[];
-    header?: CardHeaderConfig;
-    note?: string;
-    sendChunk: (params: {
-      chunk: string;
-      isFirst: boolean;
-      mentions?: MentionTarget[];
-    }) => Promise<FeishuReplyDeliverySource>;
+    preparedPostText?: boolean;
   }): Promise<FeishuReplyDeliveryResult> => {
+    const header = paramsLocal.useCard ? resolveCardHeader(agentId, identity) : undefined;
+    const note = paramsLocal.useCard
+      ? resolveCardNote(agentId, identity, responsePrefixContextProvider())
+      : undefined;
     const chunkSource = paramsLocal.useCard
       ? paramsLocal.text
       : materializeFeishuPostMarkdownSoftBreaks(
@@ -739,7 +766,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
       limit: textChunkLimit,
       mode: chunkMode,
       firstChunkMentions: paramsLocal.firstChunkMentions,
-      chunkMentions: paramsLocal.chunkMentions,
+      chunkMentions: requiredMentionTargets,
       initialChunks,
     };
     const chunks = resolveTextChunksWithFallback(
@@ -747,8 +774,8 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
       paramsLocal.useCard
         ? chunkFeishuCardMarkdown({
             ...chunkOptions,
-            header: paramsLocal.header,
-            note: paramsLocal.note,
+            header,
+            note,
           })
         : chunkFeishuPostMarkdown(chunkOptions),
     );
@@ -756,25 +783,31 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
     const acceptedChunks: string[] = [];
     for (const [index, chunk] of chunks.entries()) {
       const mentions = [
-        ...(paramsLocal.chunkMentions ?? []),
+        ...(requiredMentionTargets ?? []),
         ...(index === 0 ? (paramsLocal.firstChunkMentions ?? []) : []),
       ];
       try {
-        const result = await paramsLocal.sendChunk({
-          chunk,
-          isFirst: index === 0,
-          mentions: mentions.length > 0 ? mentions : undefined,
-        });
+        const sendParams = {
+          ...replyTarget,
+          text: chunk,
+          ...(mentions.length > 0 ? { mentions } : {}),
+        };
+        const result = paramsLocal.useCard
+          ? await sendStructuredCardFeishu({ ...sendParams, header, note })
+          : await sendMessageFeishu({
+              ...sendParams,
+              ...(paramsLocal.preparedPostText ? { preparedPostText: true } : {}),
+            });
         results.push(result);
         acceptedChunks.push(chunk);
-        markVisibleReplySent();
+        visibleReplySent = true;
       } catch (error: unknown) {
         const acceptedChunk = isChannelPartialDeliveryError(error)
           ? error.deliveryResult
           : undefined;
         if (acceptedChunk) {
           acceptedChunks.push(acceptedChunk.content ?? chunk);
-          markVisibleReplySent();
+          visibleReplySent = true;
         }
         throw createFeishuPartialReplyDeliveryError(error, {
           ...acceptedChunk,
@@ -798,6 +831,14 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
     });
   };
 
+  const sendPostReply = (text: string, infoKind?: string, firstChunkMentions?: MentionTarget[]) =>
+    sendChunkedTextReply({
+      text,
+      useCard: false,
+      infoKind,
+      firstChunkMentions,
+    });
+
   const sendMediaReplies = async (
     payload: ReplyPayload,
     options?: { fallbackText?: string },
@@ -806,37 +847,14 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
     let sentFallbackText = false;
     let degradedVoiceFallbackText: string | undefined;
     const results: FeishuReplyDeliveryResult[] = [];
-    const sendFallbackText = async (text: string) =>
-      await sendChunkedTextReply({
-        text,
-        useCard: false,
-        infoKind: "final",
-        chunkMentions: requiredMentionTargets,
-        sendChunk: async ({ chunk, mentions }) =>
-          await sendMessageFeishu({
-            cfg,
-            to: sendTarget,
-            text: chunk,
-            replyToMessageId: sendReplyToMessageId,
-            replyInThread: effectiveReplyInThread,
-            allowTopLevelReplyFallback,
-            accountId,
-            ...(mentions ? { mentions } : {}),
-          }),
-      });
     try {
       await sendMediaWithLeadingCaption({
         mediaUrls,
         caption: "",
         send: async ({ mediaUrl }) => {
           const result = await sendMediaFeishu({
-            cfg,
-            to: sendTarget,
+            ...replyTarget,
             mediaUrl,
-            replyToMessageId: sendReplyToMessageId,
-            replyInThread: effectiveReplyInThread,
-            allowTopLevelReplyFallback,
-            accountId,
             ...(payload.audioAsVoice === true ? { audioAsVoice: true } : {}),
           });
           results.push(
@@ -846,7 +864,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
               kind: result?.voiceIntentDegradedToFile ? "media" : undefined,
             }),
           );
-          markVisibleReplySent();
+          visibleReplySent = true;
           if (result?.voiceIntentDegradedToFile && options?.fallbackText && !sentFallbackText) {
             degradedVoiceFallbackText = options.fallbackText;
           }
@@ -857,7 +875,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
             : async ({ error, mediaUrl }) => {
                 if (isChannelPartialDeliveryError(error)) {
                   // The attachment is already visible; text recovery would duplicate delivery.
-                  markVisibleReplySent();
+                  visibleReplySent = true;
                   throw toFeishuError(error);
                 }
                 const fallbackText = await buildFeishuMediaFallbackText({
@@ -865,17 +883,17 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
                   mediaUrl,
                 });
                 sentFallbackText = true;
-                results.push(await sendFallbackText(fallbackText));
+                results.push(await sendPostReply(fallbackText, "final"));
               },
       });
       if (degradedVoiceFallbackText && !sentFallbackText) {
         sentFallbackText = true;
-        results.push(await sendFallbackText(degradedVoiceFallbackText));
+        results.push(await sendPostReply(degradedVoiceFallbackText, "final"));
       }
     } catch (error: unknown) {
       const partial = isChannelPartialDeliveryError(error) ? error.deliveryResult : undefined;
       if (partial) {
-        markVisibleReplySent();
+        visibleReplySent = true;
       }
       throw createFeishuPartialReplyDeliveryError(
         error,
@@ -890,23 +908,21 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
     if (visibleReplySent) {
       return false;
     }
-    if (skippedFinalReason === "silent") {
+    if (
+      replyOutcome?.kind === "suppressed" ||
+      (replyOutcome?.kind === "skipped" && replyOutcome.reason === "silent")
+    ) {
       params.runtime.log?.(
-        `feishu[${account.accountId}]: no-visible-reply fallback skipped for intentional silence (${reason})`,
+        `feishu[${account.accountId}]: no-visible-reply fallback skipped for ${replyOutcome.reason} (${reason})`,
       );
       return false;
     }
     await sendMessageFeishu({
-      cfg,
-      to: sendTarget,
+      ...replyTarget,
       text: NO_VISIBLE_REPLY_FALLBACK_TEXT,
-      replyToMessageId: sendReplyToMessageId,
-      replyInThread: effectiveReplyInThread,
-      allowTopLevelReplyFallback,
-      accountId,
       ...(requiredMentionTargets?.length ? { mentions: requiredMentionTargets } : {}),
     });
-    markVisibleReplySent();
+    visibleReplySent = true;
     params.runtime.error?.(
       `feishu[${account.accountId}]: sent no-visible-reply fallback (${reason})`,
     );
@@ -963,28 +979,11 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
     if (result?.visibleReplySent === true || !content?.trim()) {
       return result;
     }
-    const cardHeader = resolveCardHeader(agentId, identity);
-    const cardNote = resolveCardNote(agentId, identity, responsePrefixContextProvider());
-    return await sendChunkedTextReply({
+    return sendChunkedTextReply({
       text: content,
-      useCard: true,
+      useCard: withinCardTableLimit(content),
       infoKind,
-      header: cardHeader,
-      note: cardNote,
-      chunkMentions: requiredMentionTargets,
-      sendChunk: async ({ chunk, mentions }) =>
-        await sendStructuredCardFeishu({
-          cfg,
-          to: sendTarget,
-          text: chunk,
-          replyToMessageId: sendReplyToMessageId,
-          replyInThread: effectiveReplyInThread,
-          allowTopLevelReplyFallback,
-          accountId,
-          header: cardHeader,
-          note: cardNote,
-          ...(mentions ? { mentions } : {}),
-        }),
+      preparedPostText: true,
     });
   };
 
@@ -1010,6 +1009,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
           for (const completion of completions) {
             const claimedSettlement = ownsCurrentClose(completion)
               ? {
+                  disposition: closeOutcome.disposition,
                   result: finalized,
                   ...(closeOutcome.error === undefined ? {} : { error: closeOutcome.error }),
                 }
@@ -1018,6 +1018,18 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
                   completion.result.content,
                 );
             const deliveryError = claimedSettlement?.error;
+            if (claimedSettlement?.disposition === "discarded") {
+              const retained = mergeFeishuReplyDeliveryResults(
+                [claimedSettlement.result, completion.result],
+                claimedSettlement.result.content ?? "",
+              );
+              if (deliveryError !== undefined) {
+                completion.reject(createFeishuPartialReplyDeliveryError(deliveryError, retained));
+              } else {
+                completion.resolve(retained);
+              }
+              continue;
+            }
             let providerFinalized = claimedSettlement?.result;
             try {
               providerFinalized = await ensureVisibleStreamingDelivery(
@@ -1112,39 +1124,38 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
     let finalized = noVisibleFeishuReplyDelivery;
     let finalizationError: unknown;
     let fallbackPartial: FeishuReplyDeliveryResult | undefined;
-    const claimedSettlement = claimClosedStreamingResult(
+    let settlement: StreamingCloseOutcome | undefined = claimClosedStreamingResult(
       paramsLocal.ownerGeneration,
       paramsLocal.content,
     );
-    if (claimedSettlement) {
-      finalized = claimedSettlement.result;
-      finalizationError = claimedSettlement.error;
-    } else if (
+    if (
+      !settlement &&
       paramsLocal.ownerGeneration !== undefined &&
       inFlightStreamingClose?.generation === paramsLocal.ownerGeneration
     ) {
       const closeOutcome = await inFlightStreamingClose.promise;
-      const completedSettlement = claimClosedStreamingResult(
-        paramsLocal.ownerGeneration,
-        paramsLocal.content,
-      );
-      finalized = completedSettlement?.result ?? closeOutcome?.result ?? finalized;
-      finalizationError = completedSettlement?.error ?? closeOutcome?.error;
+      settlement =
+        claimClosedStreamingResult(paramsLocal.ownerGeneration, paramsLocal.content) ??
+        closeOutcome;
     } else if (
+      !settlement &&
       paramsLocal.ownerGeneration !== undefined &&
       activeStreamingGeneration === paramsLocal.ownerGeneration
     ) {
-      const closeOutcome = await closeStreaming();
-      finalized = closeOutcome.result;
-      finalizationError = closeOutcome.error;
+      settlement = await closeStreaming();
     }
+    finalized = settlement?.result ?? finalized;
+    finalizationError = settlement?.error;
+    const discarded = settlement?.disposition === "discarded";
     try {
-      finalized =
-        (await ensureVisibleStreamingDelivery(
-          finalized,
-          paramsLocal.content,
-          paramsLocal.infoKind,
-        )) ?? finalized;
+      if (!discarded) {
+        finalized =
+          (await ensureVisibleStreamingDelivery(
+            finalized,
+            paramsLocal.content,
+            paramsLocal.infoKind,
+          )) ?? finalized;
+      }
     } catch (fallbackError: unknown) {
       fallbackPartial = isChannelPartialDeliveryError(fallbackError)
         ? fallbackError.deliveryResult
@@ -1169,11 +1180,13 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
         ...(fallbackPartial ? [fallbackPartial] : []),
         ...(mediaPartial ? [mediaPartial] : []),
       ],
-      fallbackPartial?.visibleReplySent === true
-        ? fallbackPartial.content
-        : finalized.visibleReplySent === true
-          ? finalized.content
-          : paramsLocal.content,
+      discarded
+        ? (finalized.content ?? "")
+        : fallbackPartial?.visibleReplySent === true
+          ? fallbackPartial.content
+          : finalized.visibleReplySent === true
+            ? finalized.content
+            : paramsLocal.content,
     );
     const mediaCause =
       mediaPartial && paramsLocal.error instanceof Error
@@ -1204,13 +1217,30 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
       conversationType: chatId.startsWith("oc_") ? "group" : "direct",
     },
     onSkip: (_payload, info) => {
-      if (info.kind === "final" || (info.kind === "block" && info.reason === "silent")) {
-        skippedFinalReason = info.reason;
-        skippedFinalAssistantMessageIndex = info.assistantMessageIndex;
+      if (
+        replyOutcome?.kind !== "failed" &&
+        (info.kind === "final" || (info.kind === "block" && info.reason === "silent"))
+      ) {
+        replyOutcome = {
+          kind: "skipped",
+          reason: info.reason,
+          assistantMessageIndex: info.assistantMessageIndex,
+        };
       }
     },
     beforeDeliver: (payload, info) => {
-      preparedDeliveryAssistantMessageIndex = info.assistantMessageIndex;
+      // Enqueue-time silence may be newer than this queued block. Reset before either
+      // modifying hook, since cancellation skips native delivery entirely.
+      const preservesNewerSilence =
+        replyOutcome?.kind === "skipped" &&
+        replyOutcome.reason === "silent" &&
+        info.kind !== "final" &&
+        replyOutcome.assistantMessageIndex !== undefined &&
+        info.assistantMessageIndex !== undefined &&
+        info.assistantMessageIndex < replyOutcome.assistantMessageIndex;
+      if (!preservesNewerSilence && replyOutcome?.kind !== "failed") {
+        replyOutcome = undefined;
+      }
       return payload;
     },
     onReplyStart: async () => {
@@ -1221,9 +1251,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
         sentIndependentBlockText = false;
         idleRequestedForReply = false;
         visibleReplySent = false;
-        skippedFinalReason = null;
-        skippedFinalAssistantMessageIndex = undefined;
-        preparedDeliveryAssistantMessageIndex = undefined;
+        replyOutcome = undefined;
       }
       if (previewStreamingEnabled && renderMode === "card") {
         startStreaming();
@@ -1236,10 +1264,15 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
     },
   };
   const handleDeliveryError = async (error: unknown, info: { kind: string }) => {
+    if (info.kind === "final") {
+      // Later suppression cannot erase a failed final; accepted visibility still
+      // prevents recovery from duplicating any native reply.
+      replyOutcome = { kind: "failed" };
+    }
     if (isChannelPartialDeliveryError(error)) {
       // Core invokes this before no-visible recovery; keep accepted sends visible even
       // when their normal success bookkeeping could not run.
-      markVisibleReplySent();
+      visibleReplySent = true;
     }
     params.runtime.error?.(
       `feishu[${account.accountId}] ${info.kind} reply failed: ${String(error)}`,
@@ -1252,28 +1285,47 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
   };
   const delivery: ChannelInboundTurnPlan["delivery"] = {
     observeMessageSent: true,
-    deliver: async (payload: ReplyPayload, info) => {
-      // Core serializes before-delivery hooks and delivery, even when a later hook replaces
-      // the payload, so consume the prepared index before another reply can overwrite it.
-      const deliveryAssistantMessageIndex = preparedDeliveryAssistantMessageIndex;
-      preparedDeliveryAssistantMessageIndex = undefined;
-      // Skips happen at enqueue time. Preserve silence only when both message indices
-      // prove the failed delivery was older; unknown ordering must allow recovery.
-      if (
-        info?.kind === "final" ||
-        skippedFinalReason !== "silent" ||
-        skippedFinalAssistantMessageIndex === undefined ||
-        deliveryAssistantMessageIndex === undefined ||
-        deliveryAssistantMessageIndex >= skippedFinalAssistantMessageIndex
-      ) {
-        skippedFinalReason = null;
-        skippedFinalAssistantMessageIndex = undefined;
+    onDelivered: (_payload, info, result) => {
+      if (result?.visibleReplySent) {
+        visibleReplySent = true;
+        if (info.kind === "final") {
+          replyOutcome = undefined;
+        }
+        return;
       }
+      const reason = result?.suppression?.reason;
+      if (
+        info.kind === "final" &&
+        replyOutcome?.kind !== "failed" &&
+        (reason === "cancelled_by_reply_payload_sending_hook" ||
+          reason === "empty_after_reply_payload_sending_hook" ||
+          reason === "cancelled_by_message_sending_hook" ||
+          reason === "empty_after_message_sending_hook" ||
+          reason === "channel_transform")
+      ) {
+        replyOutcome = { kind: "suppressed", reason };
+      }
+    },
+    deliver: async (inputPayload: ReplyPayload, info) => {
+      // Delivery runs after modifying hooks. Render here so native cards carry the
+      // accepted prose, and a canceled payload never creates a card.
+      const prepared = await renderFeishuReplyPayload(inputPayload, {
+        to: sendTarget,
+        identity,
+        // Cards notify only required bot recipients; incoming user mentions remain context.
+        mentions: requiredMentionTargets,
+      });
+      const rendered = consumeFeishuPresentationFallbackMarker(prepared.payload);
+      const payload = rendered.payload;
+      const presentationCard = prepared.card;
+      const hasPresentationFallback = rendered.presentationFallback?.hasVisibleContent === true;
+      const hasIndependentPresentation = presentationCard !== undefined || hasPresentationFallback;
+      const resolvedText = payload.text;
       const payloadText =
-        payload.isReasoning && payload.text ? formatReasoningMessage(payload.text) : payload.text;
+        payload.isReasoning && resolvedText ? formatReasoningMessage(resolvedText) : resolvedText;
       const reply = resolveSendableOutboundReplyParts({ ...payload, text: payloadText });
       const text =
-        info?.kind === "final"
+        info?.kind === "final" && !hasIndependentPresentation
           ? mergeStreamingFinalText(
               streamText,
               reply.text,
@@ -1295,23 +1347,32 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
         );
       const finalTextExceedsStreamingLimit =
         info?.kind === "final" && hasText && text.length > textChunkLimit;
-      const useStaticCard =
-        hasText &&
-        (renderMode === "card" ||
-          (info?.kind === "block" && coreBlockStreamingEnabled && renderMode !== "raw") ||
-          (renderMode === "auto" && shouldUseCard(text)));
+      // Feishu's table ceiling applies to static card elements, not CardKit's streamed markdown.
+      // Keep the intents separate so an active preview cannot fork into an independent post.
+      const cardRenderingRequested =
+        renderMode === "card" ||
+        (info?.kind === "block" && coreBlockStreamingEnabled && renderMode !== "raw") ||
+        (renderMode === "auto" && shouldUseFeishuCard(text));
+      const useStaticCard = hasText && cardRenderingRequested && withinCardTableLimit(text);
       const useStreamingCard =
         hasText &&
         streamingEnabled &&
         !finalTextExceedsStreamingLimit &&
-        (info?.kind === "final" || useStaticCard);
-      const useCard = useStaticCard || useStreamingCard;
+        (info?.kind === "final" || cardRenderingRequested);
       const skipTextForDuplicateFinal =
-        info?.kind === "final" && hasText && deliveredFinalTexts.has(text);
-      const shouldDeliverText = hasText && !hasVoiceMedia && !skipTextForDuplicateFinal;
+        !hasIndependentPresentation &&
+        info?.kind === "final" &&
+        hasText &&
+        deliveredFinalTexts.has(text);
+      const shouldDeliverText =
+        hasText && (!hasVoiceMedia || hasPresentationFallback) && !skipTextForDuplicateFinal;
+      // Error controls supplement a committed answer. Only a replacement final may
+      // discard it; block/tool controls also leave the earlier reply owned by idle.
       const shouldDiscardStreamingPreview =
         info?.kind === "final" &&
-        (finalTextExceedsStreamingLimit ||
+        !(hasIndependentPresentation && payload.isError === true && hasStreamingFinalText) &&
+        (hasIndependentPresentation ||
+          finalTextExceedsStreamingLimit ||
           (hasMedia &&
             ((hasVoiceMedia && !shouldDeliverText && !ttsTextAlreadyVisible) ||
               skipTextForDuplicateFinal)));
@@ -1320,7 +1381,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
         info?.kind === "final" && hasText && skipTextForDuplicateFinal
           ? claimClosedStreamingResult(undefined, text)
           : undefined;
-      if (!shouldDeliverText && !hasMedia) {
+      if (!shouldDeliverText && !hasMedia && !presentationCard) {
         if (priorClosedStreamingSettlement?.error !== undefined) {
           throw toFeishuError(priorClosedStreamingSettlement.error);
         }
@@ -1330,21 +1391,23 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
       const deliveredResults: FeishuReplyDeliveryResult[] = priorClosedStreamingSettlement
         ? [priorClosedStreamingSettlement.result]
         : [];
-      const collectMediaDelivery = async (
-        mediaPayload: ReplyPayload,
-        mediaOptions?: { fallbackText?: string },
+      const collectDelivery = async (
+        pending: Promise<FeishuReplyDeliveryResult>,
+        acceptedContent?: string,
       ): Promise<void> => {
         try {
-          deliveredResults.push(await sendMediaReplies(mediaPayload, mediaOptions));
+          deliveredResults.push(await pending);
         } catch (error: unknown) {
           const partial = isChannelPartialDeliveryError(error) ? error.deliveryResult : undefined;
           const accumulated = mergeFeishuReplyDeliveryResults([
             ...deliveredResults,
-            ...(partial ? [partial] : []),
+            ...(partial ? [{ ...partial, content: partial.content ?? acceptedContent }] : []),
           ]);
           throw createFeishuPartialReplyDeliveryError(
             partial && error instanceof Error ? (error.cause ?? error) : error,
-            accumulated,
+            // Media-only acceptance has no caption; omission would make core report
+            // the rejected card's original prose as delivered.
+            { ...accumulated, content: accumulated.content ?? "" },
           );
         }
       };
@@ -1353,51 +1416,49 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
         await discardStreamingPreview();
       }
 
-      if (shouldDeliverText) {
-        if (info?.kind === "block") {
-          // Drop internal block chunks unless we can safely consume them as
-          // streaming-card fallback content or send them as independent
-          // messages for true progressive delivery.
-          if (!useStreamingCard) {
-            if (coreBlockStreamingEnabled) {
-              // Reuse normal text chunking, but notify mentions only on the first visible chunk.
-              const isFirstBlock = !sentIndependentBlockText;
-              const firstChunkMentions =
-                isFirstBlock && mentionTargets?.length ? mentionTargets : undefined;
-              deliveredResults.push(
-                await sendChunkedTextReply({
-                  text,
-                  useCard: false,
-                  infoKind: "block",
-                  firstChunkMentions,
-                  chunkMentions: requiredMentionTargets,
-                  sendChunk: async ({ chunk, mentions }) =>
-                    await sendMessageFeishu({
-                      cfg,
-                      to: sendTarget,
-                      text: chunk,
-                      replyToMessageId: sendReplyToMessageId,
-                      replyInThread: effectiveReplyInThread,
-                      allowTopLevelReplyFallback,
-                      accountId,
-                      ...(mentions ? { mentions } : {}),
-                    }),
-                }),
-              );
-              sentIndependentBlockText = true;
-              if (hasMedia) {
-                await collectMediaDelivery(payload);
-              }
-            }
-            return mergeFeishuReplyDeliveryResults(deliveredResults, text);
-          }
-          startStreaming();
-          if (streamingStartPromise) {
-            await streamingStartPromise;
-          }
+      if (presentationCard) {
+        // A logical card owns its controls and attachments even when its prose repeats.
+        if (hasMedia) {
+          await collectDelivery(sendMediaReplies(payload));
         }
+        await collectDelivery(
+          sendCardFeishu({
+            ...replyTarget,
+            card: presentationCard,
+          }).then((result) =>
+            createFeishuReplyDeliveryResult({
+              results: [result],
+              visibleReplySent: true,
+              content: resolvedText,
+              kind: "card",
+            }),
+          ),
+          resolvedText,
+        );
+        visibleReplySent = true;
+        return mergeFeishuReplyDeliveryResults(deliveredResults, resolvedText);
+      }
 
-        if (info?.kind === "final" && useStreamingCard) {
+      if (shouldDeliverText) {
+        // Later finals replace stream text. Each presentation fallback owns a
+        // separate message; ordinary blocks retain their streaming policy.
+        if (hasPresentationFallback || (info?.kind === "block" && !useStreamingCard)) {
+          if (hasPresentationFallback || coreBlockStreamingEnabled) {
+            const firstChunkMentions =
+              info?.kind === "final" || (info?.kind === "block" && !sentIndependentBlockText)
+                ? mentionTargets
+                : undefined;
+            await collectDelivery(sendPostReply(text, info?.kind, firstChunkMentions));
+            if (info?.kind === "block") {
+              sentIndependentBlockText = true;
+            }
+            if (hasMedia) {
+              await collectDelivery(sendMediaReplies(payload));
+            }
+          }
+          return mergeFeishuReplyDeliveryResults(deliveredResults, text);
+        }
+        if (info?.kind === "block" || (info?.kind === "final" && useStreamingCard)) {
           startStreaming();
           if (streamingStartPromise) {
             await streamingStartPromise;
@@ -1406,7 +1467,9 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
 
         const shouldStreamText = info?.kind === "block" || info?.kind === "final";
         const matchingInFlightClose =
-          info?.kind === "final" && inFlightStreamingClose?.content === text
+          info?.kind === "final" &&
+          inFlightStreamingClose?.disposition === "closed" &&
+          inFlightStreamingClose.content === text
             ? inFlightStreamingClose
             : undefined;
         const ownerGeneration = activeStreamingGeneration ?? matchingInFlightClose?.generation;
@@ -1434,7 +1497,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
           // Send media even when streaming handled the text
           if (hasMedia) {
             try {
-              await collectMediaDelivery(payload);
+              await collectDelivery(sendMediaReplies(payload));
             } catch (error: unknown) {
               await throwStreamingDeliveryFailure({
                 error,
@@ -1451,62 +1514,32 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
           );
         }
 
-        if (useCard) {
-          const cardHeader = resolveCardHeader(agentId, identity);
-          const cardNote = resolveCardNote(agentId, identity, responsePrefixContextProvider());
+        // Streaming eligibility can still fall back to a static card, so the provider ceiling
+        // also applies when startup is unavailable or another generation is closing.
+        const useFallbackCard =
+          useStaticCard ||
+          (useStreamingCard &&
+            !isStreamingStartBackedOff(account.accountId) &&
+            withinCardTableLimit(text));
+        if (useFallbackCard) {
           deliveredResults.push(
-            await sendChunkedTextReply({
-              text,
-              useCard: true,
-              infoKind: info?.kind,
-              header: cardHeader,
-              note: cardNote,
-              chunkMentions: requiredMentionTargets,
-              sendChunk: async ({ chunk, mentions }) =>
-                await sendStructuredCardFeishu({
-                  cfg,
-                  to: sendTarget,
-                  text: chunk,
-                  replyToMessageId: sendReplyToMessageId,
-                  replyInThread: effectiveReplyInThread,
-                  allowTopLevelReplyFallback,
-                  accountId,
-                  header: cardHeader,
-                  note: cardNote,
-                  ...(mentions ? { mentions } : {}),
-                }),
-            }),
+            await sendChunkedTextReply({ text, useCard: true, infoKind: info?.kind }),
           );
         } else {
           const firstChunkMentions =
             info?.kind === "final" && mentionTargets?.length ? mentionTargets : undefined;
-          deliveredResults.push(
-            await sendChunkedTextReply({
-              text,
-              useCard: false,
-              infoKind: info?.kind,
-              firstChunkMentions,
-              chunkMentions: requiredMentionTargets,
-              sendChunk: async ({ chunk, mentions }) =>
-                await sendMessageFeishu({
-                  cfg,
-                  to: sendTarget,
-                  text: chunk,
-                  replyToMessageId: sendReplyToMessageId,
-                  replyInThread: effectiveReplyInThread,
-                  allowTopLevelReplyFallback,
-                  accountId,
-                  ...(mentions ? { mentions } : {}),
-                }),
-            }),
-          );
+          deliveredResults.push(await sendPostReply(text, info?.kind, firstChunkMentions));
         }
       }
 
       if (hasMedia) {
-        await collectMediaDelivery(
-          payload,
-          !ttsTextAlreadyVisible && hasVoiceMedia && hasText ? { fallbackText: text } : undefined,
+        await collectDelivery(
+          sendMediaReplies(
+            payload,
+            !shouldDeliverText && !ttsTextAlreadyVisible && hasVoiceMedia && hasText
+              ? { fallbackText: text }
+              : undefined,
+          ),
         );
       }
       const deliveredContent = hasVoiceMedia ? (deliveredResults.at(-1)?.content ?? text) : text;
@@ -1564,28 +1597,21 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
           }
         : undefined,
       onReasoningEnd: reasoningPreviewEnabled ? () => false : undefined,
-      onToolStart: previewStreamingEnabled
-        ? (payload: {
-            name?: string;
-            phase?: string;
-            args?: Record<string, unknown>;
-            detailMode?: "explain" | "raw";
-          }) => {
-            if (!isChannelProgressDraftWorkToolName(payload.name)) {
+      onItemEvent: previewStreamingEnabled
+        ? (payload: Parameters<NonNullable<GetReplyOptions["onItemEvent"]>>[0]) => {
+            if (
+              payload.kind === "preamble" ||
+              payload.hideFromChannelProgress ||
+              payload.suppressChannelProgress
+            ) {
               return false;
             }
-            const statusLineLocal = formatChannelProgressDraftLineForEntry(
-              account.config,
-              {
-                event: "tool",
-                name: payload.name,
-                phase: payload.phase,
-                args: payload.args,
-              },
-              {
-                detailMode: payload.detailMode,
-              },
-            );
+            const { kind: itemKind, ...item } = payload;
+            const statusLineLocal = formatChannelProgressDraftLineForEntry(account.config, {
+              event: "item",
+              itemKind,
+              ...item,
+            });
             if (statusLineLocal) {
               return updateStreamingStatusLine(statusLineLocal);
             }
@@ -1603,7 +1629,10 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
     ensureNoVisibleReplyFallback,
     getVisibleReplyState: () => ({
       visibleReplySent,
-      skippedFinalReason,
+      skippedFinalReason:
+        replyOutcome?.kind === "skipped" || replyOutcome?.kind === "suppressed"
+          ? replyOutcome.reason
+          : null,
     }),
   };
 }

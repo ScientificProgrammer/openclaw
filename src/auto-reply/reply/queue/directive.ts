@@ -3,7 +3,11 @@ import { parseStrictPositiveInteger } from "@openclaw/normalization-core/number-
 import { normalizeOptionalLowercaseString } from "@openclaw/normalization-core/string-coerce";
 import type { QueueMode } from "../../../../packages/gateway-protocol/src/schema/logs-chat.js";
 import { parseDurationMs } from "../../../cli/parse-duration.js";
-import { skipDirectiveArgPrefix, takeDirectiveToken } from "../directive-parsing.js";
+import {
+  removeDirectiveSpan,
+  skipDirectiveArgPrefix,
+  takeDirectiveToken,
+} from "../directive-parsing.js";
 import { normalizeQueueDropPolicy, normalizeQueueMode } from "./normalize.js";
 import type { QueueDropPolicy } from "./types.js";
 
@@ -23,13 +27,6 @@ function parseQueueDebounce(raw?: string): number | undefined {
   }
 }
 
-function parseQueueCap(raw?: string): number | undefined {
-  if (!raw) {
-    return undefined;
-  }
-  return parseStrictPositiveInteger(raw);
-}
-
 function parseQueueDirectiveArgs(raw: string): {
   consumed: number;
   queueMode?: QueueMode;
@@ -43,8 +40,8 @@ function parseQueueDirectiveArgs(raw: string): {
   rawDrop?: string;
   hasOptions: boolean;
 } {
-  const len = raw.length;
   let i = skipDirectiveArgPrefix(raw);
+  const argsStart = i;
   let consumed = i;
   let queueMode: QueueMode | undefined;
   let queueReset = false;
@@ -56,16 +53,9 @@ function parseQueueDirectiveArgs(raw: string): {
   let rawCap: string | undefined;
   let rawDrop: string | undefined;
   let hasOptions = false;
-  const takeToken = (): string | null => {
-    const res = takeDirectiveToken(raw, i);
-    i = res.nextIndex;
-    return res.token;
-  };
-  for (;;) {
-    if (i >= len) {
-      break;
-    }
-    const token = takeToken();
+  while (i < raw.length) {
+    const { token, nextIndex } = takeDirectiveToken(raw, i);
+    i = nextIndex;
     if (!token) {
       break;
     }
@@ -87,7 +77,7 @@ function parseQueueDirectiveArgs(raw: string): {
     }
     if (lowered.startsWith("cap:") || lowered.startsWith("cap=")) {
       rawCap = token.split(/[:=]/)[1] ?? "";
-      cap = parseQueueCap(rawCap);
+      cap = parseStrictPositiveInteger(rawCap);
       hasOptions = true;
       consumed = i;
       continue;
@@ -106,7 +96,7 @@ function parseQueueDirectiveArgs(raw: string): {
       consumed = i;
       continue;
     }
-    if (consumed === skipDirectiveArgPrefix(raw) && !queueReset && !hasOptions) {
+    if (consumed === argsStart && !queueReset && !hasOptions) {
       rawMode = token;
       consumed = i;
     }
@@ -129,57 +119,33 @@ function parseQueueDirectiveArgs(raw: string): {
 }
 
 /** Extracts and removes a `/queue` directive from message text. */
-export function extractQueueDirective(body?: string): {
+export function extractQueueDirective(rawBody?: string): Omit<
+  ReturnType<typeof parseQueueDirectiveArgs>,
+  "consumed"
+> & {
   cleaned: string;
-  queueMode?: QueueMode;
-  queueReset: boolean;
-  rawMode?: string;
   hasDirective: boolean;
-  debounceMs?: number;
-  cap?: number;
-  dropPolicy?: QueueDropPolicy;
-  rawDebounce?: string;
-  rawCap?: string;
-  rawDrop?: string;
-  hasOptions: boolean;
 } {
-  if (!body) {
-    return {
-      cleaned: "",
-      hasDirective: false,
-      queueReset: false,
-      hasOptions: false,
-    };
-  }
-  const re = /(?:^|\s)\/queue(?=$|\s|:)/i;
+  const body = rawBody ?? "";
+  const re = /(?<!\S)\/queue(?=$|\s|:)/i;
   const match = re.exec(body);
   if (!match) {
     return {
-      cleaned: body.trim(),
+      cleaned: body,
       hasDirective: false,
       queueReset: false,
       hasOptions: false,
     };
   }
-  const start = match.index + match[0].indexOf("/queue");
+  const start = match.index;
   const argsStart = start + "/queue".length;
   const args = body.slice(argsStart);
-  const parsed = parseQueueDirectiveArgs(args);
+  const { consumed, ...parsed } = parseQueueDirectiveArgs(args);
   // Remove only the directive and consumed options; leave the rest as agent input.
-  const cleanedRaw = `${body.slice(0, start)} ${body.slice(argsStart + parsed.consumed)}`;
-  const cleaned = cleanedRaw.replace(/\s+/g, " ").trim();
+  const cleaned = removeDirectiveSpan(body, start, argsStart + consumed);
   return {
     cleaned,
-    queueMode: parsed.queueMode,
-    queueReset: parsed.queueReset,
-    rawMode: parsed.rawMode,
-    debounceMs: parsed.debounceMs,
-    cap: parsed.cap,
-    dropPolicy: parsed.dropPolicy,
-    rawDebounce: parsed.rawDebounce,
-    rawCap: parsed.rawCap,
-    rawDrop: parsed.rawDrop,
+    ...parsed,
     hasDirective: true,
-    hasOptions: parsed.hasOptions,
   };
 }

@@ -7,7 +7,7 @@ import { normalizeOptionalLowercaseString } from "@openclaw/normalization-core/s
 import { normalizeChatType, type ChatType } from "../../channels/chat-type.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { normalizeAccountId } from "../../routing/account-id.js";
-import { resolveNormalizedAccountEntry } from "../../routing/account-lookup.js";
+import { resolveChannelAccountEntry } from "../../routing/account-lookup.js";
 import { resolveLinkedDirectPeerId } from "../../routing/session-key.js";
 import type { AgentMessage } from "../runtime/index.js";
 
@@ -57,14 +57,9 @@ export function limitHistoryTurns(
     conversationStart++;
   }
 
-  const tail = messages.slice(conversationStart);
-  if (tail.length === 0) {
-    return messages;
-  }
-
   let userCount = 0;
-  for (const message of tail) {
-    if (message.role === "user") {
+  for (let i = conversationStart; i < messages.length; i++) {
+    if (messages[i]?.role === "user") {
       userCount++;
     }
   }
@@ -80,13 +75,13 @@ export function limitHistoryTurns(
   const userTurnsToKeep = targetUserTurns + ((userCount - targetUserTurns) % evictionBatchSize);
 
   userCount = 0;
-  let lastUserIndex = tail.length;
+  let lastUserIndex = messages.length;
 
-  for (const [i, message] of Array.from(tail.entries()).toReversed()) {
-    if (message.role === "user") {
+  for (let i = messages.length - 1; i >= conversationStart; i--) {
+    if (messages[i]?.role === "user") {
       userCount++;
       if (userCount > userTurnsToKeep) {
-        return [...messages.slice(0, conversationStart), ...tail.slice(lastUserIndex)];
+        return [...messages.slice(0, conversationStart), ...messages.slice(lastUserIndex)];
       }
       lastUserIndex = i;
     }
@@ -194,9 +189,10 @@ export function getHistoryLimitFromSessionKey(
   // match the routed `work-team`).
   const trimmedAccountId = routedAccountId?.trim();
   const accountConfig = trimmedAccountId
-    ? resolveNormalizedAccountEntry(
+    ? resolveChannelAccountEntry(
         providerConfig.accounts,
         normalizeAccountId(trimmedAccountId),
+        provider,
         normalizeAccountId,
       )
     : undefined;

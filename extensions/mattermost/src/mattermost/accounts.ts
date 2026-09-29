@@ -1,4 +1,3 @@
-// Mattermost plugin module implements accounts behavior.
 import {
   createAccountListHelpers,
   hasConfiguredAccountValue,
@@ -13,8 +12,11 @@ import {
   type TextChunkMode,
 } from "openclaw/plugin-sdk/channel-outbound";
 import type { BlockStreamingCoalesceConfig } from "openclaw/plugin-sdk/config-contracts";
+import {
+  resolveSecretInputString,
+  type SecretInputStringResolutionMode,
+} from "openclaw/plugin-sdk/secret-input";
 import { normalizeOptionalString } from "openclaw/plugin-sdk/string-coerce-runtime";
-import { resolveSecretInputString, type SecretInputStringResolutionMode } from "../secret-input.js";
 import type {
   MattermostAccountConfig,
   MattermostChatMode,
@@ -146,8 +148,20 @@ export function resolveMattermostAccount(params: {
 export function inspectMattermostAccount(params: {
   cfg: OpenClawConfig;
   accountId?: string | null;
-}): ResolvedMattermostAccount {
-  return resolveMattermostAccountWithMode({ ...params, mode: "inspect" });
+}) {
+  const account = resolveMattermostAccountWithMode({ ...params, mode: "inspect" });
+  return {
+    ...account,
+    configured: isMattermostConfigured(account),
+    dmPolicy: account.config.dmPolicy ?? "pairing",
+  };
+}
+
+export function isMattermostConfigured(account: ResolvedMattermostAccount): boolean {
+  const tokenConfigured = account.botTokenStatus
+    ? account.botTokenStatus !== "missing"
+    : Boolean(account.botToken);
+  return tokenConfigured && Boolean(account.baseUrl);
 }
 
 /**

@@ -61,7 +61,10 @@ function firstCommandContext(handler: ReturnType<typeof registerTestCommand>) {
 
 function buildPluginParams(
   commandBodyNormalized: string,
-  cfg: OpenClawConfig,
+  cfg: OpenClawConfig = {
+    commands: { text: true },
+    channels: { whatsapp: { allowFrom: ["*"] } },
+  },
 ): HandleCommandsParams {
   return {
     cfg,
@@ -82,6 +85,7 @@ function buildPluginParams(
       to: "test-bot",
     },
     sessionKey: "agent:main:whatsapp:direct:test-user",
+    agentId: "main",
     sessionEntry: {
       sessionId: "session-plugin-command",
       updatedAt: Date.now(),
@@ -252,13 +256,7 @@ describe("handlePluginCommand", () => {
   it("dispatches registered plugin commands with gateway scopes and session metadata", async () => {
     const handler = registerTestCommand();
 
-    const result = await handlePluginCommand(
-      buildPluginParams("/card", {
-        commands: { text: true },
-        channels: { whatsapp: { allowFrom: ["*"] } },
-      } as OpenClawConfig),
-      true,
-    );
+    const result = await handlePluginCommand(buildPluginParams("/card"), true);
 
     expect(result?.shouldContinue).toBe(false);
     expect(result?.reply?.text).toBe("from plugin");
@@ -546,11 +544,8 @@ describe("handlePluginCommand", () => {
   it("prefers the target session entry from sessionStore for plugin command metadata", async () => {
     const handler = registerTestCommand();
 
-    const params = buildPluginParams("/card", {
-      commands: { text: true },
-      channels: { whatsapp: { allowFrom: ["*"] } },
-    } as OpenClawConfig);
-    params.agentId = "requester";
+    const params = buildPluginParams("/card");
+    params.agentId = "target";
     params.sessionKey = "agent:target:whatsapp:direct:test-user";
     params.sessionEntry = {
       sessionId: "wrapper-session",
@@ -636,13 +631,7 @@ describe("handlePluginCommand", () => {
       continueAgent: true,
     });
 
-    const result = await handlePluginCommand(
-      buildPluginParams("/card", {
-        commands: { text: true },
-        channels: { whatsapp: { allowFrom: ["*"] } },
-      } as OpenClawConfig),
-      true,
-    );
+    const result = await handlePluginCommand(buildPluginParams("/card"), true);
 
     expect(result).toEqual({
       shouldContinue: true,
@@ -664,13 +653,7 @@ describe("handlePluginCommand", () => {
       }),
     ).toEqual({ ok: true });
 
-    const denied = await handlePluginCommand(
-      buildPluginParams("/approve-deploy", {
-        commands: { text: true },
-        channels: { whatsapp: { allowFrom: ["*"] } },
-      } as OpenClawConfig),
-      true,
-    );
+    const denied = await handlePluginCommand(buildPluginParams("/approve-deploy"), true);
 
     expect(denied).toEqual({
       shouldContinue: false,
@@ -678,10 +661,7 @@ describe("handlePluginCommand", () => {
     });
     expect(handler).not.toHaveBeenCalled();
 
-    const allowedParams = buildPluginParams("/approve-deploy", {
-      commands: { text: true },
-      channels: { whatsapp: { allowFrom: ["*"] } },
-    } as OpenClawConfig);
+    const allowedParams = buildPluginParams("/approve-deploy");
     allowedParams.ctx.GatewayClientScopes = ["operator.approvals"];
 
     const allowed = await handlePluginCommand(allowedParams, true);

@@ -1,46 +1,33 @@
-// Qa Lab plugin module implements visual task behavior.
 import fs from "node:fs/promises";
 import path from "node:path";
 import { formatErrorMessage } from "openclaw/plugin-sdk/error-runtime";
 import { pathExists, writeExternalFileWithinRoot } from "openclaw/plugin-sdk/security-runtime";
 import { ensureRepoBoundDirectory, resolveRepoRelativeOutputDir } from "../cli-paths.js";
 import { toQaError } from "../errors.js";
-import { isTruthyOptIn, trimToValue } from "../mantis-options.runtime.js";
+import { trimToValue } from "../mantis-options.runtime.js";
 import {
   type CommandRunner,
   type CrabboxInspect,
   defaultCommandRunner,
-  inspectCrabbox,
+  createMantisCrabboxSession,
   resolveCrabboxBin,
+  resolveMantisCrabboxLeaseOptions,
+  type MantisCrabboxLeaseOptions,
   runCommand,
-  stopCrabbox,
-  warmupCrabbox,
 } from "./crabbox-runtime.js";
+import {
+  renderMantisCrabboxReport,
+  type MantisCrabboxReportSummary,
+  type MantisCrabboxRunResult,
+} from "./report.js";
 
-export type MantisVisualTaskVisionMode = "image-describe" | "metadata";
+type MantisVisualTaskVisionMode = "image-describe" | "metadata";
 
-export type MantisVisualTaskOptions = {
-  browserUrl?: string;
-  commandRunner?: CommandRunner;
-  crabboxBin?: string;
-  duration?: string;
-  env?: NodeJS.ProcessEnv;
-  expectText?: string;
-  idleTimeout?: string;
-  keepLease?: boolean;
-  leaseId?: string;
-  machineClass?: string;
-  now?: () => Date;
-  outputDir?: string;
-  provider?: string;
-  repoRoot?: string;
-  settleMs?: number;
-  ttl?: string;
-  visionMode?: MantisVisualTaskVisionMode;
-  visionModel?: string;
-  visionPrompt?: string;
-  visionTimeoutMs?: number;
-};
+export type MantisVisualTaskOptions = MantisVisualDriverOptions &
+  MantisCrabboxLeaseOptions & {
+    duration?: string;
+    now?: () => Date;
+  };
 
 export type MantisVisualDriverOptions = {
   browserUrl?: string;
@@ -57,15 +44,6 @@ export type MantisVisualDriverOptions = {
   visionModel?: string;
   visionPrompt?: string;
   visionTimeoutMs?: number;
-};
-
-type MantisVisualTaskResult = {
-  outputDir: string;
-  reportPath: string;
-  screenshotPath?: string;
-  status: "pass" | "fail";
-  summaryPath: string;
-  videoPath?: string;
 };
 
 type MantisVisualDriverResult = {
@@ -96,52 +74,27 @@ type VisionAssertion = {
   visible?: boolean;
 };
 
-type MantisVisualTaskSummary = {
-  artifacts: {
+type MantisVisualTaskSummary = MantisCrabboxReportSummary & {
+  artifacts: MantisCrabboxReportSummary["artifacts"] & {
     driverResultPath: string;
-    reportPath: string;
-    screenshotPath?: string;
-    summaryPath: string;
-    videoPath?: string;
   };
   browserUrl: string;
-  crabbox: {
-    bin: string;
-    createdLease: boolean;
-    id: string;
-    provider: string;
-    slug?: string;
-    state?: string;
-    vncCommand: string;
-  };
   driver?: MantisVisualDriverResult;
-  error?: string;
-  finishedAt: string;
-  outputDir: string;
   recording: {
     error?: string;
     required: boolean;
   };
-  startedAt: string;
-  status: "pass" | "fail";
   visionMode: MantisVisualTaskVisionMode;
 };
 
 const DEFAULT_BROWSER_URL = "https://example.net";
 const DEFAULT_PROVIDER = "hetzner";
-const DEFAULT_CLASS = "beast";
 const DEFAULT_DURATION = "180s";
-const DEFAULT_IDLE_TIMEOUT = "60m";
-const DEFAULT_TTL = "120m";
 const DEFAULT_SETTLE_MS = 8000;
 const DEFAULT_VISION_TIMEOUT_MS = 120000;
 const CRABBOX_BIN_ENV = "OPENCLAW_MANTIS_CRABBOX_BIN";
 const CRABBOX_PROVIDER_ENV = "OPENCLAW_MANTIS_CRABBOX_PROVIDER";
-const CRABBOX_CLASS_ENV = "OPENCLAW_MANTIS_CRABBOX_CLASS";
 const CRABBOX_LEASE_ID_ENV = "OPENCLAW_MANTIS_CRABBOX_LEASE_ID";
-const CRABBOX_KEEP_ENV = "OPENCLAW_MANTIS_KEEP_VM";
-const CRABBOX_IDLE_TIMEOUT_ENV = "OPENCLAW_MANTIS_CRABBOX_IDLE_TIMEOUT";
-const CRABBOX_TTL_ENV = "OPENCLAW_MANTIS_CRABBOX_TTL";
 
 function defaultOutputDir(repoRoot: string, startedAt: Date) {
   const stamp = startedAt.toISOString().replace(/[:.]/gu, "-");
@@ -341,10 +294,9 @@ function parseVisionAssertion(text: string, expectText: string): VisionAssertion
       reason: "Image describe did not return a structured visual assertion.",
     };
   }
-  const record = parsed;
-  const visible = record.visible;
-  const evidence = typeof record.evidence === "string" ? record.evidence.trim() : undefined;
-  const reason = typeof record.reason === "string" ? record.reason.trim() : undefined;
+  const visible = parsed.visible;
+  const evidence = typeof parsed.evidence === "string" ? parsed.evidence.trim() : undefined;
+  const reason = typeof parsed.reason === "string" ? parsed.reason.trim() : undefined;
   if (typeof visible !== "boolean") {
     return {
       evidence,
@@ -396,53 +348,31 @@ function browserLaunchScript() {
 }
 
 function renderReport(summary: MantisVisualTaskSummary) {
-  const lines = [
-    "# Mantis Visual Task",
-    "",
-    `Status: ${summary.status}`,
-    `Browser URL: ${summary.browserUrl}`,
-    `Vision mode: ${summary.visionMode}`,
-    `Output: ${summary.outputDir}`,
-    `Started: ${summary.startedAt}`,
-    `Finished: ${summary.finishedAt}`,
-    "",
-    "## Crabbox",
-    "",
-    `- Provider: ${summary.crabbox.provider}`,
-    `- Lease: ${summary.crabbox.id}${summary.crabbox.slug ? ` (${summary.crabbox.slug})` : ""}`,
-    `- Created by run: ${summary.crabbox.createdLease}`,
-    `- State: ${summary.crabbox.state ?? "unknown"}`,
-    `- VNC: \`${summary.crabbox.vncCommand}\``,
-    "",
-    "## Artifacts",
-    "",
-    summary.artifacts.screenshotPath
-      ? `- Screenshot: \`${path.basename(summary.artifacts.screenshotPath)}\``
-      : "- Screenshot: missing",
-    summary.artifacts.videoPath
-      ? `- Video: \`${path.basename(summary.artifacts.videoPath)}\``
-      : "- Video: missing",
-    `- Driver result: \`${path.basename(summary.artifacts.driverResultPath)}\``,
-    "",
-    "## Vision",
-    "",
-    summary.driver?.vision.text ? summary.driver.vision.text : "No vision text recorded.",
-    summary.driver?.expectText ? `Expected text: ${summary.driver.expectText}` : undefined,
-    summary.driver?.vision.assertion?.visible !== undefined
-      ? `Visible: ${summary.driver.vision.assertion.visible}`
-      : undefined,
-    summary.driver?.vision.assertion?.evidence
-      ? `Evidence: ${summary.driver.vision.assertion.evidence}`
-      : undefined,
-    summary.driver?.vision.assertion?.reason
-      ? `Reason: ${summary.driver.vision.assertion.reason}`
-      : undefined,
-    summary.driver?.matched !== undefined ? `Matched: ${summary.driver.matched}` : undefined,
-    summary.recording.error ? `Recording error: ${summary.recording.error}` : undefined,
-    summary.error ? `Error: ${summary.error}` : undefined,
-    "",
-  ].filter((line) => line !== undefined);
-  return `${lines.join("\n")}\n`;
+  return renderMantisCrabboxReport({
+    afterArtifacts: [
+      "## Vision",
+      "",
+      summary.driver?.vision.text ? summary.driver.vision.text : "No vision text recorded.",
+      summary.driver?.expectText ? `Expected text: ${summary.driver.expectText}` : undefined,
+      summary.driver?.vision.assertion?.visible !== undefined
+        ? `Visible: ${summary.driver.vision.assertion.visible}`
+        : undefined,
+      summary.driver?.vision.assertion?.evidence
+        ? `Evidence: ${summary.driver.vision.assertion.evidence}`
+        : undefined,
+      summary.driver?.vision.assertion?.reason
+        ? `Reason: ${summary.driver.vision.assertion.reason}`
+        : undefined,
+      summary.driver?.matched !== undefined ? `Matched: ${summary.driver.matched}` : undefined,
+      summary.recording.error ? `Recording error: ${summary.recording.error}` : undefined,
+      summary.error ? `Error: ${summary.error}` : undefined,
+      "",
+    ],
+    artifactRows: [`- Driver result: \`${path.basename(summary.artifacts.driverResultPath)}\``],
+    headerRows: [`Browser URL: ${summary.browserUrl}`, `Vision mode: ${summary.visionMode}`],
+    summary,
+    title: "Mantis Visual Task",
+  });
 }
 
 export async function runMantisVisualDriver(
@@ -483,7 +413,22 @@ export async function runMantisVisualDriver(
   const visionPrompt = buildVisionPrompt(opts.visionPrompt, expectText);
   const visionTimeoutMs = opts.visionTimeoutMs ?? DEFAULT_VISION_TIMEOUT_MS;
   const runner = opts.commandRunner ?? defaultCommandRunner;
-  let result: MantisVisualDriverResult;
+  const result: MantisVisualDriverResult = {
+    browserUrl,
+    expectText,
+    finishedAt: startedAt.toISOString(),
+    matched: false,
+    outputDir,
+    screenshotPath,
+    startedAt: startedAt.toISOString(),
+    status: "fail",
+    vision: {
+      mode: visionMode,
+      model: trimToValue(opts.visionModel),
+      prompt: visionPrompt,
+      timeoutMs: visionTimeoutMs,
+    },
+  };
 
   try {
     await runCommand({
@@ -562,50 +507,21 @@ export async function runMantisVisualDriver(
       visionText = parseImageDescribeText(described.stdout);
     }
     const { assertion, matched } = evaluateVisualExpectation(visionText, expectText);
-    result = {
-      browserUrl,
-      expectText,
-      finishedAt: new Date().toISOString(),
-      matched,
-      outputDir,
-      screenshotPath,
-      startedAt: startedAt.toISOString(),
-      status: matched ? "pass" : "fail",
-      vision: {
-        assertion,
-        mode: visionMode,
-        model: trimToValue(opts.visionModel),
-        prompt: visionPrompt,
-        text: visionText,
-        timeoutMs: visionTimeoutMs,
-      },
-    };
+    result.matched = matched;
+    result.status = matched ? "pass" : "fail";
+    result.vision.assertion = assertion;
+    result.vision.text = visionText;
   } catch (error) {
-    result = {
-      browserUrl,
-      error: formatErrorMessage(error),
-      expectText,
-      finishedAt: new Date().toISOString(),
-      matched: false,
-      outputDir,
-      screenshotPath,
-      startedAt: startedAt.toISOString(),
-      status: "fail",
-      vision: {
-        mode: visionMode,
-        model: trimToValue(opts.visionModel),
-        prompt: visionPrompt,
-        timeoutMs: visionTimeoutMs,
-      },
-    };
+    result.error = formatErrorMessage(error);
   }
+  result.finishedAt = new Date().toISOString();
   await fs.writeFile(resultPath, `${JSON.stringify(result, null, 2)}\n`, "utf8");
   return result;
 }
 
 export async function runMantisVisualTask(
   opts: MantisVisualTaskOptions = {},
-): Promise<MantisVisualTaskResult> {
+): Promise<MantisCrabboxRunResult> {
   const env = opts.env ?? process.env;
   const startedAt = (opts.now ?? (() => new Date()))();
   const repoRoot = path.resolve(opts.repoRoot ?? process.cwd());
@@ -626,53 +542,34 @@ export async function runMantisVisualTask(
     explicit: opts.crabboxBin,
     repoRoot,
   });
-  const provider =
-    trimToValue(opts.provider) ?? trimToValue(env[CRABBOX_PROVIDER_ENV]) ?? DEFAULT_PROVIDER;
-  const machineClass =
-    trimToValue(opts.machineClass) ?? trimToValue(env[CRABBOX_CLASS_ENV]) ?? DEFAULT_CLASS;
-  const idleTimeout =
-    trimToValue(opts.idleTimeout) ??
-    trimToValue(env[CRABBOX_IDLE_TIMEOUT_ENV]) ??
-    DEFAULT_IDLE_TIMEOUT;
-  const ttl = trimToValue(opts.ttl) ?? trimToValue(env[CRABBOX_TTL_ENV]) ?? DEFAULT_TTL;
-  const explicitLeaseId = trimToValue(opts.leaseId) ?? trimToValue(env[CRABBOX_LEASE_ID_ENV]);
-  const keepLease = opts.keepLease ?? isTruthyOptIn(env[CRABBOX_KEEP_ENV]);
-  const createdLease = explicitLeaseId === undefined;
+  const {
+    provider,
+    machineClass,
+    idleTimeout,
+    ttl,
+    leaseId: explicitLeaseId,
+    keepLease,
+  } = resolveMantisCrabboxLeaseOptions(opts, env);
   const browserUrl = trimToValue(opts.browserUrl) ?? DEFAULT_BROWSER_URL;
   const expectText = trimToValue(opts.expectText);
   const visionMode = normalizeVisionMode(opts.visionMode);
   const visionPrompt = buildVisionPrompt(opts.visionPrompt, expectText);
   const runner = opts.commandRunner ?? defaultCommandRunner;
-  let leaseId = explicitLeaseId;
+  const session = createMantisCrabboxSession({
+    crabboxBin,
+    cwd: repoRoot,
+    env,
+    leaseId: explicitLeaseId,
+    provider,
+    runner,
+  });
   let inspected: CrabboxInspect = {};
   let summary: MantisVisualTaskSummary | undefined;
 
   try {
-    leaseId =
-      leaseId ??
-      (await warmupCrabbox({
-        crabboxBin,
-        cwd: repoRoot,
-        env,
-        idleTimeout,
-        machineClass,
-        provider,
-        runner,
-        ttl,
-      }));
-    inspected = await inspectCrabbox({
-      crabboxBin,
-      cwd: repoRoot,
-      env,
-      leaseId,
-      provider,
-      runner,
-    });
+    const leaseId = await session.acquire({ idleTimeout, machineClass, ttl });
+    inspected = await session.inspect();
     let recordingError: string | undefined;
-    const activeLeaseId = leaseId;
-    if (!activeLeaseId) {
-      throw new Error("Crabbox lease id missing after warmup.");
-    }
     try {
       await runCommandWithExternalOutput({
         command: crabboxBin,
@@ -682,7 +579,7 @@ export async function runMantisVisualTask(
           "--provider",
           provider,
           "--id",
-          activeLeaseId,
+          leaseId,
           "--duration",
           trimToValue(opts.duration) ?? DEFAULT_DURATION,
           "--output",
@@ -694,7 +591,7 @@ export async function runMantisVisualTask(
             browserUrl,
             crabboxBin,
             expectText,
-            leaseId: activeLeaseId,
+            leaseId,
             outputDir,
             provider,
             repoRoot,
@@ -736,15 +633,7 @@ export async function runMantisVisualTask(
         videoPath: copiedVideo,
       },
       browserUrl,
-      crabbox: {
-        bin: crabboxBin,
-        createdLease,
-        id: leaseId,
-        provider,
-        slug: inspected.slug,
-        state: inspected.state,
-        vncCommand: `${crabboxBin} vnc --provider ${provider} --id ${leaseId} --open`,
-      },
+      crabbox: session.describe(inspected),
       driver,
       error: recordingFailure,
       finishedAt: new Date().toISOString(),
@@ -774,17 +663,7 @@ export async function runMantisVisualTask(
         videoPath: (await pathExists(videoPath)) ? videoPath : undefined,
       },
       browserUrl,
-      crabbox: {
-        bin: crabboxBin,
-        createdLease,
-        id: leaseId ?? "unallocated",
-        provider,
-        slug: inspected.slug,
-        state: inspected.state,
-        vncCommand: leaseId
-          ? `${crabboxBin} vnc --provider ${provider} --id ${leaseId} --open`
-          : "unallocated",
-      },
+      crabbox: session.describe(inspected),
       error: formatErrorMessage(error),
       finishedAt: new Date().toISOString(),
       outputDir,
@@ -810,9 +689,8 @@ export async function runMantisVisualTask(
       await fs.writeFile(summaryPath, `${JSON.stringify(summary, null, 2)}\n`, "utf8");
       await fs.writeFile(reportPath, renderReport(summary), "utf8");
     }
-    if (summary?.status === "pass" && createdLease && leaseId && !keepLease) {
-      await stopCrabbox({ crabboxBin, cwd: repoRoot, env, leaseId, provider, runner });
+    if (summary?.status === "pass" && session.createdLease && session.leaseId && !keepLease) {
+      await session.stop();
     }
   }
 }
-/* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

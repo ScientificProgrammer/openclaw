@@ -1,4 +1,3 @@
-// Control UI module implements activity model behavior.
 import { asNullableObjectRecord as readRecord } from "@openclaw/normalization-core/record-coerce";
 import { normalizeNullableString as toTrimmedString } from "@openclaw/normalization-core/string-coerce";
 import { redactToolPayloadText } from "../../lib/browser-redact.ts";
@@ -119,7 +118,9 @@ function buildOutputPreview(value: unknown): { text?: string; truncated: boolean
   }
   const redacted = redactToolPayloadText(raw);
   const truncated = truncateText(redacted, ACTIVITY_OUTPUT_PREVIEW_LIMIT);
-  return { text: truncated.text, truncated: truncated.truncated };
+  // A sliced preview can retain the whole output after the raw event is evicted.
+  // Copy its characters here so the bounded Activity entry owns only its preview.
+  return { text: Array.from(truncated.text).join(""), truncated: truncated.truncated };
 }
 
 function countArgumentFields(value: unknown): number {
@@ -160,13 +161,9 @@ function resolveStatus(data: Record<string, unknown>): ActivityStatus {
   return "done";
 }
 
-function statusLabel(status: ActivityStatus): string {
-  return ACTIVITY_STATUS_SUMMARY_LABELS[status];
-}
-
 function buildSummary(toolName: string, status: ActivityStatus, hiddenArgCount: number): string {
   const argText = `${hiddenArgCount} argument${hiddenArgCount === 1 ? "" : "s"} hidden`;
-  return `${toolName} ${statusLabel(status)}; ${argText}`;
+  return `${toolName} ${ACTIVITY_STATUS_SUMMARY_LABELS[status]}; ${argText}`;
 }
 
 export function updateToolActivity(
@@ -212,7 +209,7 @@ export function updateToolActivity(
   const next = existing
     ? entries.map((entry) => (entry.id === id ? nextEntry : entry))
     : [...entries, nextEntry];
-  return next.slice(-ACTIVITY_ENTRY_LIMIT);
+  return next.length > ACTIVITY_ENTRY_LIMIT ? next.slice(-ACTIVITY_ENTRY_LIMIT) : next;
 }
 
 function readAnswerCandidateStatus(value: unknown): "candidate" | "superseded" | "selected" | null {
@@ -254,5 +251,5 @@ function updateAnswerCandidateActivity(
   const next = existing
     ? entries.map((entry) => (entry.id === id ? nextEntry : entry))
     : [...entries, nextEntry];
-  return next.slice(-ACTIVITY_ENTRY_LIMIT);
+  return next.length > ACTIVITY_ENTRY_LIMIT ? next.slice(-ACTIVITY_ENTRY_LIMIT) : next;
 }

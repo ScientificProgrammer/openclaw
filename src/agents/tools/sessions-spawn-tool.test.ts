@@ -1,74 +1,31 @@
+import "./sessions-spawn-tool.mocks.test-support.js";
 import path from "node:path";
 // sessions_spawn tool tests cover model-visible schema gating, ACP/subagent
 // dispatch, and result details for spawned child sessions.
 import { createRequireRecord } from "openclaw/plugin-sdk/test-fixtures";
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import {
-  configureExecutionDecisionWorkSink,
-  type ExecutionDecisionWork,
-} from "../../audit/execution-decision-work.js";
+import { configureExecutionDecisionWorkSink } from "../../audit/execution-decision-work.js";
+import type { ExecutionDecisionWork } from "../../audit/execution-decision-work.types.js";
 import { createExecutionIdentityAdmissionToken } from "../../audit/execution-identity-admission.js";
 import { upsertSessionEntryCore } from "../../config/sessions/session-accessor.js";
 import { GatewayClientRequestError } from "../../gateway/client.js";
 import { withTestDir } from "../../test-helpers/temp-dir.js";
 import { createOperationalRunInstanceRef } from "../admitted-run-context.js";
+import { finalizeAgentToolAvailability } from "../agent-tool-availability.js";
 import { readParentExecutionIdentity } from "../subagents/spawn/execution-identity-spawn-context.js";
+import {
+  expectRegisteredSubagentRun,
+  supportedSpawnModelChoice,
+} from "../subagents/spawn/subagent-spawn.test-helpers.js";
 import {
   SWARM_CODE_MODE_IDEMPOTENCY_KEY,
   SWARM_CODE_MODE_REQUEST_FINGERPRINT,
 } from "../subagents/swarm/swarm-code-mode.js";
+import { createAgentsWaitTool } from "./agents-wait-tool.js";
 import { withGatewayToolCallerIdentity } from "./gateway-caller-context.js";
+import { registerSessionsSpawnCompletionTests } from "./sessions-spawn-tool.completion.test-support.js";
 
-const hoisted = vi.hoisted(() => {
-  const spawnSubagentDirectMock = vi.fn();
-  const spawnAcpDirectMock = vi.fn();
-  const registerSubagentRunMock = vi.fn();
-  const inProcessCreationMock = vi.fn();
-  const getSubagentDeliveryBacklogPressureMock = vi.fn(() => ({
-    suspended: 0,
-    blocked: false,
-  }));
-  const runSubagentProgressMock = vi.fn(async () => {});
-  return {
-    spawnSubagentDirectMock,
-    spawnAcpDirectMock,
-    registerSubagentRunMock,
-    inProcessCreationMock,
-    getSubagentDeliveryBacklogPressureMock,
-    runSubagentProgressMock,
-  };
-});
-
-vi.mock("../subagents/spawn/subagent-spawn.js", () => ({
-  SUBAGENT_SPAWN_CONTEXT_MODES: ["isolated", "fork"],
-  SUBAGENT_SPAWN_MODES: ["run", "session"],
-  spawnSubagentDirect: (...args: unknown[]) => hoisted.spawnSubagentDirectMock(...args),
-}));
-
-vi.mock("../subagents/spawn/acp-spawn.js", () => ({
-  spawnAcpDirect: (...args: unknown[]) => hoisted.spawnAcpDirectMock(...args),
-}));
-
-vi.mock("../subagents/registry/subagent-registry.js", () => ({
-  registerSubagentRun: (...args: unknown[]) => hoisted.registerSubagentRunMock(...args),
-  getSubagentDeliveryBacklogPressure: () => hoisted.getSubagentDeliveryBacklogPressureMock(),
-}));
-
-vi.mock("./in-process-gateway.js", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("./in-process-gateway.js")>();
-  return {
-    ...actual,
-    callInProcessGatewayToolWithCreation: (...args: unknown[]) =>
-      hoisted.inProcessCreationMock(...args),
-  };
-});
-
-vi.mock("../../plugins/hook-runner-global.js", () => ({
-  getGlobalHookRunner: () => ({
-    hasHooks: (hookName: string) => hookName === "subagent_progress",
-    runSubagentProgress: hoisted.runSubagentProgressMock,
-  }),
-}));
+const { hoisted } = await import("./sessions-spawn-tool.mocks.test-support.js");
 
 let createSessionsSpawnTool: typeof import("./sessions-spawn-tool.js").createSessionsSpawnTool;
 let acpRuntimeRegistry: typeof import("../../acp/runtime/registry.js");
@@ -109,6 +66,7 @@ describe("sessions_spawn tool", () => {
   });
 
   beforeEach(() => {
+    hoisted.prepareModelChoiceMock.mockReset().mockImplementation(supportedSpawnModelChoice);
     acpRuntimeRegistry.testing.resetAcpRuntimeBackendsForTests();
     hoisted.spawnSubagentDirectMock.mockReset().mockResolvedValue({
       status: "accepted",
@@ -123,9 +81,6 @@ describe("sessions_spawn tool", () => {
     });
     hoisted.registerSubagentRunMock.mockReset();
     hoisted.inProcessCreationMock.mockReset();
-    hoisted.getSubagentDeliveryBacklogPressureMock
-      .mockReset()
-      .mockReturnValue({ suspended: 0, blocked: false });
     hoisted.runSubagentProgressMock.mockClear();
   });
 
@@ -179,6 +134,58 @@ describe("sessions_spawn tool", () => {
     return requireRecord(call[argIndex], `${label} call ${callIndex + 1} arg ${argIndex + 1}`);
   }
 
+  registerSessionsSpawnCompletionTests({
+    createTool: (options) => createSessionsSpawnTool(options),
+    registerAcpBackendForTest,
+    mocks: hoisted,
+    mockCallArg,
+  });
+
+  it("advertises the private completion contract and passes it to native spawn", async () => {
+    const tool = createSessionsSpawnTool();
+    const schema = tool.parameters as {
+      required?: string[];
+      properties: Record<string, { description?: string; enum?: string[] }>;
+    };
+    const target = requireSchemaProperty(schema.properties, "completionTarget");
+    expect(target.enum).toEqual(["parent"]);
+    expect(schema.required ?? []).not.toContain("completionTarget");
+    expect(target).not.toHaveProperty("default");
+    for (const restriction of [
+      "ACP",
+      "collect",
+      "visible",
+      "thread",
+      "session mode",
+      "expectsCompletionMessage=false",
+    ]) {
+      expect(target.description).toContain(restriction);
+    }
+    await tool.execute("private-spawn", { task: "review privately", completionTarget: "parent" });
+    expect(hoisted.spawnSubagentDirectMock).toHaveBeenCalledWith(
+      expect.objectContaining({ completionTarget: "parent" }),
+      expect.anything(),
+    );
+  });
+
+  it.each([{ runtime: "acp" }, { visible: true }, { completionTarget: "channel" }])(
+    "rejects unsupported private tool routes before dispatch: %j",
+    async (options) => {
+      registerAcpBackendForTest();
+      const tool = createSessionsSpawnTool();
+      await expect(
+        tool.execute("private-spawn", {
+          task: "review privately",
+          completionTarget: "parent",
+          ...options,
+        }),
+      ).rejects.toThrow(/completionTarget/);
+      expect(hoisted.spawnSubagentDirectMock).not.toHaveBeenCalled();
+      expect(hoisted.spawnAcpDirectMock).not.toHaveBeenCalled();
+      expect(hoisted.inProcessCreationMock).not.toHaveBeenCalled();
+    },
+  );
+
   it("hides ACP runtime affordances when no ACP backend is loaded", () => {
     // The tool schema is generated from live runtime availability; stale ACP
     // fields should not be advertised when no backend can handle them.
@@ -225,14 +232,16 @@ describe("sessions_spawn tool", () => {
       "Spawn hidden subagent (ephemeral) or visible work session (durable).",
     );
     expect(tool.description).toContain('runtime="acp"');
-    expect(tool.description).toContain('unless ACP `streamTo="parent"`');
+    expect(tool.description).toContain("follow the receipt's completion mode");
     expect(schema.properties?.runtime?.enum).toEqual(["subagent", "acp"]);
     const resumeSessionId = requireSchemaProperty(schema.properties, "resumeSessionId");
     const streamTo = requireSchemaProperty(schema.properties, "streamTo");
     expect(resumeSessionId.description).toContain("ACP resume id");
     expect(resumeSessionId.description).toContain("ignored by subagent");
     expect(resumeSessionId.description).toContain("already recorded for requester");
+    expect(streamTo.enum).toEqual(["parent"]);
     expect(streamTo.description).toContain("ACP only");
+    expect(streamTo.description).toContain('"parent" streams turn to requester');
     expect(streamTo.description).toContain("Ignored by subagent");
   });
 
@@ -313,30 +322,6 @@ describe("sessions_spawn tool", () => {
     },
   );
 
-  it.each([
-    { label: "native", args: { task: "investigate", runtime: "subagent" } },
-    { label: "ACP", args: { task: "investigate", runtime: "acp" }, acp: true },
-    { label: "visible", args: { task: "investigate", visible: true } },
-  ])("blocks $label starts when retained delivery pressure reaches capacity", async (testCase) => {
-    if (testCase.acp) {
-      registerAcpBackendForTest();
-    }
-    hoisted.getSubagentDeliveryBacklogPressureMock.mockReturnValue({
-      suspended: 50,
-      blocked: true,
-    });
-    const callGateway = vi.fn();
-    const tool = createSessionsSpawnTool({ callGateway });
-
-    const result = await tool.execute(`blocked-${testCase.label}`, testCase.args);
-
-    expectDetailFields(result.details, { status: "forbidden" });
-    expect(JSON.stringify(result.details)).toContain("50 completed tasks have blocked delivery");
-    expect(hoisted.spawnSubagentDirectMock).not.toHaveBeenCalled();
-    expect(hoisted.spawnAcpDirectMock).not.toHaveBeenCalled();
-    expect(callGateway).not.toHaveBeenCalled();
-  });
-
   it("hides ACP runtime affordances when ACP policy is disabled", () => {
     registerAcpBackendForTest();
 
@@ -383,7 +368,10 @@ describe("sessions_spawn tool", () => {
   });
 
   it("hides and rejects swarm parameters while tools.swarm is disabled", async () => {
-    const tool = createSessionsSpawnTool({ agentSessionKey: "agent:main:main" });
+    const tool = createSessionsSpawnTool({
+      agentSessionKey: "agent:main:main",
+      config: { tools: { swarm: false } },
+    });
     const schema = tool.parameters as { properties?: Record<string, unknown> };
 
     expect(schema.properties?.collect).toBeUndefined();
@@ -403,6 +391,7 @@ describe("sessions_spawn tool", () => {
       config: { tools: { swarm: true } },
     });
 
+    finalizeAgentToolAvailability([tool, createAgentsWaitTool({})]);
     await expect(tool.execute("normal-child", { task: "ask for approval" })).rejects.toThrow(
       "requires collect=true",
     );
@@ -422,12 +411,12 @@ describe("sessions_spawn tool", () => {
     });
   });
 
-  it("forwards collector parameters and requesting run identity when enabled", async () => {
+  it("forwards collector parameters and requesting identity when native waiting is available", async () => {
     const tool = createSessionsSpawnTool({
       agentSessionKey: "agent:main:main",
       requesterRunId: "parent-run",
-      config: { tools: { swarm: true } },
     });
+    finalizeAgentToolAvailability([tool, createAgentsWaitTool({})]);
     const schema = tool.parameters as {
       properties?: Record<string, { description?: string } | undefined>;
     };
@@ -448,6 +437,7 @@ describe("sessions_spawn tool", () => {
     });
 
     const spawnArgs = mockCallArg(hoisted.spawnSubagentDirectMock, 0, 0, "spawnSubagentDirect");
+    expect(spawnArgs.completionTarget).toBeUndefined();
     expect(spawnArgs).toMatchObject({
       collect: true,
       outputSchema: { type: "object", required: ["answer"] },
@@ -465,6 +455,7 @@ describe("sessions_spawn tool", () => {
       requesterRunId: "parent-run",
       config: { tools: { swarm: true } },
     });
+    finalizeAgentToolAvailability([tool, createAgentsWaitTool({})]);
     const input: Record<PropertyKey, unknown> = { task: "collect", collect: true };
     Object.defineProperty(input, SWARM_CODE_MODE_IDEMPOTENCY_KEY, {
       value: "cm-restart:bridge:1",
@@ -508,7 +499,7 @@ describe("sessions_spawn tool", () => {
     expect(hoisted.spawnSubagentDirectMock).not.toHaveBeenCalled();
   });
 
-  it("advertises visible sessions with terse UI guidance", () => {
+  it("reserves visible sessions for independently user-facing work", () => {
     const tool = createSessionsSpawnTool();
     const schema = tool.parameters as {
       properties?: Record<
@@ -518,13 +509,22 @@ describe("sessions_spawn tool", () => {
     };
 
     expect(schema.properties?.visible?.description).toBe(
-      "Durable visible session: coding/multi-step/keepable results; works without UI; subagent only. Default run mode and empty attachment fields are accepted; no thread/thinking/lightContext or attachment staging.",
+      "Persistent sidebar session only when the user requests a separate session or needs to revisit and steer it independently. Internal QA/coding/review/test workers: omit or false. Subagent runtime only; default run mode and empty attachments accepted; no thread/thinking/lightContext or attachment staging.",
     );
+    expect(schema.properties?.projectId?.description).toContain("Registered project");
+    expect(schema.properties?.projectGitUrl?.description).toContain("managed clone");
     expect(schema.properties?.cwd?.description).toContain(
       "outside configured agent workspaces require operator.admin",
     );
     expect(tool.description).toContain("`visible=true`: durable visible session");
-    expect(tool.description).toContain("Default for coding, multi-step work");
+    expect(tool.description).toContain(
+      "Default to a hidden subagent for internal QA, research, coding, review, tests, and parallel work supporting the current task",
+    );
+    expect(tool.description).toContain(
+      "A PR/report, long runtime, or isolated worktree alone does not justify a sidebar session",
+    );
+    expect(tool.description).not.toContain("Default for coding, multi-step work");
+    expect(tool.description).toContain("announcing runs report back");
     expect(tool.description).toContain('`mode="run"` is also accepted');
     expect(tool.description).toContain(
       "`attachments=[]` and omitted/blank `attachAs.mountPath` are accepted",
@@ -541,7 +541,7 @@ describe("sessions_spawn tool", () => {
     expect(schema.properties?.attachAs?.description).toContain(
       "only an omitted or blank mountPath",
     );
-    expect(schema.properties?.category?.description).toContain("leave it ungrouped");
+    expect(schema.properties?.group?.description).toContain("leave it ungrouped");
     expect(schema.properties?.mode?.enum).toEqual(["run"]);
     expect(schema.properties?.mode?.anyOf).toBeUndefined();
     expect(schema.properties?.worktree).toBeDefined();
@@ -583,7 +583,7 @@ describe("sessions_spawn tool", () => {
           await tool.execute("visible", {
             task: "inspect issue",
             label: "Issue review",
-            category: "P1 issues from beta feedback",
+            group: "P1 issues from beta feedback",
             model: "anthropic/claude-sonnet-4-6",
             cwd: dir,
             context: "fork",
@@ -606,7 +606,8 @@ describe("sessions_spawn tool", () => {
         label: "Issue review",
         category: "P1 issues from beta feedback",
         model: "anthropic/claude-sonnet-4-6",
-        task: "inspect issue",
+        task: expect.stringContaining("[Subagent Task]\n\ninspect issue"),
+        timeoutMs: 120000,
         parentSessionKey: "agent:main:main",
         spawnDepth: 1,
         fork: true,
@@ -615,23 +616,21 @@ describe("sessions_spawn tool", () => {
         worktreeName: "issue-review",
         worktreeBaseRef: "main",
       });
-      expect(registerRun).toHaveBeenCalledWith(
-        expect.objectContaining({
-          runId: "run-visible",
-          requesterTurnRunId: "run-requester-visible-worktree",
-          childSessionKey: "agent:main:dashboard:child",
-          requesterSessionKey: "agent:main:main",
-          requesterOrigin: {
-            channel: "slack",
-            to: "channel:C-current",
-            threadId: "current-thread",
-          },
-          cleanup: "keep",
-          runTimeoutSeconds: 120,
-          expectsCompletionMessage: true,
-          spawnMode: "run",
-        }),
-      );
+      expectRegisteredSubagentRun(registerRun, {
+        runId: "run-visible",
+        requesterTurnRunId: "run-requester-visible-worktree",
+        childSessionKey: "agent:main:dashboard:child",
+        requesterSessionKey: "agent:main:main",
+        requesterOrigin: {
+          channel: "slack",
+          to: "channel:C-current",
+          threadId: "current-thread",
+        },
+        cleanup: "keep",
+        runTimeoutSeconds: 120,
+        expectsCompletionMessage: true,
+        spawnMode: "run",
+      });
       expect(hoisted.spawnSubagentDirectMock).not.toHaveBeenCalled();
       expect(work).toHaveLength(1);
       expect(work[0]).toMatchObject({
@@ -651,50 +650,9 @@ describe("sessions_spawn tool", () => {
   });
 
   it.each([
-    { label: "default", mode: undefined },
-    { label: "read-only", mode: "read-only" },
-    { label: "guarded", mode: "guarded" },
-    { label: "workspace", mode: "workspace" },
-    { label: "full", mode: "full" },
-  ] as const)(
-    "inherits the parent's $label permission mode in a visible child",
-    async ({ mode }) => {
-      const callGateway = vi.fn(async () => ({
-        key: "agent:main:dashboard:child",
-        runStarted: true,
-        runId: "run-visible",
-      }));
-      const tool = createSessionsSpawnTool({
-        agentSessionKey: "agent:main:main",
-        ...(mode ? { sessionPermissionPolicy: { mode, root: "/workspace/main" } } : {}),
-        config: { agents: { list: [{ id: "main" }] } },
-        callGateway: callGateway as never,
-        registerRun: vi.fn(),
-        countActiveRuns: () => 0,
-      });
-
-      await tool.execute("visible-permissions", { task: "inspect", visible: true, worktree: true });
-
-      const createParams = mockCallArg(callGateway, 0, 1, "sessions.create");
-      expect(createParams.worktree).toBe(true);
-      expect(createParams).not.toHaveProperty("sessionRoot");
-      if (mode) {
-        expect(createParams.permissionMode).toBe(mode);
-      } else {
-        expect(createParams).not.toHaveProperty("permissionMode");
-      }
-    },
-  );
-
-  it.each([
     { label: "omitted", optional: {} },
-    { label: "empty category", optional: { category: "" } },
-    { label: "whitespace category", optional: { category: " \t\n " } },
+    { label: "whitespace group", optional: { group: " \t\n " } },
     { label: "empty attachment hint", optional: { mode: "run", attachments: [], attachAs: {} } },
-    {
-      label: "empty attachment mount path",
-      optional: { mode: "run", attachments: [], attachAs: { mountPath: "" } },
-    },
     {
       label: "whitespace attachment mount path",
       optional: { mode: "run", attachments: [], attachAs: { mountPath: " \t\n " } },
@@ -757,7 +715,7 @@ describe("sessions_spawn tool", () => {
 
       expect(result.details).toMatchObject({
         status: "forbidden",
-        error: `Visible session cwd "${outside}" is outside configured agent workspaces and requires operator.admin. Omit cwd to use the target agent workspace, or ask the operator to start the session from a registered project. Do not substitute the synchronous \`openclaw agent\` CLI for a persistent visible session.`,
+        error: `Visible session cwd "${outside}" is outside configured agent workspaces and requires operator.admin. Omit cwd to use the target agent workspace, or select a registered project with projectId or a GitHub repository with projectGitUrl. Do not substitute the synchronous \`openclaw agent\` CLI for a persistent visible session.`,
       });
       expect(callGateway).toHaveBeenCalledOnce();
     });
@@ -875,10 +833,10 @@ describe("sessions_spawn tool", () => {
       other: hoisted.spawnAcpDirectMock,
     },
     { runtime: "acp", spawn: hoisted.spawnAcpDirectMock, other: hoisted.spawnSubagentDirectMock },
-  ])("$runtime category preflight", ({ runtime, spawn, other }) => {
+  ])("$runtime group preflight", ({ runtime, spawn, other }) => {
     beforeEach(() => registerAcpBackendForTest());
 
-    it.each([undefined, "", " \t\n "])("dispatches once with category %j", async (category) => {
+    it("dispatches once with a blank group", async () => {
       const callGateway = vi.fn();
       const tool = createSessionsSpawnTool({ agentSessionKey: "agent:main:main", callGateway });
       const request = {
@@ -890,10 +848,10 @@ describe("sessions_spawn tool", () => {
         mode: "run",
       };
 
-      const result = await tool.execute("hidden-category", {
+      const result = await tool.execute("hidden-group", {
         ...request,
         visible: false,
-        ...(category !== undefined ? { category } : {}),
+        group: " \t\n ",
       });
 
       expect(result.details).toMatchObject({ status: "accepted", runId: `run-${runtime}` });
@@ -904,103 +862,156 @@ describe("sessions_spawn tool", () => {
       expect(callGateway).not.toHaveBeenCalled();
       expect(hoisted.inProcessCreationMock).not.toHaveBeenCalled();
     });
-
-    it.each([
-      { category: "Projects" },
-      { worktree: true },
-      { worktreeName: "repair" },
-      { worktreeBaseRef: "main" },
-    ])("rejects visible-only options %j with actionable recovery", async (options) => {
-      const callGateway = vi.fn();
-      const tool = createSessionsSpawnTool({ agentSessionKey: "agent:main:main", callGateway });
-
-      await expect(
-        tool.execute("hidden-visible-options", {
-          task: "inspect",
-          runtime,
-          mode: "run",
-          ...options,
-        }),
-      ).rejects.toThrow(
-        `Parameters require visible=true: ${Object.keys(options).join(", ")}. ` +
-          'Omit these options for hidden subagent or ACP runs. For a visible session, use visible=true with runtime="subagent"; omit mode, thread, thinking, lightContext, attachments, attachAs, swarm options, and ACP-only streamTo/resumeSessionId. Worktree names/base refs also require worktree=true.',
-      );
-      expect(spawn).not.toHaveBeenCalled();
-      expect(other).not.toHaveBeenCalled();
-      expect(callGateway).not.toHaveBeenCalled();
-    });
   });
 
-  it("applies a per-run timeout to visible dashboard sessions", async () => {
-    const callGateway = vi.fn(async () => ({
-      key: "agent:main:dashboard:timed-child",
-      runStarted: true,
-      runId: "run-visible-timed",
-    }));
-    const registerRun = vi.fn();
-    const tool = createSessionsSpawnTool({
-      agentSessionKey: "agent:main:main",
-      config: {
-        agents: {
-          defaults: { subagents: { runTimeoutSeconds: 120 } },
-          list: [{ id: "main" }],
-        },
-      },
-      callGateway: callGateway as never,
-      registerRun,
-      countActiveRuns: () => 0,
-    });
+  it.each([
+    { group: "Projects" },
+    { projectId: "registered-project" },
+    { projectGitUrl: "https://github.com/openclaw/openclaw.git" },
+    { worktree: true },
+    { worktreeName: "repair" },
+    { worktreeBaseRef: "main" },
+  ])("rejects visible-only options %j with actionable recovery", async (options) => {
+    const callGateway = vi.fn();
+    const tool = createSessionsSpawnTool({ agentSessionKey: "agent:main:main", callGateway });
 
-    const result = await tool.execute("visible-timeout", {
-      task: "inspect issue",
-      visible: true,
-      runTimeoutSeconds: 7,
-    });
-
-    expect(result.details).toMatchObject({ status: "accepted", runId: "run-visible-timed" });
-    expect(registerRun).toHaveBeenCalledWith(
-      expect.objectContaining({ runId: "run-visible-timed", runTimeoutSeconds: 7 }),
+    await expect(
+      tool.execute("hidden-visible-options", {
+        task: "inspect",
+        runtime: "subagent",
+        mode: "run",
+        ...options,
+      }),
+    ).rejects.toThrow(
+      `Parameters require visible=true: ${Object.keys(options).join(", ")}. ` +
+        'Omit these options for hidden subagent or ACP runs. For a visible session, use visible=true with runtime="subagent"; omit mode, thread, thinking, lightContext, attachments, attachAs, swarm options, and ACP-only streamTo/resumeSessionId. Worktree names/base refs also require worktree=true.',
     );
+    expect(hoisted.spawnSubagentDirectMock).not.toHaveBeenCalled();
+    expect(hoisted.spawnAcpDirectMock).not.toHaveBeenCalled();
+    expect(callGateway).not.toHaveBeenCalled();
   });
 
-  it("uses the target agent model for cross-agent visible sessions", async () => {
-    const callGateway = vi.fn(async () => ({
+  it.each([
+    { requested: 1800, configured: 120, seconds: 1800 },
+    { requested: 0, configured: 120, seconds: 0 },
+    { requested: undefined, configured: 120, seconds: 120 },
+    { requested: undefined, configured: undefined, seconds: 0 },
+  ])(
+    "forwards visible run timeout $requested (default $configured)",
+    async ({ requested, configured, seconds }) => {
+      const callGateway = vi.fn(async () => ({
+        key: "agent:main:dashboard:timed-child",
+        runStarted: true,
+        runId: "run-visible-timed",
+      }));
+      const registerRun = vi.fn();
+      const tool = createSessionsSpawnTool({
+        agentSessionKey: "agent:main:main",
+        config: {
+          agents: {
+            defaults: { timeoutSeconds: 180, subagents: { runTimeoutSeconds: configured } },
+            list: [{ id: "main" }],
+          },
+        },
+        callGateway: callGateway as never,
+        registerRun,
+        countActiveRuns: () => 0,
+      });
+
+      const result = await tool.execute("visible-timeout", {
+        task: "inspect issue",
+        visible: true,
+        ...(requested !== undefined ? { runTimeoutSeconds: requested } : {}),
+      });
+
+      expect(result.details).toMatchObject({ status: "accepted", runId: "run-visible-timed" });
+      expect(callGateway).toHaveBeenCalledWith(
+        "sessions.create",
+        expect.objectContaining({ timeoutMs: seconds * 1000 }),
+      );
+      expectRegisteredSubagentRun(registerRun, {
+        runId: "run-visible-timed",
+        runTimeoutSeconds: seconds,
+      });
+    },
+  );
+
+  it.each([
+    { target: "main", requestedModel: undefined, expectedModel: "openai/gpt-5.6-sol" },
+    { target: "reviewer", requestedModel: undefined, expectedModel: "anthropic/claude-sonnet-4-6" },
+    { target: "main", requestedModel: "openai/gpt-5.6-luna", expectedModel: "openai/gpt-5.6-luna" },
+    {
+      target: "main",
+      requestedModel: undefined,
+      configuredModel: "openai/gpt-5.6-luna@preferred",
+      expectedModel: "openai/gpt-5.6-luna@preferred",
+    },
+    {
+      target: "main",
+      requestedModel: undefined,
+      requesterModel: { provider: "custom", model: "custom/model" },
+      expectedModel: "custom/custom/model",
+    },
+  ])("uses $expectedModel for a visible $target session", async (scenario) => {
+    const { target, requestedModel, expectedModel } = scenario;
+    const configuredModel = "configuredModel" in scenario ? scenario.configuredModel : undefined;
+    const callGateway = hoisted.inProcessCreationMock.mockResolvedValue({
       key: "agent:reviewer:dashboard:child",
       runStarted: true,
       runId: "run-reviewer",
-    }));
+    });
+    const requesterModel =
+      "requesterModel" in scenario
+        ? scenario.requesterModel
+        : { provider: "openai", model: "gpt-5.6-sol" };
     const tool = createSessionsSpawnTool({
       agentSessionKey: "agent:main:main",
+      requesterModel,
       config: {
         agents: {
-          defaults: { subagents: { allowAgents: ["reviewer"] } },
+          defaults: { subagents: { allowAgents: ["main", "reviewer"] } },
           list: [
-            { id: "main" },
+            { id: "main", ...(configuredModel ? { subagents: { model: configuredModel } } : {}) },
             { id: "reviewer", subagents: { model: "anthropic/claude-sonnet-4-6" } },
           ],
         },
       },
-      callGateway: callGateway as never,
       registerRun: vi.fn(),
       countActiveRuns: () => 0,
     });
 
     await tool.execute("visible-reviewer", {
       task: "review patch",
-      agentId: "reviewer",
+      agentId: target,
+      ...(requestedModel ? { model: requestedModel } : {}),
       visible: true,
     });
 
     expect(callGateway).toHaveBeenCalledWith(
       "sessions.create",
       expect.objectContaining({
-        agentId: "reviewer",
-        model: "anthropic/claude-sonnet-4-6",
+        agentId: target,
+        model: expectedModel,
         parentSessionKey: "agent:main:main",
         spawnDepth: 1,
       }),
+      expect.objectContaining({ via: "spawn", requesterSessionKey: "agent:main:main" }),
+      undefined,
     );
     expect(mockCallArg(callGateway, 0, 1, "sessions.create")).not.toHaveProperty("fork");
+    const creation = mockCallArg(callGateway, 0, 2, "sessions.create");
+    if (target === "main" && requestedModel === undefined && !configuredModel) {
+      expect(creation).toMatchObject({ resolvedModel: requesterModel });
+    } else {
+      expect(creation).not.toHaveProperty("resolvedModel");
+    }
+    if (requestedModel) {
+      expect(creation).not.toHaveProperty("spawnModelAutoSelection");
+    } else {
+      expect(creation).toMatchObject({
+        spawnModelAutoSelection: { model: expectedModel, hasFallbackOrigin: true },
+      });
+    }
   });
 
   it("rejects cross-agent visible transcript forks", async () => {
@@ -1175,86 +1186,6 @@ describe("sessions_spawn tool", () => {
     ).rejects.toThrow(message);
   });
 
-  it("reports every unsupported visible parameter in one error", async () => {
-    const tool = createSessionsSpawnTool({ agentSessionKey: "agent:main:main" });
-
-    await expect(
-      tool.execute("visible-unsupported-many", {
-        task: "inspect",
-        runtime: "acp",
-        thinking: "high",
-        thread: true,
-        mode: "session",
-        lightContext: true,
-        attachments: [{ name: "note.txt", content: "hello" }],
-        attachAs: { mountPath: "inputs" },
-        visible: true,
-      }),
-    ).rejects.toThrow(
-      'Parameters unavailable with visible=true: runtime: supports runtime="subagent" only; thinking: thinking overrides are not wired to the sessions.create path; thread: visible sessions route to the dashboard, not a channel thread; mode: visible sessions are persistent dashboard sessions; lightContext: bootstrap staging is not wired to the sessions.create path; attachments: attachment staging is not wired to the sessions.create path; attachAs: attachment staging is not wired to the sessions.create path',
-    );
-  });
-
-  it("creates visible sessions while carrying inherited tool restrictions forward", async () => {
-    hoisted.inProcessCreationMock.mockResolvedValue({
-      key: "agent:main:dashboard:restricted-child",
-      runStarted: true,
-      runId: "run-visible-restricted",
-    });
-    const registerRun = vi.fn();
-    const tool = createSessionsSpawnTool({
-      agentSessionKey: "agent:main:main",
-      config: {
-        agents: { list: [{ id: "main", identity: { name: "Roboclaw" } }] },
-        gateway: { publicOrigin: "https://openclaw.example", controlUi: { basePath: "/control" } },
-      },
-      inheritedToolAllowlist: ["read", "sessions_spawn"],
-      inheritedToolDenylist: ["exec"],
-      registerRun,
-      countActiveRuns: () => 0,
-    });
-
-    const result = await tool.execute("visible-restricted", {
-      task: "inspect",
-      label: "Track upstream fix",
-      visible: true,
-    });
-
-    expect(result.details).toMatchObject({
-      status: "accepted",
-      childSessionKey: "agent:main:dashboard:restricted-child",
-      runId: "run-visible-restricted",
-      sessionUrl: "https://openclaw.example/control/chat/main/dashboard/restricted-child",
-      owner: { type: "agent", id: "main", label: "Roboclaw" },
-    });
-    expect(hoisted.inProcessCreationMock).toHaveBeenCalledWith(
-      "sessions.create",
-      expect.objectContaining({
-        agentId: "main",
-        label: "Track upstream fix",
-        parentSessionKey: "agent:main:main",
-        spawnDepth: 1,
-      }),
-      {
-        via: "spawn",
-        actor: { type: "agent", id: "main" },
-        requesterSessionKey: "agent:main:main",
-        completionOwnerSessionKey: "agent:main:main",
-        inheritedToolPolicy: {
-          version: 1,
-          allow: ["read", "sessions_spawn"],
-          deny: ["exec"],
-        },
-      },
-    );
-    expect(registerRun).toHaveBeenCalledWith(
-      expect.objectContaining({
-        childSessionKey: "agent:main:dashboard:restricted-child",
-        runId: "run-visible-restricted",
-      }),
-    );
-  });
-
   it("blocks unsandboxed visible targets for a sandboxed caller runtime", async () => {
     const callGateway = vi.fn();
     const tool = createSessionsSpawnTool({
@@ -1273,6 +1204,105 @@ describe("sessions_spawn tool", () => {
     });
     expect(callGateway).not.toHaveBeenCalled();
   });
+
+  it.each(["inherit", "require"] as const)(
+    "admits a required parent's visible child with sandbox=%s while agent sandboxing is off",
+    async (sandbox) => {
+      await withTestDir({ prefix: "openclaw-visible-required-parent-" }, async (dir) => {
+        const storePath = path.join(dir, "sessions.json");
+        const parentSessionKey = "agent:main:main";
+        await upsertSessionEntryCore(
+          { agentId: "main", sessionKey: parentSessionKey, storePath },
+          {
+            sessionId: "required-parent",
+            updatedAt: 1,
+            createdVia: "operator",
+            createdActor: { type: "human", source: "profile", id: "guest-profile" },
+            sandbox: "required",
+          },
+        );
+        hoisted.inProcessCreationMock.mockResolvedValue({
+          key: "agent:main:dashboard:required-child",
+          runStarted: true,
+          runId: "required-visible-run",
+        });
+        const tool = createSessionsSpawnTool({
+          agentSessionKey: parentSessionKey,
+          config: {
+            session: { store: storePath },
+            agents: {
+              defaults: { sandbox: { mode: "off" } },
+              entries: { main: { workspace: dir } },
+            },
+          },
+          countActiveRuns: () => 0,
+        });
+
+        const result = await tool.execute("required-visible-spawn", {
+          task: "inspect the project in an isolated child",
+          visible: true,
+          sandbox,
+        });
+
+        expect(result.details).toMatchObject({
+          status: "accepted",
+          childSessionKey: "agent:main:dashboard:required-child",
+        });
+        expect(hoisted.inProcessCreationMock).toHaveBeenCalledWith(
+          "sessions.create",
+          expect.objectContaining({ parentSessionKey }),
+          expect.objectContaining({ requesterSessionKey: parentSessionKey }),
+          undefined,
+        );
+      });
+    },
+  );
+
+  it.each(["off", "all"] as const)(
+    "uses the global requester sandbox mode %s for visible children",
+    async (sandboxMode) => {
+      const callGateway = vi.fn().mockResolvedValue({
+        key: "agent:worker:dashboard:global-child",
+        runStarted: true,
+        runId: "global-visible-run",
+      });
+      const tool = createSessionsSpawnTool({
+        agentSessionKey: "global",
+        requesterAgentIdOverride: "research",
+        config: {
+          session: { scope: "global" },
+          agents: {
+            ownership: "explicit",
+            entries: {
+              research: { sandbox: { mode: sandboxMode }, subagents: { allowAgents: ["worker"] } },
+              worker: {},
+            },
+          },
+        },
+        callGateway,
+        registerRun: vi.fn(),
+        countActiveRuns: () => 0,
+      });
+
+      const result = await tool.execute("global-visible", {
+        task: "inspect",
+        visible: true,
+        agentId: "worker",
+      });
+
+      expect(result.details).toMatchObject({
+        status: sandboxMode === "all" ? "forbidden" : "accepted",
+      });
+      if (sandboxMode === "all") {
+        expect(callGateway).not.toHaveBeenCalled();
+      } else {
+        expect(callGateway).toHaveBeenCalledWith(
+          "sessions.create",
+          expect.objectContaining({ agentId: "worker", parentSessionKey: "global" }),
+        );
+      }
+    },
+  );
 
   it("reserves visible child capacity before session creation", async () => {
     let resolveCreate!: (value: { key: string; runStarted: true; runId: string }) => void;
@@ -1317,153 +1347,61 @@ describe("sessions_spawn tool", () => {
     );
   });
 
-  it("deletes a visible session whose initial run did not start", async () => {
-    const callGateway = vi
-      .fn()
-      .mockResolvedValueOnce({
-        key: "agent:main:dashboard:not-started",
-        runStarted: false,
-        runError: "model unavailable",
-      })
-      .mockResolvedValueOnce({ deleted: true });
-    const registerRun = vi.fn();
-    const tool = createSessionsSpawnTool({
-      agentSessionKey: "agent:main:main",
-      config: { agents: { list: [{ id: "main" }] } },
-      callGateway,
-      registerRun,
-      countActiveRuns: () => 0,
-    });
-
-    const result = await tool.execute("visible-not-started", {
-      task: "inspect",
-      visible: true,
-    });
-
-    expect(result.details).toMatchObject({
-      status: "error",
-      error: "model unavailable",
-      childSessionKey: "agent:main:dashboard:not-started",
-    });
-    expect(callGateway).toHaveBeenNthCalledWith(2, "sessions.delete", {
-      key: "agent:main:dashboard:not-started",
-      deleteTranscript: true,
-      emitLifecycleHooks: false,
-    });
-    expect(registerRun).not.toHaveBeenCalled();
-  });
-
-  it("aborts a partially started visible run before deleting its session", async () => {
-    const callGateway = vi
-      .fn()
-      .mockResolvedValueOnce({
-        key: "agent:main:dashboard:partial",
-        runStarted: true,
-        runError: "missing run id",
-      })
-      .mockResolvedValueOnce({ ok: true, abortedRunId: "run-partial" })
-      .mockResolvedValueOnce({ deleted: true });
-    const registerRun = vi.fn();
-    const tool = createSessionsSpawnTool({
-      agentSessionKey: "agent:main:main",
-      config: { agents: { list: [{ id: "main" }] } },
-      callGateway,
-      registerRun,
-      countActiveRuns: () => 0,
-    });
-
-    const result = await tool.execute("visible-partial", { task: "inspect", visible: true });
-
-    // A started-but-untrackable run (no run id) is always aborted and deleted,
-    // never left as a visible orphan the parent cannot cancel.
-    expect(result.details).toMatchObject({ status: "error" });
-    expect((result.details as { childSessionKey?: string }).childSessionKey).toBeUndefined();
-    expect(callGateway).toHaveBeenNthCalledWith(2, "sessions.abort", {
-      key: "agent:main:dashboard:partial",
-      agentId: "main",
-    });
-    expect(callGateway).toHaveBeenNthCalledWith(3, "sessions.delete", {
-      key: "agent:main:dashboard:partial",
-      deleteTranscript: true,
-      emitLifecycleHooks: false,
-    });
-    expect(registerRun).not.toHaveBeenCalled();
-  });
-
-  it("deletes a started run with no run id even when abort reports nothing stopped", async () => {
-    const callGateway = vi
-      .fn()
-      .mockResolvedValueOnce({
-        key: "agent:main:dashboard:untracked",
-        runStarted: true,
-        runError: "missing run id",
-      })
-      .mockResolvedValueOnce({ ok: true, abortedRunId: null })
-      .mockResolvedValueOnce({ deleted: true });
-    const registerRun = vi.fn();
-    const tool = createSessionsSpawnTool({
-      agentSessionKey: "agent:main:main",
-      config: { agents: { list: [{ id: "main" }] } },
-      callGateway,
-      registerRun,
-      countActiveRuns: () => 0,
-    });
-
-    const result = await tool.execute("visible-untracked", { task: "inspect", visible: true });
-
-    expect(result.details).toMatchObject({ status: "error" });
-    expect(callGateway).toHaveBeenNthCalledWith(3, "sessions.delete", {
-      key: "agent:main:dashboard:untracked",
-      deleteTranscript: true,
-      emitLifecycleHooks: false,
-    });
-    expect(registerRun).not.toHaveBeenCalled();
-  });
-
-  it("rolls back a visible session when announce registration fails", async () => {
-    const callGateway = vi
-      .fn()
-      .mockResolvedValueOnce({
-        key: "agent:main:dashboard:orphan",
-        runStarted: true,
-        runId: "run-orphan",
-      })
-      .mockResolvedValueOnce({ ok: true, abortedRunId: "run-orphan" })
-      .mockResolvedValueOnce({ deleted: true });
-    const tool = createSessionsSpawnTool({
-      agentSessionKey: "agent:main:main",
-      config: { agents: { list: [{ id: "main" }] } },
-      callGateway,
-      registerRun: () => {
+  it.each(["not-started", "missing-run-id", "registration"] as const)(
+    "cleans up the created visible session after %s failure",
+    async (failure) => {
+      const callGateway = vi
+        .fn()
+        .mockResolvedValueOnce({
+          key: "agent:main:dashboard:child",
+          sessionId: "created-child",
+          entry: { lifecycleRevision: "birth-revision" },
+          runStarted: failure !== "not-started",
+          ...(failure === "registration" ? { runId: "child-run" } : {}),
+          runError: "startup failed",
+        })
+        .mockResolvedValueOnce({ deleted: true });
+      const registerRun = vi.fn(() => {
         throw new Error("registry unavailable");
-      },
-      countActiveRuns: () => 0,
-    });
+      });
+      const tool = createSessionsSpawnTool({
+        agentSessionKey: "agent:main:main",
+        config: { agents: { list: [{ id: "main" }] } },
+        callGateway,
+        registerRun,
+        countActiveRuns: () => 0,
+      });
 
-    const result = await tool.execute("visible-orphan", { task: "inspect", visible: true });
+      const result = await tool.execute("visible-failure", { task: "inspect", visible: true });
 
-    expect(result.details).toMatchObject({ status: "error", runId: "run-orphan" });
-    expect(callGateway).toHaveBeenNthCalledWith(2, "sessions.abort", {
-      key: "agent:main:dashboard:orphan",
-      runId: "run-orphan",
-      agentId: "main",
-    });
-    expect(callGateway).toHaveBeenNthCalledWith(3, "sessions.delete", {
-      key: "agent:main:dashboard:orphan",
-      deleteTranscript: true,
-      emitLifecycleHooks: false,
-    });
-  });
+      expect(result.details).toMatchObject({
+        status: "error",
+        error: expect.stringContaining("Session removed."),
+        childSessionKey: "agent:main:dashboard:child",
+      });
+      expect(callGateway).toHaveBeenCalledTimes(2);
+      expect(callGateway).toHaveBeenNthCalledWith(2, "sessions.delete", {
+        key: "agent:main:dashboard:child",
+        expectedSessionId: "created-child",
+        expectedLifecycleRevision: "birth-revision",
+        deleteTranscript: true,
+        emitLifecycleHooks: false,
+      });
+      expect(registerRun).toHaveBeenCalledTimes(failure === "registration" ? 1 : 0);
+    },
+  );
 
-  it("keeps a visible session when rollback cannot abort its run", async () => {
+  it("reports the retained child when visible-session cleanup fails", async () => {
     const callGateway = vi
       .fn()
       .mockResolvedValueOnce({
-        key: "agent:main:dashboard:live",
+        key: "agent:main:dashboard:child",
+        sessionId: "created-child",
+        entry: { lifecycleRevision: "birth-revision" },
         runStarted: true,
-        runId: "run-live",
+        runId: "child-run",
       })
-      .mockRejectedValueOnce(new Error("abort unavailable"));
+      .mockRejectedValueOnce(new Error("lifecycle drain unavailable"));
     const tool = createSessionsSpawnTool({
       agentSessionKey: "agent:main:main",
       config: { agents: { list: [{ id: "main" }] } },
@@ -1478,41 +1416,45 @@ describe("sessions_spawn tool", () => {
 
     expect(result.details).toMatchObject({
       status: "error",
-      childSessionKey: "agent:main:dashboard:live",
-      runId: "run-live",
+      error: expect.stringContaining(
+        "Session cleanup unconfirmed. Inspect the child session before retrying.",
+      ),
+      childSessionKey: "agent:main:dashboard:child",
+      runId: "child-run",
     });
     expect(callGateway).toHaveBeenCalledTimes(2);
   });
 
-  it("keeps a visible session when rollback does not confirm its run", async () => {
-    const callGateway = vi
-      .fn()
-      .mockResolvedValueOnce({
-        key: "agent:main:dashboard:finished",
-        runStarted: true,
-        runId: "run-finished",
-      })
-      .mockResolvedValueOnce({ ok: true, abortedRunId: null, status: "no-active-run" });
-    const tool = createSessionsSpawnTool({
-      agentSessionKey: "agent:main:main",
-      config: { agents: { list: [{ id: "main" }] } },
-      callGateway,
-      registerRun: () => {
-        throw new Error("registry unavailable");
-      },
-      countActiveRuns: () => 0,
-    });
+  it.each(["sessionId", "lifecycleRevision"] as const)(
+    "keeps a failed visible child when its creation receipt omits %s",
+    async (missing) => {
+      const callGateway = vi.fn().mockResolvedValueOnce({
+        key: "agent:main:dashboard:child",
+        ...(missing === "sessionId" ? {} : { sessionId: "created-child" }),
+        entry: missing === "lifecycleRevision" ? {} : { lifecycleRevision: "birth-revision" },
+        runStarted: false,
+        runError: "startup failed",
+      });
+      const tool = createSessionsSpawnTool({
+        agentSessionKey: "agent:main:main",
+        config: { agents: { list: [{ id: "main" }] } },
+        callGateway,
+        countActiveRuns: () => 0,
+      });
 
-    const result = await tool.execute("visible-finished", { task: "inspect", visible: true });
+      const result = await tool.execute("visible-missing-identity", {
+        task: "inspect",
+        visible: true,
+      });
 
-    expect(result.details).toMatchObject({
-      status: "error",
-      error: expect.stringContaining("Run abort unconfirmed. Session kept."),
-      childSessionKey: "agent:main:dashboard:finished",
-      runId: "run-finished",
-    });
-    expect(callGateway).toHaveBeenCalledTimes(2);
-  });
+      expect(result.details).toMatchObject({
+        status: "error",
+        error: expect.stringContaining("Session cleanup unconfirmed."),
+        childSessionKey: "agent:main:dashboard:child",
+      });
+      expect(callGateway).toHaveBeenCalledTimes(1);
+    },
+  );
 
   it("applies spawn depth limits to visible dashboard descendants", async () => {
     await withTestDir({ prefix: "openclaw-visible-depth-" }, async (dir) => {
@@ -1581,7 +1523,7 @@ describe("sessions_spawn tool", () => {
         expect.objectContaining({
           parentSessionKey: childKey,
           spawnDepth: 2,
-          task: "inspect from the grandchild",
+          task: expect.stringContaining("[Subagent Task]\n\ninspect from the grandchild"),
         }),
       );
     });
@@ -1669,6 +1611,7 @@ describe("sessions_spawn tool", () => {
     expect(spawnArgs.cwd).toBe("/workspace/requester");
     expect(spawnArgs).not.toHaveProperty("runTimeoutSeconds");
     expect(spawnArgs.thread).toBe(true);
+    expect(spawnArgs.completionTarget).toBeUndefined();
     expect(spawnArgs.mode).toBe("session");
     expect(spawnArgs.cleanup).toBe("keep");
     const spawnContext = mockCallArg(hoisted.spawnSubagentDirectMock, 0, 1, "spawnSubagentDirect");
@@ -1721,7 +1664,7 @@ describe("sessions_spawn tool", () => {
 
     const result = await tool.execute("call-task-name", {
       task: "review subagent handling",
-      taskName: "review-subagents",
+      taskName: "review_subagents-v2",
     });
 
     expectDetailFields(result.details, {
@@ -1730,25 +1673,7 @@ describe("sessions_spawn tool", () => {
     });
     const spawnArgs = mockCallArg(hoisted.spawnSubagentDirectMock, 0, 0, "spawnSubagentDirect");
     expect(spawnArgs.task).toBe("review subagent handling");
-    expect(spawnArgs.taskName).toBe("review-subagents");
-  });
-
-  it("accepts underscore taskName aliases", async () => {
-    const tool = createSessionsSpawnTool({
-      agentSessionKey: "agent:main:main",
-    });
-
-    const result = await tool.execute("call-underscore-task-name", {
-      task: "review subagent handling",
-      taskName: "review_subagents",
-    });
-
-    expectDetailFields(result.details, {
-      status: "accepted",
-      childSessionKey: "agent:main:subagent:1",
-    });
-    const spawnArgs = mockCallArg(hoisted.spawnSubagentDirectMock, 0, 0, "spawnSubagentDirect");
-    expect(spawnArgs.taskName).toBe("review_subagents");
+    expect(spawnArgs.taskName).toBe("review_subagents-v2");
   });
 
   it.each(["Bad-Name", "code review", "-bad"])(
@@ -1846,7 +1771,7 @@ describe("sessions_spawn tool", () => {
     );
   });
 
-  it.each([-1, 0.5, Number.NaN, Number.POSITIVE_INFINITY, "not-a-number"])(
+  it.each([-1, "not-a-number"])(
     "rejects invalid native timeout %s before spawning",
     async (runTimeoutSeconds) => {
       const tool = createSessionsSpawnTool({ agentSessionKey: "agent:main:main" });
@@ -2125,25 +2050,6 @@ describe("sessions_spawn tool", () => {
     ]);
   });
 
-  it("forwards model override to ACP runtime spawns", async () => {
-    registerAcpBackendForTest();
-    const tool = createSessionsSpawnTool({
-      agentSessionKey: "agent:main:main",
-    });
-
-    await tool.execute("call-2-model", {
-      runtime: "acp",
-      task: "investigate the failing CI run",
-      agentId: "codex",
-      model: "github-copilot/claude-sonnet-4.6",
-    });
-
-    const spawnArgs = mockCallArg(hoisted.spawnAcpDirectMock, 0, 0, "spawnAcpDirect");
-    expect(spawnArgs.task).toBe("investigate the failing CI run");
-    expect(spawnArgs.agentId).toBe("codex");
-    expect(spawnArgs.model).toBe("github-copilot/claude-sonnet-4.6");
-  });
-
   it("forwards a per-run timeout to ACP runtime spawns", async () => {
     registerAcpBackendForTest();
     const tool = createSessionsSpawnTool({ agentSessionKey: "agent:main:main" });
@@ -2188,68 +2094,6 @@ describe("sessions_spawn tool", () => {
       errorCode: "acp_disabled",
       role: "codex",
     });
-  });
-
-  it("forwards ACP sandbox options", async () => {
-    registerAcpBackendForTest();
-    hoisted.spawnAcpDirectMock.mockResolvedValueOnce({
-      status: "accepted",
-      childSessionKey: "agent:codex:acp:1",
-      runId: "run-acp",
-      mode: "run",
-      runTimeoutSeconds: 120,
-    });
-    const tool = createSessionsSpawnTool({
-      agentSessionKey: "agent:main:subagent:parent",
-    });
-
-    await tool.execute("call-2b", {
-      runtime: "acp",
-      task: "investigate",
-      agentId: "codex",
-      sandbox: "require",
-    });
-
-    const spawnArgs = mockCallArg(hoisted.spawnAcpDirectMock, 0, 0, "spawnAcpDirect");
-    expect(spawnArgs.task).toBe("investigate");
-    expect(spawnArgs.sandbox).toBe("require");
-    expect(spawnArgs.cleanup).toBe("keep");
-    const spawnContext = mockCallArg(hoisted.spawnAcpDirectMock, 0, 1, "spawnAcpDirect");
-    expect(spawnContext.agentSessionKey).toBe("agent:main:subagent:parent");
-    expect(hoisted.registerSubagentRunMock).not.toHaveBeenCalled();
-  });
-
-  it("forwards completion policy for inline ACP session delivery", async () => {
-    registerAcpBackendForTest();
-    hoisted.spawnAcpDirectMock.mockResolvedValueOnce({
-      status: "accepted",
-      childSessionKey: "agent:codex:acp:1",
-      runId: "run-acp",
-      mode: "session",
-      inlineDelivery: true,
-    });
-    const tool = createSessionsSpawnTool({
-      agentSessionKey: "agent:main:main",
-      agentChannel: "discord",
-      agentAccountId: "default",
-      agentTo: "channel:parent-channel",
-      agentThreadId: "child-thread",
-    });
-
-    await tool.execute("call-inline-acp", {
-      runtime: "acp",
-      task: "investigate",
-      agentId: "codex",
-      thread: true,
-      mode: "session",
-    });
-
-    const spawnArgs = mockCallArg(hoisted.spawnAcpDirectMock, 0, 0, "spawnAcpDirect");
-    expect(spawnArgs.mode).toBe("session");
-    expect(spawnArgs.cleanup).toBe("keep");
-    expect(spawnArgs.expectsCompletionMessage).toBe(true);
-    // Inline-delivery suppression is decided after the ACP adapter binds its thread.
-    expect(hoisted.registerSubagentRunMock).not.toHaveBeenCalled();
   });
 
   it("rejects ACP runtime calls from sandboxed requester sessions", async () => {
@@ -2334,52 +2178,6 @@ describe("sessions_spawn tool", () => {
     expectDetailFields(result.details, { status: "forbidden" });
     expect(JSON.stringify(result.details)).toContain("attachments are disabled");
     expect(hoisted.spawnAcpDirectMock).not.toHaveBeenCalled();
-    expect(hoisted.spawnSubagentDirectMock).not.toHaveBeenCalled();
-  });
-
-  it("forwards validated image attachments for ACP runtime", async () => {
-    registerAcpBackendForTest();
-    const tool = createSessionsSpawnTool({
-      agentSessionKey: "agent:main:main",
-      agentChannel: "quietchat",
-      agentAccountId: "default",
-      agentTo: "channel:123",
-      agentThreadId: "456",
-      config: {
-        tools: {
-          sessions_spawn: {
-            attachments: {
-              enabled: true,
-              maxFiles: 1,
-              maxFileBytes: 32,
-              maxTotalBytes: 32,
-            },
-          },
-        },
-      } as never,
-    });
-
-    const imageBase64 = Buffer.from("png-bytes").toString("base64");
-    const result = await tool.execute("call-3", {
-      runtime: "acp",
-      task: "describe the image",
-      attachments: [
-        { name: "photo.png", content: imageBase64, encoding: "base64", mimeType: "image/png" },
-      ],
-    });
-
-    expect(result.details).toMatchObject({
-      status: "accepted",
-    });
-    expect(hoisted.spawnAcpDirectMock).toHaveBeenCalledWith(
-      expect.objectContaining({
-        task: "describe the image",
-        attachments: [{ mediaType: "image/png", data: imageBase64 }],
-      }),
-      expect.objectContaining({
-        agentSessionKey: "agent:main:main",
-      }),
-    );
     expect(hoisted.spawnSubagentDirectMock).not.toHaveBeenCalled();
   });
 
@@ -2483,29 +2281,6 @@ describe("sessions_spawn tool", () => {
     expect(hoisted.spawnAcpDirectMock).not.toHaveBeenCalled();
   });
 
-  it('ignores streamTo when runtime is omitted and defaults to "subagent"', async () => {
-    const tool = createSessionsSpawnTool({
-      agentSessionKey: "agent:main:main",
-    });
-
-    const result = await tool.execute("call-3b", {
-      task: "analyze file",
-      resumeSessionId: "7f4a78e0-f6be-43fe-855c-c1c4fd229bc4",
-      streamTo: "parent",
-    });
-
-    expectDetailFields(result.details, {
-      status: "accepted",
-      childSessionKey: "agent:main:subagent:1",
-      runId: "run-subagent",
-    });
-    expect(hoisted.spawnAcpDirectMock).not.toHaveBeenCalled();
-    const spawnArgs = mockCallArg(hoisted.spawnSubagentDirectMock, 0, 0, "spawnSubagentDirect");
-    expect(spawnArgs.task).toBe("analyze file");
-    expect(spawnArgs).not.toHaveProperty("resumeSessionId");
-    expect(spawnArgs).not.toHaveProperty("streamTo");
-  });
-
   it('treats model="default" as no explicit model override', async () => {
     const tool = createSessionsSpawnTool({
       agentSessionKey: "agent:main:main",
@@ -2543,23 +2318,6 @@ describe("sessions_spawn tool", () => {
     expect(contentSchema?.maxLength).toBeUndefined();
   });
 
-  it("registers requesterSessionKey from the provided agentSessionKey, not the sandbox peer key", async () => {
-    const tool = createSessionsSpawnTool({
-      agentSessionKey: "agent:main:main",
-      agentChannel: "telegram",
-      agentAccountId: "bot-1",
-      agentTo: "telegram:direct:123",
-    });
-
-    await tool.execute("call-requester-key", {
-      task: "background research",
-    });
-
-    expect(hoisted.spawnSubagentDirectMock).toHaveBeenCalledTimes(1);
-    const spawnContext = mockCallArg(hoisted.spawnSubagentDirectMock, 0, 1, "spawnSubagentDirect");
-    expect(spawnContext.agentSessionKey).toBe("agent:main:main");
-  });
-
   it("does not use the Telegram peer key as requesterSessionKey when agentSessionKey is the run session", async () => {
     const telegramPeerKey = "agent:main:telegram:default:direct:456";
     const runSessionKey = "agent:main:main";
@@ -2588,13 +2346,14 @@ describe("sessions_spawn tool", () => {
     expect(runContext.agentSessionKey).toBe(runSessionKey);
   });
 
-  it("passes completionOwnerKey through to spawnSubagentDirect separately from agentSessionKey", async () => {
+  it("passes completion ownership and active thinking separately from agentSessionKey", async () => {
     const tool = createSessionsSpawnTool({
       agentSessionKey: "agent:main:telegram:default:direct:456",
       completionOwnerKey: "agent:main:main",
       agentChannel: "telegram",
       agentAccountId: "default",
       agentTo: "telegram:direct:456",
+      requesterThinkingLevel: "ultra",
     });
 
     await tool.execute("call-completion-owner", { task: "background work" });
@@ -2602,6 +2361,7 @@ describe("sessions_spawn tool", () => {
     const spawnContext = mockCallArg(hoisted.spawnSubagentDirectMock, 0, 1, "spawnSubagentDirect");
     expect(spawnContext.agentSessionKey).toBe("agent:main:telegram:default:direct:456");
     expect(spawnContext.completionOwnerKey).toBe("agent:main:main");
+    expect(spawnContext.requesterThinkingLevel).toBe("ultra");
   });
 
   it("forwards completionOwnerKey to the ACP registration pipeline", async () => {

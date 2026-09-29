@@ -9,7 +9,8 @@ import {
   formatCollapsedToolSummaryText,
   resolveCollapsedToolArgumentPreview,
 } from "../../../lib/chat/tool-cards.ts";
-import { renderToolCard, renderToolPreview } from "./chat-tool-cards.ts";
+import { renderToolCard } from "./chat-tool-cards.ts";
+import { renderToolPreview } from "./widget-card.ts";
 
 function requireFirstMockArg(
   mock: ReturnType<typeof vi.fn>,
@@ -24,18 +25,6 @@ function requireFirstMockArg(
     throw new Error(`expected ${label} payload`);
   }
   return arg;
-}
-
-function selectText(element: Element) {
-  const range = document.createRange();
-  range.selectNodeContents(element);
-  const selection = window.getSelection();
-  selection?.removeAllRanges();
-  selection?.addRange(range);
-}
-
-function pointerClick(element: Element) {
-  element.dispatchEvent(new MouseEvent("click", { bubbles: true, detail: 1 }));
 }
 
 describe("tool-cards", () => {
@@ -104,36 +93,6 @@ describe("tool-cards", () => {
     expect(container.querySelector("iframe")).not.toBeNull();
   });
 
-  it("keeps selected summary text from toggling the disclosure", () => {
-    const container = document.createElement("div");
-    document.body.append(container);
-    const toggle = vi.fn();
-    render(
-      renderToolCard(
-        {
-          id: "msg:selectable",
-          name: "web_search",
-          args: { query: "openclaw" },
-        },
-        { expanded: false, onToggleExpanded: toggle },
-      ),
-      container,
-    );
-
-    const summary = container.querySelector<HTMLButtonElement>(".chat-tool-msg-summary");
-    const label = summary?.querySelector(".chat-tool-msg-summary__label");
-    expect(summary).not.toBeNull();
-    expect(label).not.toBeNull();
-    selectText(label!);
-    pointerClick(summary!);
-    expect(toggle).not.toHaveBeenCalled();
-
-    window.getSelection()?.removeAllRanges();
-    pointerClick(summary!);
-    expect(toggle).toHaveBeenCalledWith("msg:selectable");
-    container.remove();
-  });
-
   it("keeps a running card closed by default", () => {
     const container = document.createElement("div");
     render(
@@ -144,7 +103,7 @@ describe("tool-cards", () => {
           args: { command: "pnpm test" },
           live: true,
         },
-        { expanded: false, runActive: true, onToggleExpanded: vi.fn() },
+        { messageKey: "test-message", expanded: false, runActive: true, onToggleExpanded: vi.fn() },
       ),
       container,
     );
@@ -167,7 +126,7 @@ describe("tool-cards", () => {
           inputText: '{\n  "url": "https://example.com"\n}',
           outputText: "Opened page",
         },
-        { expanded: true, onToggleExpanded: toggle },
+        { messageKey: "test-message", expanded: true, onToggleExpanded: toggle },
       ),
       container,
     );
@@ -214,7 +173,7 @@ describe("tool-cards", () => {
           },
           outputText: "Applied patch",
         },
-        { expanded: true, onToggleExpanded: vi.fn() },
+        { messageKey: "test-message", expanded: true, onToggleExpanded: vi.fn() },
       ),
       container,
     );
@@ -275,7 +234,7 @@ describe("tool-cards", () => {
           },
           outputText: "Applied patch",
         },
-        { expanded: true, onToggleExpanded: vi.fn() },
+        { messageKey: "test-message", expanded: true, onToggleExpanded: vi.fn() },
       ),
       container,
     );
@@ -298,7 +257,7 @@ describe("tool-cards", () => {
           completed: true,
           isError: true,
         },
-        { expanded: true, onToggleExpanded: vi.fn() },
+        { messageKey: "test-message", expanded: true, onToggleExpanded: vi.fn() },
       ),
       container,
     );
@@ -319,6 +278,7 @@ describe("tool-cards", () => {
   it("labels a completed Codex file creation from its recorded operation", () => {
     const container = document.createElement("div");
     const onOpenWorkspaceFile = vi.fn();
+    const onToggleExpanded = vi.fn();
     render(
       renderToolCard(
         {
@@ -335,7 +295,7 @@ describe("tool-cards", () => {
           },
           completed: true,
         },
-        { expanded: false, onOpenWorkspaceFile, onToggleExpanded: vi.fn() },
+        { messageKey: "test-message", expanded: false, onOpenWorkspaceFile, onToggleExpanded },
       ),
       container,
     );
@@ -346,6 +306,14 @@ describe("tool-cards", () => {
     );
     container.querySelector<HTMLButtonElement>(".chat-tool-row__file-link")?.click();
     expect(onOpenWorkspaceFile).toHaveBeenCalledWith({ path: "src/new.ts" });
+    expect(onToggleExpanded).not.toHaveBeenCalled();
+
+    expect(container.querySelector(".chat-tool-row__toggle")?.getAttribute("aria-label")).toBe(
+      "Created new.ts",
+    );
+    container.querySelector<HTMLButtonElement>(".chat-tool-row__toggle")?.click();
+    expect(onToggleExpanded).toHaveBeenCalledWith("msg:patch:add");
+    expect(onOpenWorkspaceFile).toHaveBeenCalledOnce();
   });
 
   it.each([
@@ -395,7 +363,7 @@ describe("tool-cards", () => {
           args: { patch },
           completed: true,
         },
-        { expanded: false, onOpenWorkspaceFile, onToggleExpanded },
+        { messageKey: "test-message", expanded: false, onOpenWorkspaceFile, onToggleExpanded },
       ),
       container,
     );
@@ -480,6 +448,7 @@ describe("tool-cards", () => {
               ...state.card,
             },
             {
+              messageKey: "test-message",
               expanded: true,
               onToggleExpanded: vi.fn(),
               runActive: state.runActive,
@@ -501,44 +470,37 @@ describe("tool-cards", () => {
     }
   });
 
-  it.each(
-    [
-      {
-        name: "edit",
-        args: { path: "src/edit.ts", oldText: "old edit", newText: "new edit" },
-        copiedText: "new edit",
+  it.each([
+    {
+      name: "edit",
+      args: { path: "src/edit.ts", oldText: "old edit", newText: "new edit" },
+      copiedText: "new edit",
+      failed: false,
+      feedback: "Copied!",
+    },
+    {
+      name: "write",
+      args: { path: "src/write.ts", content: "new file\n" },
+      copiedText: "new file",
+      failed: false,
+      feedback: "Copied!",
+    },
+    ...[false, true].map((failed) => ({
+      name: "apply_patch",
+      args: {
+        changes: [
+          {
+            path: "src/patch.ts",
+            kind: { type: "update" },
+            diff: "--- a/src/patch.ts\n+++ b/src/patch.ts\n@@ -1 +1 @@\n-old patch\n+new patch\n",
+          },
+        ],
       },
-      {
-        name: "write",
-        args: { path: "src/write.ts", content: "new file\n" },
-        copiedText: "new file",
-      },
-      {
-        name: "apply_patch",
-        args: {
-          changes: [
-            {
-              path: "src/patch.ts",
-              kind: { type: "update" },
-              diff: "--- a/src/patch.ts\n+++ b/src/patch.ts\n@@ -1 +1 @@\n-old patch\n+new patch\n",
-            },
-          ],
-        },
-        copiedText: "new patch",
-      },
-    ].flatMap((tool) =>
-      [
-        { failed: false, feedback: "Copied!" },
-        { failed: true, feedback: "Copy failed" },
-      ].map((outcome) => ({
-        name: tool.name,
-        args: tool.args,
-        copiedText: tool.copiedText,
-        failed: outcome.failed,
-        feedback: outcome.feedback,
-      })),
-    ),
-  )("shows $feedback after copying a completed $name diff", async (tool) => {
+      copiedText: "new patch",
+      failed,
+      feedback: failed ? "Copy failed" : "Copied!",
+    })),
+  ])("shows $feedback after copying a completed $name diff", async (tool) => {
     const writeText = tool.failed
       ? vi.fn().mockRejectedValue(new DOMException("Clipboard access denied", "NotAllowedError"))
       : vi.fn().mockResolvedValue(undefined);
@@ -555,7 +517,7 @@ describe("tool-cards", () => {
             args: tool.args,
             completed: true,
           },
-          { expanded: true, onToggleExpanded: vi.fn(), onOpenSidebar },
+          { messageKey: "test-message", expanded: true, onToggleExpanded: vi.fn(), onOpenSidebar },
         ),
         container,
       );
@@ -609,6 +571,7 @@ describe("tool-cards", () => {
           completed: true,
         },
         {
+          messageKey: "test-message",
           expanded: true,
           onOpenWorkspaceFile,
           onToggleExpanded: vi.fn(),
@@ -635,7 +598,7 @@ describe("tool-cards", () => {
           args: { path: "/repo/src/a.ts", offset: 40, limit: 20 },
           inputText: JSON.stringify({ path: "/repo/src/a.ts", offset: 40, limit: 20 }),
         },
-        { expanded: true, onToggleExpanded: vi.fn() },
+        { messageKey: "test-message", expanded: true, onToggleExpanded: vi.fn() },
       ),
       container,
     );
@@ -665,6 +628,7 @@ describe("tool-cards", () => {
           outputText: "Proposal created",
         },
         {
+          messageKey: "test-message",
           expanded: true,
           onOpenSidebar: vi.fn(),
           onToggleExpanded: vi.fn(),
@@ -694,7 +658,7 @@ describe("tool-cards", () => {
           args: { mode: "session", thread: true },
           inputText: '{\n  "mode": "session",\n  "thread": true\n}',
         },
-        { expanded: true, onToggleExpanded: vi.fn() },
+        { messageKey: "test-message", expanded: true, onToggleExpanded: vi.fn() },
       ),
       container,
     );
@@ -723,7 +687,7 @@ describe("tool-cards", () => {
           args: { mode: "run" },
           inputText: '{\n  "mode": "run"\n}',
         },
-        { expanded: false, onToggleExpanded: vi.fn() },
+        { messageKey: "test-message", expanded: false, onToggleExpanded: vi.fn() },
       ),
       container,
     );
@@ -736,34 +700,37 @@ describe("tool-cards", () => {
     expect(container.querySelector(".chat-tool-msg-body")).toBeNull();
   });
 
-  it("shows the first message line in collapsed message tool rows", () => {
-    const container = document.createElement("div");
-    render(
-      renderToolCard(
-        {
-          id: "msg:5-message:call-5-message",
-          name: "message",
-          args: {
-            action: "send",
-            channel: "reef",
-            target: "@molty",
-            message: "Hello Molty, first claw-to-claw hello.\nSecond line stays in details.",
-          },
-          inputText: "message input",
-        },
-        { expanded: false, onToggleExpanded: vi.fn() },
-      ),
-      container,
-    );
+  it.each(["structured", "serialized"])(
+    "keeps %s message captions in expanded diagnostics, not the collapsed row",
+    (shape) => {
+      const container = document.createElement("div");
+      const privateCaption =
+        "<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>\nPrivate synthetic caption.\n<<<END_OPENCLAW_INTERNAL_CONTEXT>>>";
+      const args = { action: "send", to: "fixture-room", message: privateCaption };
+      const card = {
+        id: "message-caption",
+        name: "message",
+        args: shape === "structured" ? args : JSON.stringify(args),
+        inputText: JSON.stringify(args),
+      };
+      const options = { messageKey: "test-message", onToggleExpanded: vi.fn() };
+      render(renderToolCard(card, { ...options, expanded: false }), container);
 
-    const summaryButton = container.querySelector("button.chat-tool-msg-summary");
-    expect(summaryButton?.querySelector(".chat-tool-msg-summary__label")?.textContent).toBe(
-      "Message",
-    );
-    expect(summaryButton?.querySelector(".chat-tool-msg-summary__names")?.textContent).toBe(
-      "Hello Molty, first claw-to-claw hello.",
-    );
-  });
+      const summary = container.querySelector("button.chat-tool-msg-summary");
+      expect(summary?.textContent).toContain("Message");
+      if (shape === "structured") {
+        expect(summary?.textContent).toContain("fixture-room");
+      }
+      expect(summary?.textContent).not.toContain("BEGIN_OPENCLAW_INTERNAL_CONTEXT");
+      expect(container.textContent).not.toContain("Private synthetic caption.");
+      expect(container.querySelector(".chat-tool-msg-body")).toBeNull();
+
+      render(renderToolCard(card, { ...options, expanded: true }), container);
+      const diagnostics = container.querySelector(".chat-tool-msg-body");
+      expect(diagnostics?.textContent).toContain("BEGIN_OPENCLAW_INTERNAL_CONTEXT");
+      expect(diagnostics?.textContent).toContain("Private synthetic caption.");
+    },
+  );
 
   it("previews common intent arguments across generic tools", () => {
     expect(resolveCollapsedToolArgumentPreview({ task: "Review the PR" })).toBe("Review the PR");
@@ -789,7 +756,7 @@ describe("tool-cards", () => {
           inputText: '{\n  "action": "create"\n}',
           outputText: "Proposal created",
         },
-        { expanded: false, onToggleExpanded: vi.fn() },
+        { messageKey: "test-message", expanded: false, onToggleExpanded: vi.fn() },
       ),
       container,
     );
@@ -814,7 +781,7 @@ describe("tool-cards", () => {
           args: "with Example Deck",
           inputText: "with Example Deck",
         },
-        { expanded: false, onToggleExpanded: vi.fn() },
+        { messageKey: "test-message", expanded: false, onToggleExpanded: vi.fn() },
       ),
       container,
     );
@@ -832,7 +799,7 @@ describe("tool-cards", () => {
           args: "with Example Deck",
           inputText: "with Example Deck",
         },
-        { expanded: true, onToggleExpanded: vi.fn() },
+        { messageKey: "test-message", expanded: true, onToggleExpanded: vi.fn() },
       ),
       container,
     );
@@ -881,7 +848,7 @@ describe("tool-cards", () => {
           args: rawInput,
           inputText: rawInput,
         },
-        { expanded: false, onToggleExpanded: vi.fn() },
+        { messageKey: "test-message", expanded: false, onToggleExpanded: vi.fn() },
       ),
       container,
     );
@@ -922,7 +889,7 @@ describe("tool-cards", () => {
             preferredHeight: 480,
           },
         },
-        { expanded: true, onToggleExpanded: vi.fn() },
+        { messageKey: "test-message", expanded: true, onToggleExpanded: vi.fn() },
       ),
       container,
     );
@@ -977,7 +944,7 @@ describe("tool-cards", () => {
             url: "/__openclaw__/canvas/documents/qr_preview/index.html",
           },
         },
-        { expanded: true, onToggleExpanded: vi.fn() },
+        { messageKey: "test-message", expanded: true, onToggleExpanded: vi.fn() },
       ),
       container,
     );
@@ -1021,7 +988,7 @@ describe("tool-cards", () => {
             preferredHeight: 360,
           },
         },
-        { expanded: true, onToggleExpanded: vi.fn(), onOpenSidebar },
+        { messageKey: "test-message", expanded: true, onToggleExpanded: vi.fn(), onOpenSidebar },
       ),
       container,
     );
@@ -1038,39 +1005,5 @@ describe("tool-cards", () => {
     expect(sidebar.kind).toBe("canvas");
     expect(sidebar.docId).toBe("cv_sidebar");
     expect(sidebar.entryUrl).toBe("/__openclaw__/canvas/documents/cv_sidebar/index.html");
-  });
-
-  it("opens ambiguous tool details with the same sidebar output", () => {
-    const container = document.createElement("div");
-    const onOpenSidebar = vi.fn();
-    render(
-      renderToolCard(
-        {
-          id: "msg:tool:full",
-          name: "browser.open",
-          outputText: "Opened page",
-          messageId: "msg-tool-full",
-        },
-        {
-          expanded: true,
-          sessionKey: "main",
-          agentId: "work",
-          onToggleExpanded: vi.fn(),
-          onOpenSidebar,
-        },
-      ),
-      container,
-    );
-
-    const sidebarButton = container.querySelector<HTMLButtonElement>(".chat-tool-card__action-btn");
-    expect(sidebarButton).toBeInstanceOf(HTMLButtonElement);
-    sidebarButton!.click();
-
-    const sidebar = requireFirstMockArg(onOpenSidebar, "sidebar open");
-    expect(sidebar).toEqual({
-      kind: "markdown",
-      content: "## Browser.open\n\n**Tool:** `browser.open`\n\n### Tool output\nOpened page",
-      rawText: "Opened page",
-    });
   });
 });

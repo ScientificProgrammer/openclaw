@@ -1,4 +1,4 @@
-import fs from "node:fs";
+import type { DatabaseSync } from "node:sqlite";
 import { note } from "../../packages/terminal-core/src/note.js";
 import { INBOUND_CONTEXT_MARKER } from "../auto-reply/reply/inbound-context-marker.js";
 import type { TranscriptEvent } from "../config/sessions/session-accessor.js";
@@ -10,15 +10,14 @@ import { updateSqliteTranscriptEventJsonInTransaction } from "../config/sessions
 import { resolveAllAgentSessionStoreTargetsSync } from "../config/sessions/targets.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { formatErrorMessage } from "../infra/errors.js";
+import { openNodeSqliteDatabase } from "../infra/node-sqlite.js";
 import {
-  resolveOpenClawAgentSqlitePath,
-  runOpenClawAgentWriteTransaction,
-} from "../state/openclaw-agent-db.js";
-import { resolveTargetSqliteOptions } from "./doctor-session-sqlite-readers.js";
-import {
-  readOnlySqliteTranscriptSessionIds,
-  readOnlySqliteTranscriptRepairSnapshot,
-} from "./doctor-session-sqlite-transcript-readers.js";
+  projectExistingAgentDatabaseTargets,
+  resolveTargetSqliteOptions,
+} from "../infra/session-sqlite-migration-readers.js";
+import { runOpenClawAgentWriteTransaction } from "../state/openclaw-agent-db.js";
+import { ReadOnlySqliteTranscriptReader } from "./doctor-session-sqlite-transcript-readers.js";
+import { countLabel } from "./doctor-state-integrity-format.js";
 
 const NOTE_TITLE = "Session transcript labels";
 
@@ -50,7 +49,21 @@ const LEGACY_LEADING_TIMESTAMP_PREFIX_RE = /^\[[A-Za-z]{3} \d{4}-\d{2}-\d{2} \d{
 //   "Chat history since last reply" (805).
 // CHAT WINDOW: `${label} (untrusted, <order>, <relation>):` (338-360).
 
+function mayContainLegacyInboundContextLabels(eventJson: string): boolean {
+  // Every frozen rewrite requires one of these decoded spellings. Unicode escapes
+  // can conceal either spelling, so those rows still use the canonical JSON decoder.
+  return (
+    eventJson.includes("untrusted") || eventJson.includes("Untrusted") || eventJson.includes("\\u")
+  );
+}
+
 function applyLegacyInboundLabelRewrites(text: string): string {
+  // Every legacy rule contains one of these spellings. Check decoded content so
+  // Unicode-escaped labels still reach their rewrite.
+  if (!text.includes("untrusted") && !text.includes("Untrusted")) {
+    return text;
+  }
+
   // Peel the timestamp envelope so the anchored (`^`) rules see the first header at column 0, exactly
   // as the runtime stripper does. Without this, "[Wed …] Conversation info (…):" stays unmarked and the
   // marker-only strippers expose its JSON. Reattached verbatim below.
@@ -177,10 +190,6 @@ function snapshotsMatch(
   );
 }
 
-function formatCount(count: number, singular: string): string {
-  return `${count} ${singular}${count === 1 ? "" : "s"}`;
-}
-
 /** Reports or repairs legacy inbound-context labels in canonical SQLite transcripts. */
 export async function noteSessionTranscriptLabelHealth(params: {
   cfg: OpenClawConfig;
@@ -193,27 +202,27 @@ export async function noteSessionTranscriptLabelHealth(params: {
   let repairedSessions = 0;
   let repairedEvents = 0;
 
-  const seenPaths = new Set<string>();
-  for (const target of resolveAllAgentSessionStoreTargetsSync(params.cfg, { env })) {
+  for (const target of projectExistingAgentDatabaseTargets(
+    resolveAllAgentSessionStoreTargetsSync(params.cfg, { env }),
+    env,
+    params.cfg,
+  )) {
     const databaseOptions = resolveTargetSqliteOptions(target, env);
-    const sqlitePath = resolveOpenClawAgentSqlitePath(databaseOptions);
-    if (seenPaths.has(sqlitePath) || !fs.existsSync(sqlitePath)) {
-      continue;
-    }
-    seenPaths.add(sqlitePath);
+    const sqlitePath = target.sqlitePath;
     const { agentId } = target;
 
+    let readDatabase: DatabaseSync | undefined;
     try {
+      readDatabase = openNodeSqliteDatabase(sqlitePath, { readOnly: true });
+      const reader = new ReadOnlySqliteTranscriptReader(readDatabase);
       // Detect read-only, then repair each session in its own transaction as it is found, so a large
       // store never buffers every plan at once. Enumerate from transcript_events, not sessions: the
       // latter gained its columns post-ship and is not safe to assume on old databases.
-      const sessionIds = readOnlySqliteTranscriptSessionIds(sqlitePath);
-      for (const sessionId of sessionIds) {
-        // Read transcript in read-only mode (detection phase).
-        const readResult = readOnlySqliteTranscriptRepairSnapshot(
-          sqlitePath,
+      for (const sessionId of reader.sessionIds()) {
+        const readResult = reader.repairSnapshot(
           sessionId,
           normalizeLegacyInboundContextLabels,
+          mayContainLegacyInboundContextLabels,
         );
         if (!readResult.ok) {
           const detail = formatErrorMessage(readResult.error).replace(/\s+/g, " ").trim();
@@ -249,7 +258,6 @@ export async function noteSessionTranscriptLabelHealth(params: {
         foundSessions += 1;
         foundEvents += updates.length;
 
-        // REPAIR PHASE (if --fix): process immediately, don't buffer.
         if (params.shouldRepair) {
           try {
             if (hasMalformedRow) {
@@ -257,7 +265,6 @@ export async function noteSessionTranscriptLabelHealth(params: {
             }
             runOpenClawAgentWriteTransaction(
               (writeDatabase) => {
-                // Use rows-only guard (tolerant of malformed JSON in sibling rows).
                 const currentRows = readTranscriptEventRows(writeDatabase, sessionId);
                 if (!snapshotsMatch(readResult.rows, currentRows)) {
                   throw new Error(`transcript changed while preparing rewrite for ${sessionId}`);
@@ -285,18 +292,20 @@ export async function noteSessionTranscriptLabelHealth(params: {
         `- Failed to inspect or rewrite labels for ${agentId} (${sqlitePath}): ${detail}`,
         NOTE_TITLE,
       );
+    } finally {
+      readDatabase?.close();
     }
   }
 
   if (params.shouldRepair && repairedSessions > 0) {
     note(
-      `- Rewrote legacy inbound-context labels in ${formatCount(repairedSessions, "session")} (${formatCount(repairedEvents, "event")}).`,
+      `- Rewrote legacy inbound-context labels in ${countLabel(repairedSessions, "session")} (${countLabel(repairedEvents, "event")}).`,
       NOTE_TITLE,
     );
   } else if (!params.shouldRepair && foundEvents > 0) {
     note(
       [
-        `- Found ${formatCount(foundSessions, "session")} with legacy inbound-context labels.`,
+        `- Found ${countLabel(foundSessions, "session")} with legacy inbound-context labels.`,
         '- Run "openclaw doctor --fix" to rewrite them.',
       ].join("\n"),
       NOTE_TITLE,

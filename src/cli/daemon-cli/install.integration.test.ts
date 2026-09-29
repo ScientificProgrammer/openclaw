@@ -3,7 +3,7 @@ import { spawnSync } from "node:child_process";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { buildServiceEnvironment } from "../../daemon/service-env.js";
 import type {
   GatewayServiceCommandConfig,
@@ -12,9 +12,13 @@ import type {
 import {
   buildSystemdManagerPropertyOutput,
   buildSystemdUnitPropertyOutput,
+  mockSystemAccountHome,
 } from "../../daemon/service.test-helpers.js";
+import { buildSystemdUnit, parseSystemdExecStart } from "../../daemon/systemd-unit.js";
+import { systemdManagerVersionProbe } from "../../daemon/systemd-user-bus.test-support.js";
 import { makeTempWorkspace } from "../../test-helpers/workspace.js";
-import { captureEnv } from "../../test-utils/env.js";
+import { captureEnv, withEnvAsync } from "../../test-utils/env.js";
+import { resolveTestNodeExecPath } from "../../test-utils/node-process.js";
 import { createCliRuntimeCapture } from "../test-runtime-capture.js";
 
 const { runtimeLogs, runtimeErrors, defaultRuntime, resetRuntimeCapture } =
@@ -55,12 +59,6 @@ const serviceMock = vi.hoisted(() => ({
   readRuntime: vi.fn(async () => ({ status: "stopped" as const })),
 }));
 
-vi.mock("../../config/paths.js", async () => {
-  const actual =
-    await vi.importActual<typeof import("../../config/paths.js")>("../../config/paths.js");
-  return { ...actual, isDefaultInstallIdentity: () => true };
-});
-
 vi.mock("../../daemon/service.js", () => ({
   resolveGatewayService: () => serviceMock,
 }));
@@ -69,7 +67,13 @@ vi.mock("../../runtime.js", () => ({
   defaultRuntime,
 }));
 
-const { mergeInstallInvocationEnv, runDaemonInstall } = await import("./install.js");
+const daemonExec = await import("../../daemon/exec-file.js");
+const { runDaemonInstall } = await import("./install.js");
+const { buildLaunchAgentPlist, readLaunchAgentProgramArgumentsFromFile } =
+  await import("../../daemon/launchd-plist.js");
+const { decodeLaunchAgentPlistFixture } =
+  await import("../../daemon/launchd-plist.test-support.js");
+const processExec = await import("../../process/exec.js");
 const { clearConfigCache, clearRuntimeConfigSnapshot, readConfigFileSnapshot } =
   await import("../../config/config.js");
 const { readSystemdDefinitionMutationCapability } =
@@ -103,8 +107,14 @@ async function createInstalledServiceCommand() {
 
 describe("runDaemonInstall integration", () => {
   let envSnapshot: ReturnType<typeof captureEnv>;
+  let accountHome: string;
   let tempHome: string;
   let configPath: string;
+
+  async function writeConfig(config: unknown, indent?: number) {
+    await fs.writeFile(configPath, JSON.stringify(config, null, indent));
+    clearConfigCache();
+  }
 
   async function snapshotConfig() {
     const contents = await fs.readFile(configPath);
@@ -115,64 +125,261 @@ describe("runDaemonInstall integration", () => {
   beforeAll(async () => {
     envSnapshot = captureEnv([
       "HOME",
+      "DBUS_SESSION_BUS_ADDRESS",
       "OPENCLAW_STATE_DIR",
       "OPENCLAW_CONFIG_PATH",
       "OPENCLAW_GATEWAY_TOKEN",
       "OPENCLAW_GATEWAY_PASSWORD",
     ]);
-    tempHome = await makeTempWorkspace("openclaw-daemon-install-int-");
+    accountHome = await makeTempWorkspace("openclaw-daemon-install-int-");
+    tempHome = path.join(accountHome, ".openclaw");
+    await fs.mkdir(tempHome);
     configPath = path.join(tempHome, "openclaw.json");
-    process.env.HOME = tempHome;
+    process.env.HOME = accountHome;
+    process.env.DBUS_SESSION_BUS_ADDRESS = `unix:path=${path.join(accountHome, "bus")}`;
     process.env.OPENCLAW_STATE_DIR = tempHome;
     process.env.OPENCLAW_CONFIG_PATH = configPath;
   });
 
   afterAll(async () => {
     envSnapshot.restore();
-    await fs.rm(tempHome, { recursive: true, force: true });
+    await fs.rm(accountHome, { recursive: true, force: true });
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
   });
 
   beforeEach(async () => {
     vi.clearAllMocks();
+    mockSystemAccountHome();
+    vi.spyOn(daemonExec, "execFileUtf8").mockImplementation(systemdManagerVersionProbe);
     resetRuntimeCapture();
     clearRuntimeConfigSnapshot();
     // Keep these defined-but-empty so dotenv won't repopulate from local .env.
     process.env.OPENCLAW_GATEWAY_TOKEN = "";
     process.env.OPENCLAW_GATEWAY_PASSWORD = "";
     serviceMock.isLoaded.mockResolvedValue(false);
+    serviceMock.install.mockReset();
+    serviceMock.install.mockResolvedValue(undefined);
+    serviceMock.readDefinitionMutationCapability.mockReset();
     serviceMock.readDefinitionMutationCapability.mockResolvedValue({ kind: "writable" });
     serviceMock.readCommand.mockReset();
     serviceMock.readCommand.mockResolvedValue(null);
-    await fs.writeFile(configPath, JSON.stringify({}, null, 2));
-    clearConfigCache();
+    await writeConfig({}, 2);
+  });
+
+  it.each(
+    (
+      [
+        { platform: "darwin", force: false },
+        { platform: "linux", force: false },
+        { platform: "darwin", force: true },
+        { platform: "linux", force: true },
+      ] as const
+    ).flatMap(({ platform, force }) =>
+      ["unsupported", "broken-decoder", "unsafe-sqlite", "missing", "non-executable"].map(
+        (condition) => ({
+          platform,
+          force,
+          condition,
+        }),
+      ),
+    ),
+  )(
+    "repairs $condition Node in the $platform definition (force=$force)",
+    async ({ platform, force, condition }) => {
+      const execPathDescriptor = Object.getOwnPropertyDescriptor(process, "execPath")!;
+      const testNodeExecPath = resolveTestNodeExecPath();
+      vi.spyOn(process, "platform", "get").mockReturnValue(platform);
+      if (process.versions.bun) {
+        Object.defineProperty(process, "execPath", {
+          value: testNodeExecPath,
+          configurable: true,
+        });
+      }
+      const entry = path.join(tempHome, "dist", "index.js");
+      await fs.mkdir(path.dirname(entry), { recursive: true });
+      await fs.writeFile(entry, "");
+      const originalArgv = process.argv;
+      const oldNode = path.join(
+        accountHome,
+        `.hermes-${condition}-${platform}-${force}`,
+        "node",
+        "bin",
+        "node",
+      );
+      if (condition === "non-executable") {
+        await fs.mkdir(path.dirname(oldNode), { recursive: true });
+        await fs.writeFile(oldNode, "not executable\n", { mode: 0o600 });
+      }
+      const definitionPath = path.join(
+        tempHome,
+        platform === "darwin" ? "gateway.plist" : "gateway.service",
+      );
+      const render = (programArguments: string[]) =>
+        platform === "darwin"
+          ? buildLaunchAgentPlist({
+              label: "ai.openclaw.gateway",
+              programArguments,
+              stdoutPath: path.join(tempHome, "stdout.log"),
+              stderrPath: path.join(tempHome, "stderr.log"),
+            })
+          : buildSystemdUnit({ programArguments });
+      const runExec = processExec.runExec;
+      vi.spyOn(processExec, "runExec").mockImplementation(async (file, args, options) => {
+        if (
+          file === oldNode &&
+          ["unsupported", "broken-decoder", "unsafe-sqlite"].includes(condition)
+        ) {
+          const sqliteVersion = condition === "unsafe-sqlite" ? "3.51.0" : "3.53.4";
+          return {
+            stdout: JSON.stringify({
+              nodeVersion: condition === "unsupported" ? "22.23.1" : "26.8.1",
+              sqliteVersion,
+              sqliteProbe: {
+                available: true,
+                version: sqliteVersion,
+                text: condition !== "broken-decoder",
+                blob: true,
+                json: true,
+              },
+            }),
+            stderr: "",
+          };
+        }
+        if (file === "/usr/bin/plutil") {
+          if (typeof options === "number" || !options?.input) {
+            throw new Error("Missing plist fixture input");
+          }
+          return decodeLaunchAgentPlistFixture(options.input, args[1]);
+        }
+        return runExec(file, args, options);
+      });
+      const readDefinition = async (): Promise<GatewayServiceCommandConfig | null> => {
+        if (platform === "darwin") {
+          return readLaunchAgentProgramArgumentsFromFile(definitionPath, {
+            requireEffective: true,
+          });
+        }
+        const unit = await fs.readFile(definitionPath, "utf8");
+        const execStart = unit.split("\n").find((line) => line.startsWith("ExecStart="));
+        if (!execStart) {
+          throw new Error("Missing systemd command");
+        }
+        return {
+          programArguments: parseSystemdExecStart(execStart.slice("ExecStart=".length)),
+          sourcePath: definitionPath,
+        };
+      };
+      await fs.writeFile(definitionPath, render([oldNode, entry, "gateway"]));
+      serviceMock.isLoaded.mockResolvedValue(true);
+      serviceMock.readCommand.mockImplementation(readDefinition);
+      serviceMock.install.mockImplementationOnce(async (plan) => {
+        if (!plan) {
+          throw new Error("Missing install plan");
+        }
+        await fs.writeFile(definitionPath, render(plan.programArguments));
+      });
+      try {
+        process.argv = [process.execPath, entry];
+        await runDaemonInstall({ json: true, force });
+        expect(serviceMock.install).toHaveBeenCalledOnce();
+        const repaired = await readDefinition();
+        const nodePath = repaired?.programArguments[0];
+        if (!nodePath) {
+          throw new Error("Missing repaired runtime");
+        }
+        expect(await fs.realpath(nodePath)).toBe(await fs.realpath(testNodeExecPath));
+        expect(repaired?.programArguments).toContain(entry);
+        expect(await fs.readFile(definitionPath, "utf8")).not.toContain(oldNode);
+        expect(runtimeLogs.join("\n")).toContain(
+          condition === "unsupported"
+            ? "Replacing unsupported Gateway service Node 22.23.1"
+            : condition === "broken-decoder" || condition === "unsafe-sqlite"
+              ? "Replacing unsupported Gateway service Node 26.8.1"
+              : `Replacing missing Gateway service Node (${oldNode})`,
+        );
+        if (condition === "broken-decoder") {
+          expect(runtimeLogs.join("\n")).toContain("node:sqlite truncates TEXT at embedded NUL");
+        }
+      } finally {
+        process.argv = originalArgv;
+        if (process.versions.bun) {
+          Object.defineProperty(process, "execPath", execPathDescriptor);
+        }
+      }
+    },
+  );
+
+  it.each([
+    { mode: "Nix before external supervision", reason: "Nix mode detected" },
+    { mode: "external supervision", reason: "managed by an external supervisor" },
+    { mode: "relocated home", reason: "non-default state dir or config path" },
+    { mode: "sudo user manager", reason: "Refusing a sudo-to-root" },
+  ])("preserves config and skips native inspection for $mode", async ({ mode, reason }) => {
+    // Keep the synthetic account fixed when the invocation relocates HOME.
+    // Following that override would erase the ownership mismatch being tested.
+    const account = os.userInfo();
+    vi.spyOn(os, "homedir").mockReturnValue(accountHome);
+    vi.spyOn(os, "userInfo").mockReturnValue({ ...account, homedir: accountHome });
+    if (mode === "sudo user manager") {
+      vi.spyOn(process, "platform", "get").mockReturnValue("linux");
+      vi.spyOn(os, "userInfo").mockReturnValue({
+        ...account,
+        username: "root",
+        homedir: accountHome,
+      });
+      if (process.geteuid) {
+        vi.spyOn(process, "geteuid").mockReturnValue(0);
+      }
+    }
+    const before = await snapshotConfig();
+    await withEnvAsync(
+      {
+        OPENCLAW_HOME: undefined,
+        OPENCLAW_PROFILE: undefined,
+        OPENCLAW_LAUNCHD_LABEL: undefined,
+        OPENCLAW_SYSTEMD_UNIT: undefined,
+        OPENCLAW_WINDOWS_TASK_NAME: undefined,
+        OPENCLAW_NIX_MODE: mode.startsWith("Nix") ? "1" : undefined,
+        OPENCLAW_SUPERVISOR_MODE: mode.includes("supervision") ? " ExTeRnAl " : undefined,
+        HOME: mode === "relocated home" ? path.join(accountHome, "relocated") : accountHome,
+        SUDO_USER: mode === "sudo user manager" ? "service-fixture" : undefined,
+      },
+      async () => {
+        await expect(runDaemonInstall({ json: true })).rejects.toThrow("__exit__:1");
+        expect(runtimeLogs.join("\n")).toContain(reason);
+        expect(serviceMock.isLoaded).not.toHaveBeenCalled();
+        expect(serviceMock.readCommand).not.toHaveBeenCalled();
+        expect(serviceMock.readDefinitionMutationCapability).not.toHaveBeenCalled();
+        expect(serviceMock.install).not.toHaveBeenCalled();
+        expect(await snapshotConfig()).toEqual(before);
+      },
+    );
   });
 
   it("fails closed when token SecretRef is required but unresolved", async () => {
-    await fs.writeFile(
-      configPath,
-      JSON.stringify(
-        {
-          secrets: {
-            providers: {
-              default: { source: "env" },
-            },
+    await writeConfig(
+      {
+        secrets: {
+          providers: {
+            default: { source: "env" },
           },
-          gateway: {
-            auth: {
-              mode: "token",
-              token: {
-                source: "env",
-                provider: "default",
-                id: "MISSING_GATEWAY_TOKEN",
-              },
+        },
+        gateway: {
+          auth: {
+            mode: "token",
+            token: {
+              source: "env",
+              provider: "default",
+              id: "MISSING_GATEWAY_TOKEN",
             },
           },
         },
-        null,
-        2,
-      ),
+      },
+      2,
     );
-    clearConfigCache();
 
     await expect(runDaemonInstall({ json: true })).rejects.toThrow("__exit__:1");
     expect(serviceMock.install).not.toHaveBeenCalled();
@@ -198,8 +405,7 @@ describe("runDaemonInstall integration", () => {
       };
       await fs.mkdir(ancestor);
       await fs.chmod(ancestor, 0o777);
-      await fs.writeFile(configPath, JSON.stringify(config));
-      clearConfigCache();
+      await writeConfig(config);
       busctl.mockResolvedValue({
         code: 1,
         termination: "exit",
@@ -244,17 +450,44 @@ describe("runDaemonInstall integration", () => {
     },
   );
 
+  it("names an unreadable Linux unit without changing config or replacing it", async () => {
+    const unit = path.join(accountHome, ".config/systemd/user/openclaw-gateway.service");
+    const readFile = fs.readFile.bind(fs);
+    vi.spyOn(fs, "readFile").mockImplementation(async (...args) => {
+      if (args[0] === unit) {
+        throw Object.assign(new Error("private-native-error-canary"), { code: "EACCES" });
+      }
+      return readFile(...args);
+    });
+    serviceMock.readCommand.mockImplementation(readSystemdServiceExecStart);
+    serviceMock.isLoaded.mockRejectedValue(new Error("Failed to get unit file state"));
+    const before = await snapshotConfig();
+    await expect(runDaemonInstall({ json: true, force: true })).rejects.toThrow("__exit__:1");
+    const output = runtimeLogs.join("\n");
+    expect(output).toContain(JSON.stringify(unit).slice(1, -1));
+    expect(output).toContain("unreadable");
+    expect(output).not.toContain("private-native-error-canary");
+    expect(await snapshotConfig()).toEqual(before);
+    expect(serviceMock.install).not.toHaveBeenCalled();
+    expect(serviceMock.isLoaded).not.toHaveBeenCalled();
+  });
+
   it.each(["fragment", "drop-in"])(
     "blocks a root-owned manager %s before config or token writes",
     async (kind) => {
       const fixture = await fs.realpath(await fs.mkdtemp(path.join(tempHome, "manager-owner-")));
       const unitPath = path.join(fixture, ".config/systemd/user/openclaw-gateway.service");
       const extra = path.join(fixture, "global-user", "operator.conf");
-      await fs.mkdir(path.dirname(unitPath), { recursive: true });
-      await fs.mkdir(path.dirname(extra));
-      await fs.writeFile(extra, "[Service]\nEnvironment=TOKEN=operator-secret-canary\n");
+      // Reach the foreign-owner check even when the test process has a permissive umask.
+      await fs.mkdir(path.dirname(unitPath), { recursive: true, mode: 0o700 });
+      await fs.mkdir(path.dirname(extra), { mode: 0o700 });
+      await fs.writeFile(extra, "[Service]\nEnvironment=TOKEN=operator-secret-canary\n", {
+        mode: 0o600,
+      });
       if (kind === "drop-in") {
-        await fs.writeFile(unitPath, "[Service]\nExecStart=/usr/bin/node gateway\n");
+        await fs.writeFile(unitPath, "[Service]\nExecStart=/usr/bin/node gateway\n", {
+          mode: 0o600,
+        });
       }
       const originalLstat = fs.lstat.bind(fs);
       const lstat = vi.spyOn(fs, "lstat").mockImplementation(async (...args) => {
@@ -303,25 +536,27 @@ describe("runDaemonInstall integration", () => {
 
   it("checks the planned generated environment after a drop-in redirects effective state", async () => {
     const fixture = await fs.realpath(await fs.mkdtemp(path.join(tempHome, "planned-owner-")));
-    const plannedState = path.join(fixture, "planned");
+    const plannedState = path.join(fixture, ".openclaw");
     const effectiveState = path.join(fixture, "effective");
     const unit = path.join(fixture, ".config/systemd/user/openclaw-gateway.service");
     const dropIn = `${unit}.d/override.conf`;
     const plannedFile = path.join(plannedState, "gateway.systemd.env");
     const effectiveFile = path.join(effectiveState, "gateway.systemd.env");
-    const invocation = captureEnv(["HOME", "OPENCLAW_STATE_DIR"]);
-    await fs.mkdir(path.dirname(dropIn), { recursive: true });
-    await fs.mkdir(plannedState);
-    await fs.mkdir(effectiveState);
-    await fs.writeFile(plannedFile, "OPERATOR_VALUE=planned\n");
-    await fs.writeFile(effectiveFile, "OPERATOR_VALUE=effective\n");
+    const invocation = captureEnv(["HOME", "OPENCLAW_STATE_DIR", "OPENCLAW_CONFIG_PATH"]);
+    await fs.mkdir(path.dirname(dropIn), { recursive: true, mode: 0o700 });
+    await fs.mkdir(plannedState, { mode: 0o700 });
+    await fs.mkdir(effectiveState, { mode: 0o700 });
+    await fs.writeFile(plannedFile, "OPERATOR_VALUE=planned\n", { mode: 0o600 });
+    await fs.writeFile(effectiveFile, "OPERATOR_VALUE=effective\n", { mode: 0o600 });
     await fs.writeFile(
       unit,
       `[Service]\nExecStart=/usr/bin/node gateway\nEnvironment=OPENCLAW_STATE_DIR=${plannedState}\nEnvironmentFile=${plannedFile}\n`,
+      { mode: 0o600 },
     );
     await fs.writeFile(
       dropIn,
       `[Service]\nEnvironment=OPENCLAW_STATE_DIR=${effectiveState}\nEnvironmentFile=\nEnvironmentFile=${effectiveFile}\n`,
+      { mode: 0o600 },
     );
     await fs.writeFile(
       configPath,
@@ -329,6 +564,7 @@ describe("runDaemonInstall integration", () => {
     );
     process.env.HOME = fixture;
     process.env.OPENCLAW_STATE_DIR = plannedState;
+    process.env.OPENCLAW_CONFIG_PATH = path.join(plannedState, "openclaw.json");
     clearConfigCache();
     const lstat = fs.lstat.bind(fs);
     const owner = vi.spyOn(fs, "lstat").mockImplementation(async (...args) => {
@@ -385,24 +621,19 @@ describe("runDaemonInstall integration", () => {
   });
 
   it("refuses service install when config was written by a newer OpenClaw", async () => {
-    await fs.writeFile(
-      configPath,
-      JSON.stringify(
-        {
-          meta: {
-            lastTouchedVersion: "9999.1.1",
-          },
-          gateway: {
-            auth: {
-              mode: "token",
-            },
+    await writeConfig(
+      {
+        meta: {
+          lastTouchedVersion: "9999.1.1",
+        },
+        gateway: {
+          auth: {
+            mode: "token",
           },
         },
-        null,
-        2,
-      ),
+      },
+      2,
     );
-    clearConfigCache();
 
     await expect(runDaemonInstall({ json: true, force: true })).rejects.toThrow("__exit__:1");
 
@@ -432,8 +663,7 @@ describe("runDaemonInstall integration", () => {
   ])(
     "preserves config bytes and directory entries when definition access is refused and $name",
     async ({ capability, config, marker }) => {
-      await fs.writeFile(configPath, JSON.stringify(config, null, 2));
-      clearConfigCache();
+      await writeConfig(config, 2);
       serviceMock.readDefinitionMutationCapability.mockResolvedValueOnce(capability);
       const before = await snapshotConfig();
 
@@ -457,8 +687,7 @@ describe("runDaemonInstall integration", () => {
     "preserves config, token, and state when $name cannot inspect its command",
     async ({ loaded, force }) => {
       const secret = "service-command-inspection-secret-canary";
-      await fs.writeFile(configPath, JSON.stringify({ gateway: { auth: { mode: "token" } } }));
-      clearConfigCache();
+      await writeConfig({ gateway: { auth: { mode: "token" } } });
       serviceMock.isLoaded.mockResolvedValue(loaded);
       serviceMock.readCommand.mockRejectedValueOnce(new Error(secret));
       const before = await snapshotConfig();
@@ -476,28 +705,57 @@ describe("runDaemonInstall integration", () => {
     },
   );
 
-  it("keeps an already-installed service read-only without probing definition authority", async () => {
-    await fs.writeFile(
-      configPath,
-      JSON.stringify({ gateway: { mode: "local", auth: { mode: "token", token: "existing" } } }),
-    );
-    clearConfigCache();
-    serviceMock.isLoaded.mockResolvedValue(true);
-    serviceMock.readCommand.mockResolvedValue(await createInstalledServiceCommand());
-    const before = await snapshotConfig();
+  it.each([undefined, "26.8.1", "24.15.0"])(
+    "keeps an already-installed service read-only with Node %s",
+    async (nodeVersion) => {
+      await fs.writeFile(
+        configPath,
+        JSON.stringify({ gateway: { mode: "local", auth: { mode: "token", token: "existing" } } }),
+      );
+      clearConfigCache();
+      serviceMock.isLoaded.mockResolvedValue(true);
+      const command = await createInstalledServiceCommand();
+      if (nodeVersion) {
+        const nodePath = "/opt/vendor/bin/node";
+        command.programArguments[0] = nodePath;
+        const runExec = processExec.runExec;
+        vi.spyOn(processExec, "runExec").mockImplementation(async (file, args, options) =>
+          file === nodePath
+            ? {
+                stdout: JSON.stringify({
+                  nodeVersion,
+                  sqliteVersion: "3.53.4",
+                  sqliteProbe: {
+                    available: true,
+                    version: "3.53.4",
+                    text: true,
+                    blob: true,
+                    json: true,
+                  },
+                }),
+                stderr: "",
+              }
+            : runExec(file, args, options),
+        );
+      }
+      serviceMock.readCommand.mockResolvedValue(command);
+      const before = await snapshotConfig();
 
-    await runDaemonInstall({ json: true });
+      await runDaemonInstall({ json: true });
 
-    expect(runtimeLogs.join("\n")).toContain('"result": "already-installed"');
-    expect(serviceMock.readDefinitionMutationCapability).not.toHaveBeenCalled();
-    expect(serviceMock.install).not.toHaveBeenCalled();
-    expect(await snapshotConfig()).toEqual(before);
-  });
+      expect(runtimeLogs.join("\n")).toContain('"result": "already-installed"');
+      expect(serviceMock.readDefinitionMutationCapability).not.toHaveBeenCalled();
+      expect(serviceMock.install).not.toHaveBeenCalled();
+      expect(await snapshotConfig()).toEqual(before);
+      if (nodeVersion === "24.15.0") {
+        expect(runtimeLogs.join("\n")).toContain("unsupported version, capability probe passed");
+      }
+    },
+  );
 
   it("repairs missing gateway mode for a loaded sealed service without rewriting its definition", async () => {
     const config = { gateway: { auth: { mode: "token", token: "existing-token" } } };
-    await fs.writeFile(configPath, JSON.stringify(config));
-    clearConfigCache();
+    await writeConfig(config);
     serviceMock.isLoaded.mockResolvedValue(true);
     serviceMock.readDefinitionMutationCapability.mockResolvedValue({
       kind: "sealed",
@@ -514,11 +772,7 @@ describe("runDaemonInstall integration", () => {
   });
 
   it("refuses loaded-service auto-refresh before persisting missing gateway defaults", async () => {
-    await fs.writeFile(
-      configPath,
-      JSON.stringify({ gateway: { auth: { mode: "token", token: "existing-token" } } }),
-    );
-    clearConfigCache();
+    await writeConfig({ gateway: { auth: { mode: "token", token: "existing-token" } } });
     serviceMock.isLoaded.mockResolvedValue(true);
     serviceMock.readCommand.mockResolvedValue({
       programArguments: ["openclaw", "gateway", "run"],
@@ -539,8 +793,7 @@ describe("runDaemonInstall integration", () => {
 
   it("refuses a loaded service's sealed effective state before persisting config or a token", async () => {
     const effectiveStateDir = path.join(tempHome, "sealed-service-state");
-    await fs.writeFile(configPath, JSON.stringify({ gateway: { auth: { mode: "token" } } }));
-    clearConfigCache();
+    await writeConfig({ gateway: { auth: { mode: "token" } } });
     serviceMock.isLoaded.mockResolvedValue(true);
     serviceMock.readCommand.mockResolvedValue({
       programArguments: ["openclaw", "gateway", "run"],
@@ -572,8 +825,12 @@ describe("runDaemonInstall integration", () => {
     { name: "uninspectable definition", kind: "unknown", force: true },
     { name: "rejected definition inspection", kind: "rejected", force: false },
   ])("leaves absent config and state untouched for $name", async ({ kind, force }) => {
-    const stateDir = await fs.mkdtemp(path.join(tempHome, "sealed-install-"));
+    const isolatedHome = await fs.mkdtemp(path.join(tempHome, "sealed-install-"));
+    const stateDir = path.join(isolatedHome, ".openclaw");
+    await fs.mkdir(stateDir);
     const missingConfigPath = path.join(stateDir, "openclaw.json");
+    const originalHome = process.env.HOME;
+    process.env.HOME = isolatedHome;
     const originalStateDir = process.env.OPENCLAW_STATE_DIR;
     const originalConfigPath = process.env.OPENCLAW_CONFIG_PATH;
     const secret = "direct-install-capability-secret-canary";
@@ -602,29 +859,25 @@ describe("runDaemonInstall integration", () => {
       );
       expect(runtimeLogs.join("\n")).not.toContain(secret);
     } finally {
+      process.env.HOME = originalHome;
       process.env.OPENCLAW_STATE_DIR = originalStateDir;
       process.env.OPENCLAW_CONFIG_PATH = originalConfigPath;
       clearConfigCache();
-      await fs.rm(stateDir, { recursive: true, force: true });
+      await fs.rm(isolatedHome, { recursive: true, force: true });
     }
   });
 
   it("auto-mints token when no source exists without embedding it into service env", async () => {
-    await fs.writeFile(
-      configPath,
-      JSON.stringify(
-        {
-          gateway: {
-            auth: {
-              mode: "token",
-            },
+    await writeConfig(
+      {
+        gateway: {
+          auth: {
+            mode: "token",
           },
         },
-        null,
-        2,
-      ),
+      },
+      2,
     );
-    clearConfigCache();
     serviceMock.isLoaded.mockResolvedValueOnce(false).mockResolvedValueOnce(true);
 
     await runDaemonInstall({ json: true });
@@ -640,11 +893,7 @@ describe("runDaemonInstall integration", () => {
   });
 
   it("logs a generated-token warning without callback indexes or warning arrays", async () => {
-    await fs.writeFile(
-      configPath,
-      JSON.stringify({ gateway: { mode: "local", auth: { mode: "token" } } }),
-    );
-    clearConfigCache();
+    await writeConfig({ gateway: { mode: "local", auth: { mode: "token" } } });
     serviceMock.isLoaded.mockResolvedValueOnce(false).mockResolvedValueOnce(true);
 
     await runDaemonInstall({});
@@ -766,7 +1015,7 @@ describe("runDaemonInstall integration", () => {
         if (testCase.name === "operator heap cap") {
           const measure = (flags: string[]) => {
             const child = spawnSync(
-              process.execPath,
+              resolveTestNodeExecPath(),
               [
                 ...flags,
                 "-e",
@@ -784,82 +1033,6 @@ describe("runDaemonInstall integration", () => {
         physical.mockRestore();
         constrained.mockRestore();
       }
-    },
-  );
-});
-
-describe("mergeInstallInvocationEnv", () => {
-  it("canonicalizes Windows install env keys while filtering dangerous loader env", () => {
-    const env = mergeInstallInvocationEnv({
-      env: {
-        Path: "C:\\Windows\\System32",
-        openai_api_key: "service-openai-key",
-        NODE_OPTIONS: "--require C:\\temp\\untrusted.js",
-      },
-      platform: "win32",
-    });
-
-    expect(env).toMatchObject({
-      PATH: "C:\\Windows\\System32",
-      OPENAI_API_KEY: "service-openai-key",
-    });
-    expect(env.Path).toBeUndefined();
-    expect(env.openai_api_key).toBeUndefined();
-    expect(env.NODE_OPTIONS).toBeUndefined();
-  });
-
-  it.each([
-    { platform: "darwin" as const, caKey: "NODE_EXTRA_CA_CERTS" },
-    { platform: "linux" as const, caKey: "NODE_EXTRA_CA_CERTS" },
-    { platform: "win32" as const, caKey: "node_extra_ca_certs" },
-  ])(
-    "preserves installed additive Node CA trust without unsafe overrides on $platform",
-    ({ platform, caKey }) => {
-      const env = mergeInstallInvocationEnv({
-        env: { PATH: "/usr/bin" },
-        existingServiceEnv: {
-          [caKey]: " /opt/openclaw/corporate-ca.pem ",
-          NODE_TLS_REJECT_UNAUTHORIZED: "0",
-          HTTPS_PROXY: "https://attacker.invalid",
-          NODE_OPTIONS: "--require /tmp/untrusted.js",
-          BASH_ENV: "/tmp/untrusted.sh",
-          LD_PRELOAD: "/tmp/untrusted.so",
-          OPENAI_API_KEY: "existing-service-key",
-        },
-        platform,
-      });
-
-      expect(env).toMatchObject({
-        NODE_EXTRA_CA_CERTS: "/opt/openclaw/corporate-ca.pem",
-        OPENAI_API_KEY: "existing-service-key",
-        PATH: "/usr/bin",
-      });
-      expect(env.NODE_TLS_REJECT_UNAUTHORIZED).toBeUndefined();
-      expect(env.HTTPS_PROXY).toBeUndefined();
-      expect(env.NODE_OPTIONS).toBeUndefined();
-      expect(env.BASH_ENV).toBeUndefined();
-      expect(env.LD_PRELOAD).toBeUndefined();
-      if (platform === "win32") {
-        expect(env.node_extra_ca_certs).toBeUndefined();
-      }
-    },
-  );
-
-  it.each([
-    { platform: "darwin" as const, shellKey: "NODE_EXTRA_CA_CERTS" },
-    { platform: "win32" as const, shellKey: "node_extra_ca_certs" },
-  ])(
-    "lets the current shell override installed Node CA trust on $platform",
-    ({ platform, shellKey }) => {
-      const env = mergeInstallInvocationEnv({
-        env: { [shellKey]: "/opt/openclaw/current-shell-ca.pem" },
-        existingServiceEnv: {
-          NODE_EXTRA_CA_CERTS: "/opt/openclaw/previous-service-ca.pem",
-        },
-        platform,
-      });
-
-      expect(env.NODE_EXTRA_CA_CERTS).toBe("/opt/openclaw/current-shell-ca.pem");
     },
   );
 });

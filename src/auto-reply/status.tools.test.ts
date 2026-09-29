@@ -1,13 +1,55 @@
 /** Tests /tools status output for compact and verbose tool inventory modes. */
+import type { ChatCommandDefinition } from "openclaw/plugin-sdk/native-command-registry";
 import { describe, expect, it, vi } from "vitest";
 import type { OpenClawConfig } from "../config/config.js";
+import * as commandsRegistry from "./commands-registry.js";
 import { buildCommandsMessage, buildHelpMessage, buildToolsMessage } from "./status.js";
 
 vi.mock("../plugins/commands.js", () => ({
   listPluginCommands: () => [],
 }));
 
+type InventoryTool = Parameters<typeof buildToolsMessage>[0]["groups"][number]["tools"][number];
+
+function createToolFixture(
+  id: string,
+  label: string,
+  description: string,
+  overrides: Partial<InventoryTool> = {},
+): InventoryTool {
+  return { id, label, description, rawDescription: description, source: "core", ...overrides };
+}
+
 describe("tools product copy", () => {
+  it("renders shipped SDK docks-category definitions without restoring docking commands", () => {
+    const command: ChatCommandDefinition = {
+      key: "saved-layout",
+      description: "Inspect a saved layout.",
+      textAliases: ["/saved-layout"],
+      scope: "text",
+      category: "docks",
+    };
+    const tool: ChatCommandDefinition = {
+      key: "inspect-tool",
+      description: "Inspect a tool.",
+      textAliases: ["/inspect-tool"],
+      scope: "text",
+      category: "tools",
+    };
+    const commands = vi
+      .spyOn(commandsRegistry, "listChatCommands")
+      .mockReturnValue([command, tool]);
+    try {
+      const text = buildCommandsMessage();
+      expect(text).toContain("Tools\n  /saved-layout [text] - Inspect a saved layout.");
+      expect(text).toContain("  /inspect-tool [text] - Inspect a tool.");
+      expect(text.match(/^Tools$/gm)).toHaveLength(1);
+      expect(text).not.toContain("Docks");
+    } finally {
+      commands.mockRestore();
+    }
+  });
+
   it("mentions /tools in command discovery copy", () => {
     const cfg = {
       commands: { config: false, debug: false },
@@ -16,7 +58,7 @@ describe("tools product copy", () => {
     expect(buildCommandsMessage(cfg)).toContain("/tools - List available runtime tools.");
     expect(buildCommandsMessage(cfg)).toContain("More: /tools for available capabilities");
     expect(buildHelpMessage(cfg)).toContain("/tools for available capabilities");
-    expect(buildHelpMessage(cfg)).toContain("/tasks");
+    expect(buildHelpMessage(cfg)).not.toContain("/tasks");
   });
 
   it("formats built-in and plugin tools for end users", () => {
@@ -29,20 +71,8 @@ describe("tools product copy", () => {
           label: "Built-in tools",
           source: "core",
           tools: [
-            {
-              id: "exec",
-              label: "Exec",
-              description: "Run shell commands",
-              rawDescription: "Run shell commands",
-              source: "core",
-            },
-            {
-              id: "web_search",
-              label: "Web Search",
-              description: "Search the web",
-              rawDescription: "Search the web",
-              source: "core",
-            },
+            createToolFixture("exec", "Exec", "Run shell commands"),
+            createToolFixture("web_search", "Web Search", "Search the web"),
           ],
         },
         {
@@ -50,14 +80,10 @@ describe("tools product copy", () => {
           label: "Connected tools",
           source: "plugin",
           tools: [
-            {
-              id: "docs_lookup",
-              label: "Docs Lookup",
-              description: "Search internal documentation",
-              rawDescription: "Search internal documentation",
+            createToolFixture("docs_lookup", "Docs Lookup", "Search internal documentation", {
               source: "plugin",
               pluginId: "docs",
-            },
+            }),
           ],
         },
       ],
@@ -82,15 +108,7 @@ describe("tools product copy", () => {
           id: "core",
           label: "Built-in tools",
           source: "core",
-          tools: [
-            {
-              id: "web_fetch",
-              label: "Web Fetch",
-              description: "Fetch web content",
-              rawDescription: "Fetch web content",
-              source: "core",
-            },
-          ],
+          tools: [createToolFixture("web_fetch", "Web Fetch", "Fetch web content")],
         },
       ],
       notices: [
@@ -117,15 +135,7 @@ describe("tools product copy", () => {
             id: "core",
             label: "Built-in tools",
             source: "core",
-            tools: [
-              {
-                id: "exec",
-                label: "Exec",
-                description: "Run shell commands",
-                rawDescription: "Run shell commands",
-                source: "core",
-              },
-            ],
+            tools: [createToolFixture("exec", "Exec", "Run shell commands")],
           },
         ],
       },

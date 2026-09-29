@@ -1,11 +1,12 @@
 /**
  * Prepares bundled MCP configuration for CLI runner backends.
  */
-import crypto from "node:crypto";
 import path from "node:path";
+import { filterStringEntries } from "@openclaw/normalization-core/string-normalization";
 import { applyMergePatch } from "../../config/merge-patch.js";
 import type { SessionToolOverrides } from "../../config/sessions/types.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
+import { sha256Hex } from "../../infra/crypto-digest.js";
 import { formatErrorMessage } from "../../infra/errors.js";
 import { tryReadJson } from "../../infra/json-files.js";
 import {
@@ -18,15 +19,25 @@ import {
   type BundleMcpConfig,
   type BundleMcpServerConfig,
 } from "../../plugins/bundle-mcp.js";
-import type { CliBackendConfig } from "../../plugins/cli-backend.types.js";
+import type { CliBackendConfig, CliBackendPlugin } from "../../plugins/cli-backend.types.js";
 import type { CliBundleMcpMode } from "../../plugins/types.js";
+import {
+  acquireSessionMcpRuntime,
+  releaseSessionMcpRuntime,
+} from "../agent-bundle-mcp-manager-api.js";
 import { isRecord } from "../bundle-mcp-adapter.js";
 import {
   loadMergedBundleMcpConfig,
   prepareOwnedBundleMcpDataDirs,
   toCliBundleMcpServerConfig,
 } from "../bundle-mcp-config.js";
+import type { ResolvedConversationCapabilityProfile } from "../conversation-capability-profile.js";
 import { resolveMcpBearerBundleConfig } from "../mcp-auth-profile.js";
+import {
+  applyPreparedNativeMcpPolicy,
+  prepareNativeMcpPolicy,
+  preparedNativeMcpDenials,
+} from "../native-mcp-policy.js";
 import {
   findClaudeMcpConfigPaths,
   injectClaudeMcpConfigArgs,
@@ -49,6 +60,21 @@ type PreparedCliBundleMcpConfig = {
   mcpResumeHash?: string;
   env?: Record<string, string>;
 };
+
+/** A managed provider pin replaces native search without disabling OpenClaw's MCP tool. */
+export function resolveCliNativeWebSearchEnabled(
+  params: { config?: OpenClawConfig; toolOverrides?: SessionToolOverrides },
+  backend: Pick<CliBackendPlugin, "bundleMcp" | "bundleMcpMode">,
+): boolean {
+  if (params.toolOverrides?.webSearch === false) {
+    return false;
+  }
+  if (!backend.bundleMcp && !backend.bundleMcpMode) {
+    return true;
+  }
+  const search = params.config?.tools?.web?.search;
+  return search?.enabled !== false && !search?.provider?.trim();
+}
 
 async function readExternalMcpConfig(configPath: string): Promise<BundleMcpConfig> {
   return { mcpServers: extractMcpServerMap(await tryReadJson<unknown>(configPath)) };
@@ -102,17 +128,17 @@ function canonicalizeBundleMcpConfigForResume(config: BundleMcpConfig): BundleMc
     Object.entries(config.mcpServers).map(([name, server]) => {
       const canonicalServer = canonicalizeSystemAgentTurnStateForResume(server);
       if (name !== "openclaw" || typeof canonicalServer.url !== "string") {
-        return [name, sortJsonValue(canonicalServer)];
+        return [name, canonicalServer];
       }
       return [
         name,
-        sortJsonValue({
+        {
           ...canonicalServer,
           url: normalizeOpenClawLoopbackUrl(canonicalServer.url),
-        }),
+        },
       ];
     }),
-  ) as BundleMcpConfig["mcpServers"];
+  );
   return {
     mcpServers: sortJsonValue(canonicalServers) as BundleMcpConfig["mcpServers"],
   };
@@ -145,9 +171,7 @@ function applyCodexMcpToolDenials(
           return [serverName, server];
         }
         const toolFilter = isRecord(server.toolFilter) ? server.toolFilter : {};
-        const existing = Array.isArray(toolFilter.exclude)
-          ? toolFilter.exclude.filter((name): name is string => typeof name === "string")
-          : [];
+        const existing = filterStringEntries(toolFilter.exclude);
         return [
           serverName,
           {
@@ -177,6 +201,19 @@ function applyMcpServerOverrides(
         ),
       }
     : config;
+}
+
+function selectBundleMcpServers(
+  config: BundleMcpConfig,
+  selected: BundleMcpConfig,
+): BundleMcpConfig {
+  return {
+    mcpServers: Object.fromEntries(
+      Object.entries(config.mcpServers).filter(([name]) =>
+        Object.hasOwn(selected.mcpServers, name),
+      ),
+    ),
+  };
 }
 
 function resolveOpenClawMcpEnvTemplates(value: unknown, env?: Record<string, string>): unknown {
@@ -210,24 +247,18 @@ async function prepareModeSpecificBundleMcpConfig(params: {
 }): Promise<PreparedCliBundleMcpConfig> {
   const mcpToolsDeny = normalizeMcpToolDenials(params.mcpToolsDeny);
   const webSearchDisabled = params.webSearchEnabled === false;
-  const configHashInput =
-    mcpToolsDeny || webSearchDisabled
-      ? { config: params.mergedConfig, mcpToolsDeny, webSearchDisabled }
-      : params.mergedConfig;
-  const serializedConfig = `${JSON.stringify(configHashInput, null, 2)}\n`;
-  const mcpConfigHash = crypto.createHash("sha256").update(serializedConfig).digest("hex");
-  const serializedResumeConfig = `${JSON.stringify(
-    mcpToolsDeny || webSearchDisabled
-      ? {
-          config: canonicalizeBundleMcpConfigForResume(params.mergedConfig),
-          mcpToolsDeny,
-          webSearchDisabled,
-        }
-      : canonicalizeBundleMcpConfigForResume(params.mergedConfig),
-    null,
-    2,
-  )}\n`;
-  const mcpResumeHash = crypto.createHash("sha256").update(serializedResumeConfig).digest("hex");
+  const hashConfig = (config: BundleMcpConfig) =>
+    sha256Hex(
+      `${JSON.stringify(
+        mcpToolsDeny || webSearchDisabled ? { config, mcpToolsDeny, webSearchDisabled } : config,
+        null,
+        2,
+      )}\n`,
+    );
+  const fingerprints = {
+    mcpConfigHash: hashConfig(params.mergedConfig),
+    mcpResumeHash: hashConfig(canonicalizeBundleMcpConfigForResume(params.mergedConfig)),
+  };
 
   if (params.mode === "codex-config-overrides") {
     const codexConfig = applyCodexMcpToolDenials(params.mergedConfig, mcpToolsDeny);
@@ -237,8 +268,7 @@ async function prepareModeSpecificBundleMcpConfig(params: {
           ? [...injectCodexMcpConfigArgs(args, codexConfig), "-c", 'web_search="disabled"']
           : injectCodexMcpConfigArgs(args, codexConfig),
       ),
-      mcpConfigHash,
-      mcpResumeHash,
+      ...fingerprints,
       env: params.env,
     };
   }
@@ -252,8 +282,7 @@ async function prepareModeSpecificBundleMcpConfig(params: {
     );
     return {
       backend: params.backend,
-      mcpConfigHash,
-      mcpResumeHash,
+      ...fingerprints,
       env: settings.env,
       cleanup: settings.cleanup,
     };
@@ -263,9 +292,17 @@ async function prepareModeSpecificBundleMcpConfig(params: {
     params.mergedConfig,
     params.env,
   ) as BundleMcpConfig;
+  const claudeConfig: BundleMcpConfig = {
+    mcpServers: Object.fromEntries(
+      Object.entries(runtimeConfig.mcpServers).map(([name, server]) => {
+        const { toolFilter: _toolFilter, ...nativeServer } = server;
+        return [name, nativeServer];
+      }),
+    ),
+  };
   const temporary = await writeTemporaryBundleMcpJson(
     "openclaw-cli-mcp-",
-    runtimeConfig,
+    claudeConfig,
     "mcp.json",
     false,
   );
@@ -273,8 +310,7 @@ async function prepareModeSpecificBundleMcpConfig(params: {
     backend: injectBundleMcpBackendArgs(params.backend, (args) =>
       injectClaudeMcpConfigArgs(args, temporary.filePath, mcpToolsDeny, params.webSearchEnabled),
     ),
-    mcpConfigHash,
-    mcpResumeHash,
+    ...fingerprints,
     env: params.env,
     cleanup: temporary.cleanup,
   };
@@ -285,7 +321,7 @@ async function prepareCliWebSearchDisabled(params: {
   backend: CliBackendConfig;
   env?: Record<string, string>;
 }): Promise<PreparedCliBundleMcpConfig> {
-  const fingerprint = crypto.createHash("sha256").update("web-search-disabled-v1").digest("hex");
+  const fingerprint = sha256Hex("web-search-disabled-v1");
   if (params.mode === "gemini-system-settings") {
     const settings = await writeGeminiWebSearchDisabledSettings(params.env);
     return {
@@ -322,9 +358,19 @@ export async function prepareCliBundleMcpConfig(params: {
   exclusiveConfig?: BundleMcpConfig;
   env?: Record<string, string>;
   warn?: (message: string) => void;
+  nativeMcpPolicy?: {
+    sessionId: string;
+    sessionKey?: string;
+    capabilityProfile: ResolvedConversationCapabilityProfile;
+    runtimeToolsAllow?: string[];
+  };
 }): Promise<PreparedCliBundleMcpConfig> {
+  const nativeWebSearchEnabled = resolveCliNativeWebSearchEnabled(params, {
+    bundleMcp: params.enabled,
+    bundleMcpMode: params.mode,
+  });
   if (!params.enabled) {
-    return params.toolOverrides?.webSearch === false
+    return !nativeWebSearchEnabled
       ? await prepareCliWebSearchDisabled({
           mode: params.mode ?? "claude-config-file",
           backend: params.backend,
@@ -344,7 +390,7 @@ export async function prepareCliBundleMcpConfig(params: {
       ),
       env: params.env,
       mcpToolsDeny: params.toolOverrides?.mcpToolsDeny,
-      webSearchEnabled: params.toolOverrides?.webSearch,
+      webSearchEnabled: nativeWebSearchEnabled,
     });
   }
   const resumeMcpConfigPaths =
@@ -380,22 +426,24 @@ export async function prepareCliBundleMcpConfig(params: {
   }
   mergedConfig = applyMergePatch(mergedConfig, bundleConfig.config) as BundleMcpConfig;
   const prepareDataDirsByServer = { ...bundleConfig.prepareDataDirsByServer };
+  const additionalServerNames = new Set(Object.keys(params.additionalConfig?.mcpServers ?? {}));
   if (params.additionalConfig) {
     mergedConfig = applyMergePatch(mergedConfig, params.additionalConfig) as BundleMcpConfig;
     for (const serverName of Object.keys(params.additionalConfig.mcpServers)) {
       delete prepareDataDirsByServer[serverName];
     }
   }
+  const warnUnavailableOAuthServer = (serverName: string, error: unknown) =>
+    params.warn?.(
+      `bundle MCP skipped unavailable OAuth server ${serverName}: ${formatErrorMessage(error)}`,
+    );
   const resolvedBearerConfig = await resolveMcpBearerBundleConfig({
     config: mergedConfig,
     cfg: params.config,
     agentDir: params.agentDir,
     env: params.env,
     omitUnavailableOAuthServers: true,
-    onServerUnavailable: (serverName, error) =>
-      params.warn?.(
-        `bundle MCP skipped unavailable OAuth server ${serverName}: ${formatErrorMessage(error)}`,
-      ),
+    onServerUnavailable: warnUnavailableOAuthServer,
   });
 
   const preparedDataDirs = prepareOwnedBundleMcpDataDirs({
@@ -406,13 +454,89 @@ export async function prepareCliBundleMcpConfig(params: {
     params.warn?.(`bundle MCP skipped for ${diagnostic.pluginId}: ${diagnostic.message}`);
   }
 
+  let effectiveConfig = preparedDataDirs.config;
+  let effectiveEnv = resolvedBearerConfig.env;
+  let effectiveDenials = params.toolOverrides?.mcpToolsDeny;
+  const policyConfig: BundleMcpConfig = {
+    mcpServers: Object.fromEntries(
+      Object.entries(effectiveConfig.mcpServers).filter(
+        ([serverName]) => !additionalServerNames.has(serverName),
+      ),
+    ),
+  };
+  if (params.nativeMcpPolicy && Object.keys(policyConfig.mcpServers).length > 0) {
+    // Native policy discovery runs in-process and owns OAuth refresh. Restrict it
+    // to projected survivors without passing external-runtime bearer placeholders.
+    const nativePolicyConfig = selectBundleMcpServers(mergedConfig, policyConfig);
+    const runtimeConfig: OpenClawConfig = {
+      ...params.config,
+      mcp: { ...params.config?.mcp, servers: nativePolicyConfig.mcpServers },
+    };
+    const acquisition = await acquireSessionMcpRuntime({
+      sessionId: params.nativeMcpPolicy.sessionId,
+      sessionKey: params.nativeMcpPolicy.sessionKey,
+      workspaceDir: params.workspaceDir,
+      agentDir: params.agentDir,
+      cfg: runtimeConfig,
+      toolOverrides: params.toolOverrides,
+      toolDenylist: params.nativeMcpPolicy.capabilityProfile.policy.explicitToolDenylist,
+    });
+    let retainedServerNames: ReadonlySet<string> | undefined;
+    try {
+      const policy = await prepareNativeMcpPolicy({
+        runtime: acquisition.runtime,
+        config: params.config,
+        workspaceDir: params.workspaceDir,
+        capabilityProfile: params.nativeMcpPolicy.capabilityProfile,
+        runtimeToolsAllow: params.nativeMcpPolicy.runtimeToolsAllow,
+        warn: params.warn ?? (() => {}),
+      });
+      effectiveConfig = {
+        mcpServers: {
+          ...applyPreparedNativeMcpPolicy(policyConfig, policy).mcpServers,
+          ...Object.fromEntries(
+            Object.entries(effectiveConfig.mcpServers).filter(([serverName]) =>
+              additionalServerNames.has(serverName),
+            ),
+          ),
+        },
+      };
+      const preservedAdditionalDenials = Object.fromEntries(
+        Object.entries(params.toolOverrides?.mcpToolsDeny ?? {}).filter(([serverName]) =>
+          additionalServerNames.has(serverName),
+        ),
+      );
+      const combinedDenials = {
+        ...preparedNativeMcpDenials(policy),
+        ...preservedAdditionalDenials,
+      };
+      effectiveDenials = Object.keys(combinedDenials).length > 0 ? combinedDenials : undefined;
+
+      // Policy discovery can refresh OAuth. Reproject the final survivors afterward
+      // so the external runtime receives the same current credential.
+      const refreshedBearerConfig = await resolveMcpBearerBundleConfig({
+        config: selectBundleMcpServers(mergedConfig, effectiveConfig),
+        cfg: params.config,
+        agentDir: params.agentDir,
+        env: params.env,
+        omitUnavailableOAuthServers: true,
+        onServerUnavailable: warnUnavailableOAuthServer,
+      });
+      effectiveConfig = selectBundleMcpServers(effectiveConfig, refreshedBearerConfig.config);
+      effectiveEnv = refreshedBearerConfig.env;
+      retainedServerNames = new Set(Object.keys(effectiveConfig.mcpServers));
+    } finally {
+      await releaseSessionMcpRuntime(acquisition, retainedServerNames);
+    }
+  }
+
   return await prepareModeSpecificBundleMcpConfig({
     mode,
     backend: params.backend,
-    mergedConfig: preparedDataDirs.config,
-    env: resolvedBearerConfig.env,
-    mcpToolsDeny: params.toolOverrides?.mcpToolsDeny,
-    webSearchEnabled: params.toolOverrides?.webSearch,
+    mergedConfig: effectiveConfig,
+    env: effectiveEnv,
+    mcpToolsDeny: effectiveDenials,
+    webSearchEnabled: nativeWebSearchEnabled,
   });
 }
 

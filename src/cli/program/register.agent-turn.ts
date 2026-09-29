@@ -7,37 +7,7 @@ import { THINKING_LEVELS_HELP } from "../../auto-reply/thinking.shared.js";
 import { inheritOptionFromParent } from "../command-options.js";
 import { measureCliCommandStartup } from "../command-startup-timing.js";
 import { formatHelpExamples } from "../help-format.js";
-import { requestExitAfterOneShotOutput } from "../one-shot-exit.js";
-
-type AgentViaGatewayModule = typeof import("../../commands/agent-via-gateway.js");
-type AgentExecModule = typeof import("../../commands/agent-exec.js");
-type CliUtilsModule = typeof import("../cli-utils.js");
-type GlobalStateModule = typeof import("../../global-state.js");
-type RuntimeModule = typeof import("../../runtime.js");
-
-async function loadAgentCliCommand(): Promise<AgentViaGatewayModule["agentCliCommand"]> {
-  return (await import("../../commands/agent-via-gateway.js")).agentCliCommand;
-}
-
-async function loadAgentExecCommand(): Promise<AgentExecModule["agentExecCommand"]> {
-  return (await import("../../commands/agent-exec.js")).agentExecCommand;
-}
-
-function collectFallback(value: string, previous: string[]): string[] {
-  return [...previous, value];
-}
-
-async function loadDefaultRuntime(): Promise<RuntimeModule["defaultRuntime"]> {
-  return (await import("../../runtime.js")).defaultRuntime;
-}
-
-async function loadRunCommandWithRuntime(): Promise<CliUtilsModule["runCommandWithRuntime"]> {
-  return (await import("../cli-utils.js")).runCommandWithRuntime;
-}
-
-async function loadSetVerbose(): Promise<GlobalStateModule["setVerbose"]> {
-  return (await import("../../global-state.js")).setVerbose;
-}
+import { collectOption } from "./helpers.js";
 
 /** Register `openclaw agent` for one Gateway-backed agent turn. */
 export function registerAgentTurnCommand(
@@ -110,15 +80,21 @@ ${theme.muted("Docs:")} ${formatDocsLink("/cli/agent", "docs.openclaw.ai/cli/age
     .action(async (opts): Promise<void> => {
       const verboseLevel =
         typeof opts.verbose === "string" ? normalizeLowercaseStringOrEmpty(opts.verbose) : "";
-      const [defaultRuntime, runCommandWithRuntime, setVerbose, agentCliCommand] =
-        await measureCliCommandStartup("agent-action-imports", () =>
-          Promise.all([
-            loadDefaultRuntime(),
-            loadRunCommandWithRuntime(),
-            loadSetVerbose(),
-            loadAgentCliCommand(),
-          ]),
-        );
+      const [
+        { defaultRuntime },
+        { runCommandWithRuntime },
+        { setVerbose },
+        { agentCliCommand },
+        { requestExitAfterOneShotOutput },
+      ] = await measureCliCommandStartup("agent-action-imports", () =>
+        Promise.all([
+          import("../../runtime.js"),
+          import("../cli-utils.js"),
+          import("../../global-state.js"),
+          import("../../commands/agent-via-gateway.js"),
+          import("../one-shot-exit.js"),
+        ]),
+      );
       await runCommandWithRuntime(defaultRuntime, async () => {
         setVerbose(verboseLevel === "on");
         await agentCliCommand(opts, defaultRuntime);
@@ -147,7 +123,7 @@ ${theme.muted("Docs:")} ${formatDocsLink("/cli/agent", "docs.openclaw.ai/cli/age
     .option(
       "--fallback <provider/model>",
       "Add an ordered fallback model (repeatable; requires --model)",
-      collectFallback,
+      collectOption,
       [],
     )
     .option("--auth-env-only", "Use provider credentials from environment variables only", false)
@@ -164,7 +140,7 @@ ${theme.muted("Docs:")} ${formatDocsLink("/cli/agent", "docs.openclaw.ai/cli/age
             "Read a prompt file and set the workspace.",
           ],
           [
-            'openclaw agent exec "Summarize this repo" --model openai/gpt-5.6-sol --fallback anthropic/claude-sonnet-4-6 --json',
+            'openclaw agent exec "Summarize this repo" --model openai/gpt-6-astra --fallback anthropic/claude-sonnet-4-6 --json',
             "Use an explicit fallback chain and JSON output.",
           ],
           [
@@ -193,10 +169,16 @@ ${theme.muted("Docs:")} ${formatDocsLink("/cli/agent", "docs.openclaw.ai/cli/age
         timeout: inheritOptionFromParent<string>(command, "timeout") ?? opts.timeout,
         json: opts.json === true || parentOpts?.json === true,
       };
-      const [defaultRuntime, runCommandWithRuntime, agentExecCommand] = await Promise.all([
-        loadDefaultRuntime(),
-        loadRunCommandWithRuntime(),
-        loadAgentExecCommand(),
+      const [
+        { defaultRuntime },
+        { runCommandWithRuntime },
+        { agentExecCommand },
+        { requestExitAfterOneShotOutput },
+      ] = await Promise.all([
+        import("../../runtime.js"),
+        import("../cli-utils.js"),
+        import("../../commands/agent-exec.js"),
+        import("../one-shot-exit.js"),
       ]);
       await runCommandWithRuntime(defaultRuntime, async () => {
         const result = await agentExecCommand(message, execOpts, defaultRuntime);

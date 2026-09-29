@@ -11,7 +11,7 @@ const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 
 afterEach(() => {
   vi.restoreAllMocks();
-  vi.doUnmock("../infra/file-store.js");
+  vi.doUnmock("@openclaw/fs-safe/store");
   vi.unstubAllEnvs();
   vi.resetModules();
 });
@@ -46,8 +46,8 @@ describe("media store filesystem faults", () => {
     const segment = `retry-${Date.now()}-${Math.random().toString(36).slice(2)}`;
     const injectedError = error();
     let writeAttempts = 0;
-    vi.doMock("../infra/file-store.js", async (importOriginal) => {
-      const actual = await importOriginal<typeof import("../infra/file-store.js")>();
+    vi.doMock("@openclaw/fs-safe/store", async (importOriginal) => {
+      const actual = await importOriginal<typeof import("@openclaw/fs-safe/store")>();
       return {
         ...actual,
         fileStore: (options: Parameters<typeof actual.fileStore>[0]) => {
@@ -78,6 +78,82 @@ describe("media store filesystem faults", () => {
     }
     await expect(result).rejects.toBe(injectedError);
     expect(writeAttempts).toBe(1);
+  });
+
+  it("recovers a missing staging directory before consuming a stream", async () => {
+    const stateDir = tempDirs.make("openclaw-media-stream-retry-");
+    vi.stubEnv("OPENCLAW_STATE_DIR", stateDir);
+    const subdir = "stream-before-open";
+    const input = Buffer.from("media stream survives directory recovery");
+    let consumptionStarted = false;
+    const stream = (async function* () {
+      consumptionStarted = true;
+      yield input;
+    })();
+    const originalOpen = fs.open.bind(fs);
+    let directoryPruned = false;
+    let consumedBeforeRecovery: boolean | undefined;
+    vi.spyOn(fs, "open").mockImplementation(async (...args) => {
+      if (
+        !directoryPruned &&
+        typeof args[0] === "string" &&
+        args[0].includes(`${path.sep}${subdir}${path.sep}`) &&
+        args[1] === "wx"
+      ) {
+        consumedBeforeRecovery = consumptionStarted;
+        await fs.rmdir(path.dirname(args[0]));
+        directoryPruned = true;
+      }
+      return await originalOpen(...args);
+    });
+
+    const store = await importFreshModule<typeof import("./store.js")>(
+      import.meta.url,
+      "./store.js?scope=stream-before-open",
+    );
+    const saved = await store.saveMediaStream(stream, "text/plain", subdir, 1024);
+
+    expect(directoryPruned).toBe(true);
+    expect(consumedBeforeRecovery).toBe(false);
+    expect(saved.size).toBe(input.byteLength);
+    await expect(fs.readFile(saved.path)).resolves.toEqual(input);
+    await expect(fs.readdir(path.dirname(saved.path))).resolves.toEqual([saved.id]);
+  });
+
+  it("rejects publication failure without replaying a consumed stream", async () => {
+    const stateDir = tempDirs.make("openclaw-media-stream-publication-");
+    vi.stubEnv("OPENCLAW_STATE_DIR", stateDir);
+    const subdir = "stream-final-rename";
+    const input = Buffer.from("media stream must not become an empty success");
+    const stream = (async function* () {
+      yield input;
+    })();
+    const injectedError = errnoError("ENOENT");
+    const originalRename = fs.rename.bind(fs);
+    let stagedBytes: Buffer | undefined;
+    vi.spyOn(fs, "rename").mockImplementation(async (source, target) => {
+      if (
+        !stagedBytes &&
+        typeof target === "string" &&
+        target.includes(`${path.sep}${subdir}${path.sep}`) &&
+        path.basename(target).startsWith("publication---")
+      ) {
+        stagedBytes = await fs.readFile(source);
+        throw injectedError;
+      }
+      return await originalRename(source, target);
+    });
+
+    const store = await importFreshModule<typeof import("./store.js")>(
+      import.meta.url,
+      "./store.js?scope=stream-final-rename",
+    );
+    await expect(
+      store.saveMediaStream(stream, "text/plain", subdir, 1024, "publication.txt"),
+    ).rejects.toBe(injectedError);
+
+    expect(stagedBytes).toEqual(input);
+    await expect(fs.readdir(path.join(store.getMediaDir(), subdir))).resolves.toEqual([]);
   });
 
   it("fully persists a stream chunk after a positive short write", async () => {

@@ -3,8 +3,10 @@ import { resolve, sep } from "node:path";
 import { coerceErrorMessage } from "@openclaw/normalization-core/error-coercion";
 import { root as fsSafeRoot } from "../infra/fs-safe.js";
 import type { OpenClawStateDatabaseOptions } from "../state/openclaw-state-db.js";
+import { clawWorkspaceActionsById } from "./application-provenance.js";
 import type { ClawAddPlan } from "./types.js";
 import type { ClawUpdatePlan } from "./update-plan.js";
+import { collectClawRollbackFailures } from "./update-rollback.js";
 import {
   CLAW_WORKSPACE_FILE_RECORD_SCHEMA_VERSION,
   deleteClawWorkspaceFileRecord,
@@ -61,23 +63,12 @@ export async function applyClawWorkspaceUpdate(
   const currentRefs = new Map(
     readClawWorkspaceFiles(updatePlan.agentId, options).map((record) => [record.path, record]),
   );
-  const targetActions = new Map(
-    targetAddPlan.actions
-      .filter((action) => action.kind === "workspaceFile")
-      .map((action) => [action.id, action]),
-  );
+  const targetActions = clawWorkspaceActionsById(targetAddPlan.actions);
   const undo: Array<() => Promise<void>> = [];
   const appliedPaths: string[] = [];
 
   const rollback = async () => {
-    const failures: string[] = [];
-    for (const revert of undo.toReversed()) {
-      try {
-        await revert();
-      } catch (error) {
-        failures.push(coerceErrorMessage(error));
-      }
-    }
+    const failures = await collectClawRollbackFailures(undo.toReversed());
     if (failures.length > 0) {
       throw new ClawWorkspaceUpdateError(failures.join("; "), true);
     }

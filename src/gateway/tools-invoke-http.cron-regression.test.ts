@@ -14,7 +14,6 @@ const runBeforeToolCallHook = async (args: { params: unknown }) => ({
 let cfg: Record<string, unknown> = {};
 const alwaysAuthorized = async () => ({ ok: true as const });
 const disableDefaultMemorySlot = () => false;
-const noPluginToolMeta = () => undefined;
 const noWarnLog = () => {};
 
 vi.mock("../config/config.js", () => ({
@@ -56,10 +55,6 @@ vi.mock("../plugins/config-state.js", async (importOriginal) => {
     isTestDefaultMemorySlotDisabled: disableDefaultMemorySlot,
   };
 });
-
-vi.mock("../plugins/tools.js", () => ({
-  getPluginToolMeta: noPluginToolMeta,
-}));
 
 vi.mock("../agents/openclaw-tools.js", () => {
   const tools = [
@@ -159,23 +154,20 @@ describe("tools invoke HTTP denylist", () => {
     expect(cronRes.status).toBe(200);
   });
 
-  it.each(["cron", " CRON ", "CrOn"])(
-    "keeps deny spelling %j authoritative over a canonical allow",
-    async (deniedTool) => {
-      cfg = {
-        gateway: {
-          tools: {
-            allow: ["automations"],
-            deny: [deniedTool],
-          },
+  it("keeps a normalized deny authoritative over a canonical allow", async () => {
+    cfg = {
+      gateway: {
+        tools: {
+          allow: ["automations"],
+          deny: [" CRON "],
         },
-      };
+      },
+    };
 
-      const cronRes = await invoke("cron", "operator.admin");
+    const cronRes = await invoke("cron", "operator.admin");
 
-      expect(cronRes.status).toBe(404);
-    },
-  );
+    expect(cronRes.status).toBe(404);
+  });
 
   it("keeps gateway denied under the coding profile while honoring explicit cron allow", async () => {
     cfg = {

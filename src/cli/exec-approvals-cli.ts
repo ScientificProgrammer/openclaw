@@ -2,6 +2,7 @@
 import fs from "node:fs/promises";
 import { readByteStreamWithLimit } from "@openclaw/media-core/read-byte-stream-with-limit";
 import { expectDefined } from "@openclaw/normalization-core";
+import { parseStrictPositiveInteger } from "@openclaw/normalization-core/number-coercion";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import { truncateUtf16Safe } from "@openclaw/normalization-core/utf16-slice";
@@ -15,6 +16,11 @@ import {
   type ApprovalResolveResult,
   type ApprovalSnapshot,
 } from "../../packages/gateway-protocol/src/index.js";
+import type {
+  ExecApprovalGrantsListResult,
+  ExecApprovalStandingGrant,
+  ExecApprovalsNodeSetParams,
+} from "../../packages/gateway-protocol/src/schema/exec-approvals.js";
 import { sanitizeForLog } from "../../packages/terminal-core/src/ansi.js";
 import { formatDocsLink } from "../../packages/terminal-core/src/links.js";
 import {
@@ -42,6 +48,7 @@ import {
   type ExecApprovalsDefaults,
   type ExecApprovalsFile,
 } from "../infra/exec-approvals.js";
+import { classifyExecAllowlistScope } from "../infra/exec-command-resolution.js";
 import { formatTimeAgo } from "../infra/format-time/format-relative.ts";
 import { defaultRuntime } from "../runtime.js";
 import { rethrowExpectedCliError } from "./failure-output.js";
@@ -58,18 +65,9 @@ type FileExecApprovalsSnapshot = {
   resolvedDefaults?: Required<ExecApprovalsDefaults>;
 };
 
-type NativeExecApprovalAction = "allow" | "deny" | "prompt";
-type NativeExecApprovalRule = {
-  pattern: string;
-  action: NativeExecApprovalAction;
-  shells?: string[];
-  description?: string;
-  enabled?: boolean;
-};
-type NativeExecApprovalPolicy = {
-  defaultAction?: NativeExecApprovalAction;
-  rules: NativeExecApprovalRule[];
-};
+type NativeExecApprovalPolicy = NonNullable<ExecApprovalsNodeSetParams["native"]>;
+type NativeExecApprovalRule = NativeExecApprovalPolicy["rules"][number];
+type NativeExecApprovalAction = NativeExecApprovalRule["action"];
 type NativeExecApprovalsSnapshot =
   | {
       enabled: true;
@@ -155,7 +153,7 @@ async function resolveTargetNodeId(opts: ExecApprovalsCliOpts): Promise<string |
   if (!raw) {
     return null;
   }
-  return await resolveCliNodeId(opts as NodesRpcOpts, raw);
+  return await resolveCliNodeId(opts, raw);
 }
 
 async function loadSnapshot(
@@ -164,8 +162,7 @@ async function loadSnapshot(
 ): Promise<ExecApprovalsSnapshot> {
   const method = nodeId ? "exec.approvals.node.get" : "exec.approvals.get";
   const params = nodeId ? { nodeId } : {};
-  const snapshot = (await callGatewayFromCli(method, opts, params)) as ExecApprovalsSnapshot;
-  return snapshot;
+  return (await callGatewayFromCli(method, opts, params)) as ExecApprovalsSnapshot;
 }
 
 function loadSnapshotLocal(): ExecApprovalsSnapshot {
@@ -214,7 +211,7 @@ function normalizeNativePolicyInput(value: unknown): NativeExecApprovalPolicy {
   if (!Array.isArray(value.rules)) {
     exitWithError("Host-native exec approvals rules must be an array.");
   }
-  const rules = value.rules?.map((entry, index) => {
+  const rules = value.rules.map((entry, index) => {
     if (!isRecord(entry)) {
       exitWithError(`Host-native exec approval rule ${index + 1} must be an object.`);
     }
@@ -323,7 +320,6 @@ async function loadWritableSnapshotTarget(opts: ExecApprovalsCliOpts): Promise<{
   source: ApprovalsTargetSource;
   targetLabel: string;
   baseHash: string;
-  kind: "file" | "native";
 }> {
   // Writes carry the base hash so gateway/node updates can reject stale snapshots.
   const { snapshot, nodeId, source } = await loadSnapshotTarget(opts);
@@ -337,8 +333,7 @@ async function loadWritableSnapshotTarget(opts: ExecApprovalsCliOpts): Promise<{
   if (!baseHash) {
     exitWithError("Exec approvals hash missing; reload and retry.");
   }
-  const kind = isNativeApprovalsSnapshot(snapshot) ? "native" : "file";
-  return { snapshot, nodeId, source, targetLabel, baseHash, kind };
+  return { snapshot, nodeId, source, targetLabel, baseHash };
 }
 
 type SaveSnapshotTargetedParams = {
@@ -364,7 +359,10 @@ async function saveSnapshotTargeted(params: SaveSnapshotTargetedParams): Promise
   } else if (params.source === "local") {
     // Announced at the write, not at target resolution: no-op allowlist edits and
     // rejected `set` input never reach here and must not claim a write happened.
-    defaultRuntime.log(theme.muted("Writing local approvals."));
+    // JSON mode owns stdout: the written snapshot below is the record of the write.
+    if (!params.opts.json) {
+      defaultRuntime.log(theme.muted("Writing local approvals."));
+    }
     next = await saveSnapshotLocal(params.file, params.baseHash);
   } else {
     next = await saveSnapshot(params.opts, params.nodeId, params.file, params.baseHash);
@@ -392,6 +390,17 @@ function failApprovalsCommand(err: unknown, opts: ExecApprovalsCliOpts): void {
   }
   defaultRuntime.error(message);
   defaultRuntime.exit(1);
+}
+
+async function runApprovalsAction(
+  opts: ExecApprovalsCliOpts,
+  action: () => Promise<void>,
+): Promise<void> {
+  try {
+    await action();
+  } catch (err) {
+    failApprovalsCommand(err, opts);
+  }
 }
 
 function isApprovalDecision(value: string): value is ApprovalDecision {
@@ -541,22 +550,7 @@ function formatPendingAgentSession(entry: PendingApprovalCliEntry): string {
   return parts.length > 0 ? escapeApprovalTextForTerminal(parts.join(" / ")) : "-";
 }
 
-type StandingGrantCliEntry = {
-  grantId: string;
-  agentId: string;
-  cronJobId: string;
-  cronJobName: string | null;
-  command: string;
-  cwd: string | null;
-  createdAtMs: number;
-  expiresAtMs: number | null;
-  revokedAtMs: number | null;
-  revokedBy: string | null;
-  lastUsedAtMs: number | null;
-  useCount: number;
-};
-
-function describeGrantState(grant: StandingGrantCliEntry, nowMs: number): string {
+function describeGrantState(grant: ExecApprovalStandingGrant, nowMs: number): string {
   if (grant.revokedAtMs !== null) {
     // revokedBy carries the revoking client's self-reported display name;
     // escape it visibly rather than relying on the table's silent strip.
@@ -572,7 +566,7 @@ function describeGrantState(grant: StandingGrantCliEntry, nowMs: number): string
   return "until revoked";
 }
 
-function renderStandingGrants(grants: StandingGrantCliEntry[]): void {
+function renderStandingGrants(grants: ExecApprovalStandingGrant[]): void {
   if (grants.length === 0) {
     defaultRuntime.log(theme.muted("No standing grants."));
     return;
@@ -748,15 +742,11 @@ async function resolvePendingApproval(
     }
   }
 
-  const expiresInDaysRaw =
-    opts.expiresInDays === undefined ? undefined : Number.parseInt(opts.expiresInDays, 10);
-  if (
-    expiresInDaysRaw !== undefined &&
-    (!Number.isInteger(expiresInDaysRaw) || expiresInDaysRaw < 1 || expiresInDaysRaw > 3650)
-  ) {
+  const expiresInDays = parseStrictPositiveInteger(opts.expiresInDays);
+  if (opts.expiresInDays !== undefined && (expiresInDays === undefined || expiresInDays > 3650)) {
     exitWithError("--expires-in-days must be a whole number of days between 1 and 3650.");
   }
-  if (expiresInDaysRaw !== undefined && decision !== "allow-always") {
+  if (expiresInDays !== undefined && decision !== "allow-always") {
     exitWithError("--expires-in-days only applies to allow-always.");
   }
   const result = (await callGatewayFromCli(
@@ -766,7 +756,7 @@ async function resolvePendingApproval(
       id,
       kind: current.presentation.kind,
       decision,
-      ...(expiresInDaysRaw !== undefined ? { grantExpiresInDays: expiresInDaysRaw } : {}),
+      ...(expiresInDays !== undefined ? { grantExpiresInDays: expiresInDays } : {}),
     },
     approvalCallOptions,
   )) as ApprovalResolveResult;
@@ -951,8 +941,13 @@ function renderApprovalsSnapshot(snapshot: ExecApprovalsSnapshot, targetLabel: s
       : null,
   ].filter((part): part is string => part != null);
   const agents = file.agents ?? {};
-  const allowlistRows: Array<{ Target: string; Agent: string; Pattern: string; LastUsed: string }> =
-    [];
+  const allowlistRows: Array<{
+    Target: string;
+    Agent: string;
+    Pattern: string;
+    Scope: string;
+    LastUsed: string;
+  }> = [];
   const now = Date.now();
   for (const [agentId, agent] of Object.entries(agents)) {
     const allowlist = Array.isArray(agent.allowlist) ? agent.allowlist : [];
@@ -966,10 +961,19 @@ function renderApprovalsSnapshot(snapshot: ExecApprovalsSnapshot, targetLabel: s
         Target: targetLabel,
         Agent: agentId,
         Pattern: pattern,
+        Scope: classifyExecAllowlistScope(entry),
         LastUsed: lastUsedAt ? formatTimeAgo(Math.max(0, now - lastUsedAt)) : muted("unknown"),
       });
     }
   }
+  const mcpToolRows = Object.entries(agents).flatMap(([agentId, agent]) =>
+    (agent.mcpTools ?? []).map((grant) => ({
+      Agent: agentId,
+      Server: grant.server,
+      Tool: grant.tool,
+      Added: formatTimeAgo(Math.max(0, now - grant.addedAt)),
+    })),
+  );
 
   const summaryRows = [
     { Field: "Target", Value: targetLabel },
@@ -984,6 +988,7 @@ function renderApprovalsSnapshot(snapshot: ExecApprovalsSnapshot, targetLabel: s
     { Field: "Defaults", Value: defaultsParts.length > 0 ? defaultsParts.join(", ") : "none" },
     { Field: "Agents", Value: String(Object.keys(agents).length) },
     { Field: "Allowlist", Value: String(allowlistRows.length) },
+    { Field: "MCP tool grants", Value: String(mcpToolRows.length) },
   ];
 
   defaultRuntime.log(heading("Approvals"));
@@ -998,24 +1003,40 @@ function renderApprovalsSnapshot(snapshot: ExecApprovalsSnapshot, targetLabel: s
     }).trimEnd(),
   );
 
-  if (allowlistRows.length === 0) {
-    defaultRuntime.log("");
+  defaultRuntime.log("");
+  if (allowlistRows.length > 0) {
+    defaultRuntime.log(heading("Allowlist"));
+    defaultRuntime.log(
+      renderTerminalSafeTable({
+        width: tableWidth,
+        columns: [
+          { key: "Target", header: "Target", minWidth: 10 },
+          { key: "Agent", header: "Agent", minWidth: 8 },
+          { key: "Pattern", header: "Pattern", minWidth: 20, flex: true },
+          { key: "Scope", header: "Scope", minWidth: 10 },
+          { key: "LastUsed", header: "Last Used", minWidth: 10 },
+        ],
+        rows: allowlistRows,
+      }).trimEnd(),
+    );
+  } else {
     defaultRuntime.log(muted("No allowlist entries."));
+  }
+  if (mcpToolRows.length === 0) {
     return;
   }
-
   defaultRuntime.log("");
-  defaultRuntime.log(heading("Allowlist"));
+  defaultRuntime.log(heading("MCP tool grants"));
   defaultRuntime.log(
     renderTerminalSafeTable({
       width: tableWidth,
       columns: [
-        { key: "Target", header: "Target", minWidth: 10 },
         { key: "Agent", header: "Agent", minWidth: 8 },
-        { key: "Pattern", header: "Pattern", minWidth: 20, flex: true },
-        { key: "LastUsed", header: "Last Used", minWidth: 10 },
+        { key: "Server", header: "Server", minWidth: 16, flex: true },
+        { key: "Tool", header: "Tool", minWidth: 16, flex: true },
+        { key: "Added", header: "Added", minWidth: 10 },
       ],
-      rows: allowlistRows,
+      rows: mcpToolRows,
     }).trimEnd(),
   );
 }
@@ -1081,8 +1102,7 @@ async function saveSnapshot(
 ): Promise<ExecApprovalsSnapshot> {
   const method = nodeId ? "exec.approvals.node.set" : "exec.approvals.set";
   const params = nodeId ? { nodeId, file, baseHash } : { file, baseHash };
-  const snapshot = (await callGatewayFromCli(method, opts, params)) as ExecApprovalsSnapshot;
-  return snapshot;
+  return (await callGatewayFromCli(method, opts, params)) as ExecApprovalsSnapshot;
 }
 
 function resolveAgentKey(value?: string | null): string {
@@ -1090,15 +1110,7 @@ function resolveAgentKey(value?: string | null): string {
 }
 
 function normalizeAllowlistEntry(entry: { pattern?: string } | null): string | null {
-  const pattern = normalizeOptionalString(entry?.pattern) ?? "";
-  return pattern ? pattern : null;
-}
-
-function ensureAgent(file: ExecApprovalsFile, agentKey: string): ExecApprovalsAgent {
-  const agents = file.agents ?? {};
-  const entry = agents[agentKey] ?? {};
-  file.agents = agents;
-  return entry;
+  return normalizeOptionalString(entry?.pattern) ?? null;
 }
 
 function isEmptyAgent(agent: ExecApprovalsAgent): boolean {
@@ -1108,20 +1120,12 @@ function isEmptyAgent(agent: ExecApprovalsAgent): boolean {
     !agent.ask &&
     !agent.askFallback &&
     agent.autoAllowSkills === undefined &&
+    !agent.mcpTools?.length &&
     allowlist.length === 0
   );
 }
 
-async function loadWritableAllowlistAgent(opts: ExecApprovalsCliOpts): Promise<{
-  nodeId: string | null;
-  source: "gateway" | "node" | "local";
-  targetLabel: string;
-  baseHash: string;
-  file: ExecApprovalsFile;
-  agentKey: string;
-  agent: ExecApprovalsAgent;
-  allowlistEntries: NonNullable<ExecApprovalsAgent["allowlist"]>;
-}> {
+async function loadWritableAllowlistAgent(opts: ExecApprovalsCliOpts) {
   const agentKey = resolveAgentKey(opts.agent);
   if (agentKey !== "*") {
     const source = !opts.gateway && !opts.node ? "local" : opts.gateway ? "gateway" : "node";
@@ -1131,9 +1135,9 @@ async function loadWritableAllowlistAgent(opts: ExecApprovalsCliOpts): Promise<{
     }
     resolveConfiguredAgentId(config, agentKey);
   }
-  const { snapshot, nodeId, source, targetLabel, baseHash, kind } =
-    await loadWritableSnapshotTarget(opts);
-  if (kind === "native" || !isFileApprovalsSnapshot(snapshot)) {
+  const target = await loadWritableSnapshotTarget(opts);
+  const { snapshot } = target;
+  if (isNativeApprovalsSnapshot(snapshot) || !isFileApprovalsSnapshot(snapshot)) {
     exitWithError(
       "Host-native node approvals do not support allowlist mutations; use approvals set --node with host-native JSON.",
     );
@@ -1141,41 +1145,16 @@ async function loadWritableAllowlistAgent(opts: ExecApprovalsCliOpts): Promise<{
   const file = snapshot.file;
   file.version = 1;
 
-  const agent = ensureAgent(file, agentKey);
+  const agent: ExecApprovalsAgent = file.agents?.[agentKey] ?? {};
   const allowlistEntries = Array.isArray(agent.allowlist) ? agent.allowlist : [];
 
-  return { nodeId, source, targetLabel, baseHash, file, agentKey, agent, allowlistEntries };
+  return { ...target, snapshot, file, agentKey, agent, allowlistEntries };
 }
 
 type WritableAllowlistAgentContext = Awaited<ReturnType<typeof loadWritableAllowlistAgent>> & {
   trimmedPattern: string;
 };
 type AllowlistMutation = (context: WritableAllowlistAgentContext) => boolean | Promise<boolean>;
-
-async function runAllowlistMutation(
-  pattern: string,
-  opts: ExecApprovalsCliOpts,
-  mutate: AllowlistMutation,
-): Promise<void> {
-  try {
-    const trimmedPattern = requireTrimmedNonEmpty(pattern, "Pattern required.");
-    const context = await loadWritableAllowlistAgent(opts);
-    const shouldSave = await mutate({ ...context, trimmedPattern });
-    if (!shouldSave) {
-      return;
-    }
-    await saveSnapshotTargeted({
-      opts,
-      source: context.source,
-      nodeId: context.nodeId,
-      file: context.file,
-      baseHash: context.baseHash,
-      targetLabel: context.targetLabel,
-    });
-  } catch (err) {
-    failApprovalsCommand(err, opts);
-  }
-}
 
 function registerAllowlistMutationCommand(params: {
   allowlist: Command;
@@ -1190,7 +1169,18 @@ function registerAllowlistMutationCommand(params: {
     .option("--gateway", "Force gateway approvals", false)
     .option("--agent <id>", 'Agent id (defaults to "*")')
     .action(async (pattern: string, opts: ExecApprovalsCliOpts) => {
-      await runAllowlistMutation(pattern, opts, params.mutate);
+      await runApprovalsAction(opts, async () => {
+        const trimmedPattern = requireTrimmedNonEmpty(pattern, "Pattern required.");
+        const context = await loadWritableAllowlistAgent(opts);
+        const shouldSave = await params.mutate({ ...context, trimmedPattern });
+        if (!shouldSave) {
+          if (opts.json) {
+            defaultRuntime.writeJson(redactExecApprovals(context.snapshot), 0);
+          }
+          return;
+        }
+        await saveSnapshotTargeted({ ...context, opts });
+      });
     });
   nodesCallOpts(command);
   return command;
@@ -1214,16 +1204,14 @@ export function registerExecApprovalsCli(program: Command) {
     .command("pending")
     .description("List pending exec, plugin, and system-agent approvals")
     .action(async (opts: ExecApprovalsCliOpts) => {
-      try {
+      await runApprovalsAction(opts, async () => {
         const entries = await loadPendingApprovals(opts);
         if (opts.json) {
           defaultRuntime.writeJson({ approvals: entries }, 0);
           return;
         }
         renderPendingApprovals(entries);
-      } catch (err) {
-        failApprovalsCommand(err, opts);
-      }
+      });
     });
   nodesCallOpts(pendingCmd);
 
@@ -1236,11 +1224,9 @@ export function registerExecApprovalsCli(program: Command) {
       "Allow-always on an automation approval: freeze this grant lifetime instead of the configured default",
     )
     .action(async (id: string, decision: string, opts: ExecApprovalsCliOpts) => {
-      try {
+      await runApprovalsAction(opts, async () => {
         await resolvePendingApproval(id, decision, opts);
-      } catch (err) {
-        failApprovalsCommand(err, opts);
-      }
+      });
     });
   nodesCallOpts(resolveCmd);
 
@@ -1252,32 +1238,29 @@ export function registerExecApprovalsCli(program: Command) {
     .description("List standing grants, newest first")
     .option("--limit <n>", "Maximum rows to return (default 200)")
     .action(async (opts: ExecApprovalsCliOpts & { limit?: string }) => {
-      try {
-        const limitRaw = opts.limit === undefined ? undefined : Number.parseInt(opts.limit, 10);
-        const limit =
-          limitRaw !== undefined && Number.isInteger(limitRaw) && limitRaw >= 1
-            ? limitRaw
-            : undefined;
+      await runApprovalsAction(opts, async () => {
+        const limit = parseStrictPositiveInteger(opts.limit);
+        if (opts.limit !== undefined && limit === undefined) {
+          exitWithError("--limit must be a positive integer.");
+        }
         const result = (await callGatewayFromCli(
           "exec.approval.grants.list",
           opts,
-          limit ? { limit } : {},
-        )) as { grants: StandingGrantCliEntry[] }; // SAFETY: matches ExecApprovalGrantsListResultSchema.
+          limit !== undefined ? { limit } : {},
+        )) as ExecApprovalGrantsListResult; // SAFETY: matches ExecApprovalGrantsListResultSchema.
         if (opts.json) {
           defaultRuntime.writeJson(result, 0);
           return;
         }
         renderStandingGrants(result.grants);
-      } catch (err) {
-        failApprovalsCommand(err, opts);
-      }
+      });
     });
   nodesCallOpts(grantsListCmd);
   const grantsRevokeCmd = grants
     .command("revoke <grantId>")
     .description("Revoke a standing grant; the next occurrence prompts again")
     .action(async (grantId: string, opts: ExecApprovalsCliOpts) => {
-      try {
+      await runApprovalsAction(opts, async () => {
         const result = (await callGatewayFromCli("exec.approval.grants.revoke", opts, {
           grantId,
         })) as { outcome: "revoked" | "already-revoked" | "not-found" }; // SAFETY: closed enum from the revoke result schema.
@@ -1292,9 +1275,7 @@ export function registerExecApprovalsCli(program: Command) {
         } else {
           exitWithError(`Grant ${grantId} not found.`);
         }
-      } catch (err) {
-        failApprovalsCommand(err, opts);
-      }
+      });
     });
   nodesCallOpts(grantsRevokeCmd);
 
@@ -1304,7 +1285,7 @@ export function registerExecApprovalsCli(program: Command) {
     .option("--node <node>", "Target node id/name/IP")
     .option("--gateway", "Force gateway approvals", false)
     .action(async (opts: ExecApprovalsCliOpts) => {
-      try {
+      await runApprovalsAction(opts, async () => {
         const { snapshot, nodeId, source } = await loadSnapshotTarget(opts);
         const nativePolicy = isNativeApprovalsSnapshot(snapshot);
         const configLoad = nativePolicy
@@ -1333,9 +1314,7 @@ export function registerExecApprovalsCli(program: Command) {
         const targetLabel = source === "local" ? "local" : nodeId ? `node:${nodeId}` : "gateway";
         renderApprovalsSnapshot(snapshot, targetLabel);
         renderEffectivePolicy({ report: effectivePolicy });
-      } catch (err) {
-        failApprovalsCommand(err, opts);
-      }
+      });
     });
   nodesCallOpts(getCmd, { timeoutMs: APPROVALS_GET_DEFAULT_TIMEOUT_MS });
 
@@ -1347,14 +1326,14 @@ export function registerExecApprovalsCli(program: Command) {
     .option("--file <path>", "Path to JSON file to upload")
     .option("--stdin", "Read JSON from stdin", false)
     .action(async (opts: ExecApprovalsCliOpts) => {
-      try {
+      await runApprovalsAction(opts, async () => {
         if (!opts.file && !opts.stdin) {
           exitWithError("Provide --file or --stdin.");
         }
         if (opts.file && opts.stdin) {
           exitWithError("Use either --file or --stdin (not both).");
         }
-        const { source, nodeId, targetLabel, baseHash, kind } =
+        const { source, nodeId, targetLabel, baseHash, snapshot } =
           await loadWritableSnapshotTarget(opts);
         const raw = opts.stdin ? await readStdin() : await readApprovalsFile(String(opts.file));
         let input: unknown;
@@ -1363,7 +1342,7 @@ export function registerExecApprovalsCli(program: Command) {
         } catch (err) {
           exitWithError(`Failed to parse approvals JSON: ${String(err)}`);
         }
-        if (kind === "native") {
+        if (isNativeApprovalsSnapshot(snapshot)) {
           const native = normalizeNativePolicyInput(input);
           await saveSnapshotTargeted({
             opts,
@@ -1381,9 +1360,7 @@ export function registerExecApprovalsCli(program: Command) {
         const file = input as ExecApprovalsFile;
         file.version = 1;
         await saveSnapshotTargeted({ opts, source, nodeId, file, baseHash, targetLabel });
-      } catch (err) {
-        failApprovalsCommand(err, opts);
-      }
+      });
     });
   nodesCallOpts(setCmd);
 

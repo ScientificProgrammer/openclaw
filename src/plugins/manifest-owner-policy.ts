@@ -1,6 +1,9 @@
 /** Applies manifest owner policy for plugin availability and activation decisions. */
 import type { OpenClawConfig } from "../config/types.openclaw.js";
-import { normalizePluginsConfig, resolveEffectivePluginActivationState } from "./config-state.js";
+import {
+  resolveEffectivePluginActivationState,
+  type NormalizedPluginsConfig,
+} from "./config-state.js";
 import { isPluginEnabledByDefaultForPlatform } from "./default-enablement.js";
 import type { PluginManifestRecord } from "./manifest-registry.js";
 import { normalizePluginPolicyId } from "./plugin-policy-id.js";
@@ -8,9 +11,8 @@ import { normalizePluginPolicyId } from "./plugin-policy-id.js";
 type OwnerPlugin = Pick<
   PluginManifestRecord,
   "id" | "origin" | "enabledByDefault" | "enabledByDefaultOnPlatforms"
->;
-
-type NormalizedPluginsConfig = ReturnType<typeof normalizePluginsConfig>;
+> &
+  Partial<Pick<PluginManifestRecord, "channels">>;
 
 /** Reasons a manifest owner plugin can fail the base activation policy. */
 export type ManifestOwnerBasePolicyBlockReason =
@@ -85,6 +87,7 @@ export function isActivatedManifestOwner(params: {
   return resolveEffectivePluginActivationState({
     id: params.plugin.id,
     origin: params.plugin.origin,
+    channelIds: params.plugin.channels,
     config: params.normalizedConfig,
     rootConfig: params.rootConfig,
     enabledByDefault: isPluginEnabledByDefaultForPlatform(params.plugin),

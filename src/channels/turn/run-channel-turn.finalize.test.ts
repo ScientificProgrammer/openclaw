@@ -1,14 +1,17 @@
-// Channel turn finalize tests cover orchestration, dispatch, and completion behavior.
+// Preserve mock setup before modules that consume it.
+// oxfmt-ignore
+import { channelTurnMocks } from "./run-channel-turn.test-support.js";
+import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { bindTestChannelParticipantAdmissionEvidence } from "../../../test/helpers/channel-admission-evidence.js";
+import { useAutoCleanupTempDirTracker } from "../../../test/helpers/temp-dir.js";
 import type { HistoryEntry } from "../../auto-reply/reply/history.types.js";
 import type { DispatchReplyWithBufferedBlockDispatcher } from "../../auto-reply/reply/provider-dispatcher.types.js";
-import type { FinalizedMsgContext } from "../../auto-reply/templating.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { resetDiagnosticEventsForTest } from "../../infra/diagnostic-events.js";
 import { resetLogger, setLoggerOverride } from "../../logging/logger.js";
 import {
-  configureChannelAdmissionEvidenceCollection,
+  createChannelAdmissionAudit,
   consumeChannelAdmissionEvidence,
   readChannelContextAdmissionEvidence,
 } from "../message-access/admission-evidence.js";
@@ -22,95 +25,28 @@ import {
 } from "./dispatch-result.js";
 import { runPreparedChannelTurn } from "./execution.js";
 import { dispatchAssembledChannelTurn } from "./lifecycle.js";
+import {
+  createCtx,
+  createRecordInboundSession,
+  expectDispatched,
+} from "./run-channel-turn.delivery.test-helpers.js";
 import { runChannelTurn } from "./run-channel-turn.js";
-import type { ChannelTurnHistoryFinalizeOptions, ChannelTurnResult } from "./types.js";
+import type { ChannelTurnHistoryFinalizeOptions } from "./types.js";
 
-const deliverOutboundPayloads = vi.hoisted(() => vi.fn());
-const resolveOutboundDurableFinalDeliverySupport = vi.hoisted(() => vi.fn());
-const sendDurableMessageBatch = vi.hoisted(() => vi.fn());
-const recordInboundSessionCore = vi.hoisted(() => vi.fn(async () => undefined));
-const dispatchReplyWithBufferedBlockDispatcherCore = vi.hoisted(() => vi.fn());
-const dispatchReplyWithRoutedChannelDispatcherCore = vi.hoisted(() => vi.fn());
-const emitMessageSent = vi.hoisted(() => vi.fn());
-const getGlobalHookRunner = vi.hoisted(() => vi.fn());
-const createMessageSentEmitter = vi.hoisted(() =>
-  vi.fn(() => ({ emitMessageSent, hasMessageSentHooks: true })),
-);
-const readRecentUserAssistantTextForSession = vi.hoisted(() => vi.fn());
-
-vi.mock("../../auto-reply/reply/provider-dispatcher.js", async (importOriginal) => {
-  const actual =
-    await importOriginal<typeof import("../../auto-reply/reply/provider-dispatcher.js")>();
-  return {
-    ...actual,
-    dispatchReplyWithBufferedBlockDispatcherCore,
-  };
-});
-
-vi.mock("../../auto-reply/dispatch.js", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("../../auto-reply/dispatch.js")>();
-  return {
-    ...actual,
-    dispatchInboundMessageWithRoutedChannelDispatcher: dispatchReplyWithRoutedChannelDispatcherCore,
-  };
-});
-
-vi.mock("../../infra/outbound/deliver.js", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("../../infra/outbound/deliver.js")>();
-  return {
-    ...actual,
-    deliverOutboundPayloads,
-    resolveOutboundDurableFinalDeliverySupport,
-  };
-});
-
-vi.mock("../message/send.js", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("../message/send.js")>();
-  return {
-    ...actual,
-    sendDurableMessageBatchCore: sendDurableMessageBatch,
-  };
-});
-
-vi.mock("../session.js", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("../session.js")>();
-  return { ...actual, recordInboundSession: recordInboundSessionCore };
-});
-
-vi.mock("../../infra/outbound/message-sent-hook.js", () => ({
+const {
+  resolveOutboundDurableFinalDeliverySupport,
+  recordInboundSessionCore,
+  dispatchReplyWithBufferedBlockDispatcherCore,
+  dispatchReplyWithRoutedChannelDispatcherCore,
+  emitMessageSent,
+  getGlobalHookRunner,
   createMessageSentEmitter,
-}));
-
-vi.mock("../../plugins/hook-runner-global.js", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("../../plugins/hook-runner-global.js")>();
-  return { ...actual, getGlobalHookRunner };
-});
-
-vi.mock("../../config/sessions/transcript.js", () => ({
   readRecentUserAssistantTextForSession,
-}));
+} = channelTurnMocks;
 
 const cfg = {} as OpenClawConfig;
-
-function createCtx(overrides: Partial<FinalizedMsgContext> = {}): FinalizedMsgContext {
-  return {
-    Body: "hello",
-    RawBody: "hello",
-    CommandBody: "hello",
-    From: "sender",
-    To: "target",
-    SessionKey: "agent:main:test:peer",
-    Provider: "test",
-    Surface: "test",
-    ...overrides,
-  } as FinalizedMsgContext;
-}
-
-function createRecordInboundSession(events: string[] = []): RecordInboundSession {
-  return vi.fn<RecordInboundSession>(async () => {
-    events.push("record");
-  });
-}
+const tempDirs = useAutoCleanupTempDirTracker(afterEach);
+let storePath: string;
 
 function createPendingGroupHistory() {
   const historyKey = "group-room-1";
@@ -149,7 +85,7 @@ function dispatchTestAssembledTurn(
   return dispatchAssembledChannelTurn({
     cfg,
     agentId: "main",
-    storePath: "/tmp/sessions.json",
+    storePath,
     ...overrides,
   });
 }
@@ -178,15 +114,6 @@ function finalizeResult(value: unknown): FinalizeResult {
   return value as FinalizeResult;
 }
 
-function expectDispatched<TDispatchResult>(
-  result: ChannelTurnResult<TDispatchResult>,
-): asserts result is Extract<ChannelTurnResult<TDispatchResult>, { dispatched: true }> {
-  expect(result.dispatched).toBe(true);
-  if (!result.dispatched) {
-    throw new Error("expected dispatch");
-  }
-}
-
 function loggedEvents(log: ReturnType<typeof vi.fn>): TurnLogEvent[] {
   return log.mock.calls.map(([event]) => {
     const entry = event as TurnLogEvent;
@@ -200,6 +127,7 @@ function loggedEvents(log: ReturnType<typeof vi.fn>): TurnLogEvent[] {
 
 describe("channel turn finalize", () => {
   beforeEach(() => {
+    storePath = path.join(tempDirs.make("openclaw-channel-turn-finalize-"), "sessions.json");
     vi.clearAllMocks();
     recordInboundSessionCore.mockResolvedValue(undefined);
     dispatchReplyWithBufferedBlockDispatcherCore.mockImplementation(createDispatch());
@@ -249,7 +177,7 @@ describe("channel turn finalize", () => {
     const first = await runPreparedChannelTurn({
       channel: "test",
       routeSessionKey: "agent:main:test:peer",
-      storePath: "/tmp/sessions.json",
+      storePath,
       ctxPayload: createCtx(),
       recordInboundSession,
       runDispatch,
@@ -262,7 +190,7 @@ describe("channel turn finalize", () => {
     const second = await runPreparedChannelTurn({
       channel: "test",
       routeSessionKey: "agent:main:test:peer",
-      storePath: "/tmp/sessions.json",
+      storePath,
       ctxPayload: createCtx(),
       recordInboundSession,
       runDispatch,
@@ -374,7 +302,7 @@ describe("channel turn finalize", () => {
     const result = await runPreparedChannelTurn({
       channel: "test",
       routeSessionKey: "agent:observer:test:peer",
-      storePath: "/tmp/sessions.json",
+      storePath,
       ctxPayload: createCtx({ SessionKey: "agent:observer:test:peer" }),
       recordInboundSession,
       runDispatch,
@@ -407,7 +335,7 @@ describe("channel turn finalize", () => {
       channel: "test",
       agentId: "observer",
       routeSessionKey: "agent:observer:test:peer",
-      storePath: "/tmp/sessions.json",
+      storePath,
       ctxPayload: createCtx({ SessionKey: "agent:observer:test:peer" }),
       recordInboundSession: createRecordInboundSession(events),
       dispatchReplyWithBufferedBlockDispatcher: createDispatch(events),
@@ -435,7 +363,7 @@ describe("channel turn finalize", () => {
     await runPreparedChannelTurn({
       channel: "test",
       routeSessionKey: "agent:main:test:group:room-1",
-      storePath: "/tmp/sessions.json",
+      storePath,
       ctxPayload: createCtx(),
       recordInboundSession: createRecordInboundSession(),
       runDispatch: vi.fn(async () => ({
@@ -456,7 +384,7 @@ describe("channel turn finalize", () => {
       runPreparedChannelTurn({
         channel: "test",
         routeSessionKey: "agent:main:test:peer",
-        storePath: "/tmp/sessions.json",
+        storePath,
         ctxPayload: createCtx(),
         recordInboundSession: createRecordInboundSession(),
         runDispatch,
@@ -479,7 +407,7 @@ describe("channel turn finalize", () => {
       runPreparedChannelTurn({
         channel: "test",
         routeSessionKey: "agent:main:test:peer",
-        storePath: "/tmp/sessions.json",
+        storePath,
         ctxPayload: createCtx({
           AgentId: "main",
           SessionTranscriptContext: { historyLimit: 1 },
@@ -512,7 +440,7 @@ describe("channel turn finalize", () => {
       runPreparedChannelTurn({
         channel: "test",
         routeSessionKey: "agent:main:test:peer",
-        storePath: "/tmp/sessions.json",
+        storePath,
         ctxPayload: createCtx(),
         recordInboundSession,
         onPreDispatchFailure,
@@ -544,7 +472,7 @@ describe("channel turn finalize", () => {
       runPreparedChannelTurn({
         channel: "test",
         routeSessionKey: "agent:main:test:peer",
-        storePath: "/tmp/sessions.json",
+        storePath,
         ctxPayload: createCtx(),
         recordInboundSession,
         runDispatch: vi.fn(async () => {
@@ -563,7 +491,7 @@ describe("channel turn finalize", () => {
     await runPreparedChannelTurn({
       channel: "test",
       routeSessionKey: "agent:main:test:peer",
-      storePath: "/tmp/sessions.json",
+      storePath,
       ctxPayload: createCtx(),
       recordInboundSession: createRecordInboundSession(events),
       afterRecord: vi.fn(async () => {
@@ -628,7 +556,7 @@ describe("channel turn finalize", () => {
       runPreparedChannelTurn({
         channel: "test",
         routeSessionKey: "agent:main:test:peer",
-        storePath: "/tmp/sessions.json",
+        storePath,
         ctxPayload: createCtx(),
         recordInboundSession: vi.fn(async () => {
           throw recordError;
@@ -855,10 +783,11 @@ describe("channel turn finalize", () => {
   });
 
   it("degrades private channel admission evidence when routing changes the DM scope", async () => {
-    const clearCollection = configureChannelAdmissionEvidenceCollection(true);
+    const audit = createChannelAdmissionAudit({ enabled: true });
     try {
       const ctx = createCtx();
       bindTestChannelParticipantAdmissionEvidence({
+        audit,
         context: ctx,
         channelId: "test",
         participantId: "person-1",
@@ -891,7 +820,7 @@ describe("channel turn finalize", () => {
         consumeChannelAdmissionEvidence(readChannelContextAdmissionEvidence(dispatched?.ctx ?? {})),
       ).toMatchObject({ ingressState: "unknown", invoker: { state: "unknown" } });
     } finally {
-      clearCollection();
+      audit.close();
     }
   });
 

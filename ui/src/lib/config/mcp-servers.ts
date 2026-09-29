@@ -1,8 +1,13 @@
 import { redactSensitiveUrlLikeString } from "@openclaw/net-policy/redact-sensitive-url";
+import { isHttpUrl } from "@openclaw/net-policy/url-protocol";
 import { asNullableRecord as asRecord } from "@openclaw/normalization-core/record-coerce";
+import { collectBaseArrayPaths } from "../../../../src/config/patch-replace-paths.js";
 import { t } from "../../i18n/index.ts";
+import { registerMcpEnglish } from "../../i18n/locales/en-mcp.ts";
 import { formatUiError } from "../format-error.ts";
 import type { RuntimeConfigCapability } from "./runtime-config-capability.ts";
+
+registerMcpEnglish();
 
 export const MCP_SERVER_NAME_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9._-]*$/;
 
@@ -14,12 +19,15 @@ export type McpServerSummary = {
   transport: McpServerTransport | "invalid";
   target: string;
   auth: string | null;
+  signIn: "operator" | "requester" | "profile" | null;
   toolFilter: boolean;
   parallel: boolean;
   tls: "verify-off" | "mtls" | null;
 };
 
-export type McpServersPatchBuildResult = { patch: Record<string, unknown> } | { error: string };
+export type McpServersPatchBuildResult =
+  | { patch: Record<string, unknown>; replacePaths?: string[] }
+  | { error: string };
 
 function splitMcpCommandLine(value: string): string[] | null {
   const parts: string[] = [];
@@ -102,12 +110,7 @@ export function parseMcpTarget(
   transport: McpServerTransport,
 ): Record<string, unknown> | null {
   if (transport !== "stdio") {
-    try {
-      const protocol = new URL(target).protocol;
-      return protocol === "http:" || protocol === "https:" ? { url: target, transport } : null;
-    } catch {
-      return null;
-    }
+    return isHttpUrl(target) ? { url: target, transport } : null;
   }
   if (/^https?:\/\//i.test(target)) {
     return null;
@@ -133,6 +136,7 @@ export function summarizeMcpServers(
       // Command only: stdio args routinely carry tokens, and this projection
       // is visible to read-only operators.
       const command = typeof server.command === "string" ? server.command : "";
+      const oauth = asRecord(server.oauth);
       const transport = command
         ? ("stdio" as const)
         : url
@@ -148,6 +152,16 @@ export function summarizeMcpServers(
         transport,
         target: command || redactSensitiveUrlLikeString(url),
         auth: typeof server.auth === "string" ? server.auth : null,
+        signIn:
+          server.auth !== "oauth"
+            ? null
+            : oauth?.authProfileId
+              ? ("profile" as const)
+              : oauth?.identity === "per-requester"
+                ? ("requester" as const)
+                : transport !== "stdio" && transport !== "invalid" && parseMcpTarget(url, transport)
+                  ? ("operator" as const)
+                  : null,
         toolFilter: Boolean(server.toolFilter),
         parallel: server.supportsParallelToolCalls === true,
         tls:
@@ -188,7 +202,10 @@ export function buildRemoveMcpServerPatch(
   name: string,
 ): McpServersPatchBuildResult {
   return Object.hasOwn(servers, name)
-    ? { patch: { [name]: null } }
+    ? {
+        patch: { [name]: null },
+        replacePaths: collectBaseArrayPaths(servers[name], `mcp.servers.${name}`),
+      }
     : { error: t("mcpServers.missing", { name }) };
 }
 
@@ -216,6 +233,7 @@ export async function patchMcpServers(
             options: {
               raw: { mcp: { servers: built.patch } },
               note: options.note,
+              ...(built.replacePaths?.length ? { replacePaths: built.replacePaths } : {}),
             },
           };
     });

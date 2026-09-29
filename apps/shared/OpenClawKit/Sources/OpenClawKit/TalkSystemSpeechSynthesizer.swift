@@ -37,6 +37,8 @@ public final class TalkSystemSpeechSynthesizer: NSObject {
     {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
+        // A cancelled caller must not retire the utterance already playing.
+        guard !Task.isCancelled else { throw SpeakError.canceled }
 
         self.stop()
         let token = UUID()
@@ -134,11 +136,7 @@ public final class TalkSystemSpeechSynthesizer: NSObject {
         self.didStartCallback = nil
         let cont = self.speakContinuation
         self.speakContinuation = nil
-        if let error {
-            cont?.resume(throwing: error)
-        } else {
-            cont?.resume(returning: ())
-        }
+        if let cont { ThrowingContinuationSupport.resumeVoid(cont, error: error) }
     }
 }
 

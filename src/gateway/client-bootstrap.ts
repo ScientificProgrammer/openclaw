@@ -1,16 +1,16 @@
 // Gateway client bootstrap resolver.
 // Collects URL, auth, and handshake settings before constructing a GatewayClient.
-import { gatewayOriginScope } from "../../packages/gateway-client/src/gateway-origin-scope.js";
 import { resolveGatewayPublicOrigin } from "../config/gateway-public-origin.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
-import { loadGatewayTlsRuntime } from "../infra/tls/gateway.js";
 import {
   resolveGatewayInteractiveSurfaceAuth,
   resolveGatewayProbeSurfaceAuth,
 } from "./auth-surface-resolution.js";
 import {
   buildGatewayConnectionDetailsWithResolvers,
+  resolveGatewayDeviceAuthRoute,
   type GatewayConnectionDetails,
+  type GatewaySshRoute,
 } from "./connection-details.js";
 import { normalizeControlUiBasePath } from "./control-ui-shared.js";
 import { resolveGatewayCredentialsWithSecretInputs } from "./credentials-secret-inputs.js";
@@ -42,16 +42,16 @@ export class GatewayExplicitAuthRequiredError extends Error {
   }
 }
 
-export function ensureExplicitGatewayAuth(params: {
+export async function ensureExplicitGatewayAuth(params: {
   urlOverride?: string;
   urlOverrideSource?: "cli" | "env";
   explicitAuth?: ExplicitGatewayAuth;
   resolvedAuth?: ExplicitGatewayAuth;
   deviceAuthScope?: string;
-  allowStoredOriginAuth?: (scope: string) => boolean;
+  allowStoredOriginAuth?: (scope: string) => boolean | Promise<boolean>;
   errorHint: string;
   configPath?: string;
-}): void {
+}): Promise<void> {
   if (!params.urlOverride || !params.urlOverrideSource) {
     return;
   }
@@ -64,7 +64,10 @@ export function ensureExplicitGatewayAuth(params: {
   ) {
     return;
   }
-  if (params.deviceAuthScope && params.allowStoredOriginAuth?.(params.deviceAuthScope) === true) {
+  if (
+    params.deviceAuthScope &&
+    (await params.allowStoredOriginAuth?.(params.deviceAuthScope)) === true
+  ) {
     return;
   }
   const sourceHint =
@@ -185,8 +188,9 @@ export async function resolveGatewayClientBootstrap(params: {
   localPortOverride?: number;
   configPath?: string;
   explicitTlsFingerprint?: string;
+  serviceTargetUrl?: string;
   skipImplicitAuth?: boolean;
-  allowStoredOriginAuth?: (scope: string) => boolean;
+  allowStoredOriginAuth?: (scope: string) => boolean | Promise<boolean>;
   overrideAuthErrorHint?: string;
   buildConnectionDetails?: (options: {
     config: OpenClawConfig;
@@ -195,19 +199,15 @@ export async function resolveGatewayClientBootstrap(params: {
     urlSource?: "cli" | "env";
     ignoreEnvUrlOverride?: boolean;
     localPortOverride?: number;
+    serviceTargetUrl?: string;
   }) => GatewayConnectionDetails;
-  resolveTlsFingerprint?: (params: {
-    config: OpenClawConfig;
-    url: string;
-    urlSource: string;
-    explicitTlsFingerprint?: string;
-  }) => Promise<string | undefined>;
 }): Promise<{
   url: string;
   urlSource: string;
   connectionDetails: GatewayConnectionDetails;
   urlOverrideSource?: "cli" | "env";
   deviceAuthScope?: string;
+  sshTunnel?: GatewaySshRoute;
   authFailureReason?: string;
   preauthHandshakeTimeoutMs?: number;
   tlsFingerprint?: string;
@@ -235,6 +235,7 @@ export async function resolveGatewayClientBootstrap(params: {
     ...(params.localPortOverride !== undefined
       ? { localPortOverride: params.localPortOverride }
       : {}),
+    ...(params.serviceTargetUrl ? { serviceTargetUrl: params.serviceTargetUrl } : {}),
   });
   const detectedUrlOverrideSource = resolveGatewayUrlOverrideSource(connection.urlSource);
   const urlOverrideSource = urlOverride.source ?? detectedUrlOverrideSource;
@@ -250,20 +251,12 @@ export async function resolveGatewayClientBootstrap(params: {
         })
       : undefined;
   const tlsUrlSource = configuredTarget?.tlsSource ?? connection.urlSource;
-  const tlsFingerprint = params.resolveTlsFingerprint
-    ? await params.resolveTlsFingerprint({
-        config: params.config,
-        url: connection.url,
-        urlSource: tlsUrlSource,
-        explicitTlsFingerprint: params.explicitTlsFingerprint,
-      })
-    : await resolveGatewayConnectionTlsFingerprint({
-        config: params.config,
-        url: connection.url,
-        urlSource: tlsUrlSource,
-        explicitTlsFingerprint: params.explicitTlsFingerprint,
-        loadGatewayTlsRuntime,
-      });
+  const tlsFingerprint = await resolveGatewayConnectionTlsFingerprint({
+    config: params.config,
+    url: connection.url,
+    urlSource: tlsUrlSource,
+    explicitTlsFingerprint: params.explicitTlsFingerprint,
+  });
   // Only direct CLI/env URL overrides should constrain token/password fallback. Config-derived
   // remote URLs are canonical config, not a caller override.
   const surface =
@@ -305,15 +298,20 @@ export async function resolveGatewayClientBootstrap(params: {
       env,
       urlOverride: urlOverrideSource ? connection.url : undefined,
       urlOverrideSource,
-      modeOverride: params.modeOverride,
+      modeOverride: surface,
     });
   }
-  const deviceAuthScope =
-    urlOverrideSource || params.config.gateway?.mode === "remote"
-      ? gatewayOriginScope(connection.url)
-      : undefined;
+  const { deviceAuthScope, sshTunnel } = resolveGatewayDeviceAuthRoute({
+    config: params.config,
+    url: connection.url,
+    remote: Boolean(urlOverrideSource || connection.urlSource === "config gateway.remote.url"),
+    configuredRemote:
+      (!urlOverrideSource && connection.urlSource === "config gateway.remote.url") ||
+      configuredTarget?.authSurface === "remote",
+    tlsFingerprint,
+  });
   if (params.overrideAuthErrorHint && !configuredTarget) {
-    ensureExplicitGatewayAuth({
+    await ensureExplicitGatewayAuth({
       urlOverride: urlOverrideSource ? connection.url : undefined,
       urlOverrideSource,
       explicitAuth,
@@ -330,6 +328,7 @@ export async function resolveGatewayClientBootstrap(params: {
     connectionDetails: connection,
     ...(urlOverrideSource ? { urlOverrideSource } : {}),
     ...(deviceAuthScope ? { deviceAuthScope } : {}),
+    ...(sshTunnel ? { sshTunnel } : {}),
     ...(auth.failureReason ? { authFailureReason: auth.failureReason } : {}),
     ...(tlsFingerprint ? { tlsFingerprint } : {}),
     auth: {

@@ -1,4 +1,4 @@
-// Store entry shape normalization rejects unsafe persisted metadata before runtime use.
+import { asNonNegativeFiniteNumber } from "@openclaw/normalization-core/number-coercion";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import {
@@ -9,6 +9,18 @@ import { parseAgentSessionKey } from "../../routing/session-key.js";
 import { validateSessionId } from "./paths.js";
 import type { PendingTranscriptRepairState, SessionEntry } from "./types.js";
 
+function normalizeSessionEntryArchiveReason(
+  value: unknown,
+): SessionEntry["archiveReason"] | undefined {
+  return value === "manual" ||
+    value === "active-session-cap" ||
+    value === "age-retention" ||
+    value === "stale-dashboard" ||
+    value === "restart-recovery"
+    ? value
+    : undefined;
+}
+
 // Persisted stores may contain old or malformed ids; reject path-like ids before use.
 function isSafeSessionId(value: unknown): value is string {
   if (typeof value !== "string") {
@@ -16,9 +28,6 @@ function isSafeSessionId(value: unknown): value is string {
   }
   const trimmed = value.trim();
   if (!trimmed || trimmed.length > 255 || trimmed !== trimmed.normalize("NFC")) {
-    return false;
-  }
-  if (trimmed.includes("/") || trimmed.includes("\\") || trimmed === "." || trimmed === "..") {
     return false;
   }
   return /^[\p{L}\p{N}][\p{L}\p{N}\p{M}._:@-]*$/u.test(trimmed);
@@ -33,11 +42,7 @@ function normalizeTranscriptSessionId(value: string): string | undefined {
 }
 
 function normalizeOptionalTimestamp(value: unknown): number | undefined {
-  return value === undefined
-    ? undefined
-    : typeof value === "number" && Number.isFinite(value) && value >= 0
-      ? value
-      : 0;
+  return value === undefined ? undefined : (asNonNegativeFiniteNumber(value) ?? 0);
 }
 
 /** Removes retired runtime locator fields before a session entry is persisted or returned. */
@@ -66,22 +71,21 @@ export function projectCanonicalSessionEntryShape(value: Record<string, unknown>
     participantCount: _projectedParticipantCount,
     ...canonicalValue
   } = value;
+  const setOptionalField = (key: keyof SessionEntry, normalized: unknown) => {
+    if (normalized) {
+      canonicalValue[key] = normalized;
+    } else {
+      delete canonicalValue[key];
+    }
+  };
   const icon =
     typeof canonicalValue.icon === "string" ? normalizeSessionIconValue(canonicalValue.icon) : null;
-  if (icon) {
-    canonicalValue.icon = icon;
-  } else {
-    delete canonicalValue.icon;
-  }
+  setOptionalField("icon", icon);
   const color =
     typeof canonicalValue.color === "string"
       ? normalizeSessionColorValue(canonicalValue.color)
       : null;
-  if (color) {
-    canonicalValue.color = color;
-  } else {
-    delete canonicalValue.color;
-  }
+  setOptionalField("color", color);
   const legacyPendingText = normalizeOptionalString(pendingFinalDeliveryText);
   const legacySelectedModel = normalizeOptionalString(fallbackNoticeSelectedModel);
   const legacyActiveModel = normalizeOptionalString(fallbackNoticeActiveModel);
@@ -105,27 +109,15 @@ export function projectCanonicalSessionEntryShape(value: Record<string, unknown>
           ...(intentId ? { intentId } : {}),
         }
       : undefined);
-  if (pendingFinalDelivery) {
-    canonicalValue.pendingFinalDelivery = pendingFinalDelivery;
-  } else {
-    delete canonicalValue.pendingFinalDelivery;
-  }
-  const pendingDeliveryNotice = normalizePendingDeliveryNotice(
-    canonicalValue.pendingDeliveryNotice,
+  setOptionalField("pendingFinalDelivery", pendingFinalDelivery);
+  setOptionalField(
+    "pendingDeliveryNotice",
+    normalizePendingDeliveryNotice(canonicalValue.pendingDeliveryNotice),
   );
-  if (pendingDeliveryNotice) {
-    canonicalValue.pendingDeliveryNotice = pendingDeliveryNotice;
-  } else {
-    delete canonicalValue.pendingDeliveryNotice;
-  }
-  const pendingTranscriptRepair = normalizePendingTranscriptRepair(
-    canonicalValue.pendingTranscriptRepair,
+  setOptionalField(
+    "pendingTranscriptRepair",
+    normalizePendingTranscriptRepair(canonicalValue.pendingTranscriptRepair),
   );
-  if (pendingTranscriptRepair) {
-    canonicalValue.pendingTranscriptRepair = pendingTranscriptRepair;
-  } else {
-    delete canonicalValue.pendingTranscriptRepair;
-  }
   const reason = normalizeOptionalString(fallbackNoticeReason);
   const fallbackNotice =
     normalizeFallbackNotice(canonicalValue.fallbackNotice) ??
@@ -137,11 +129,7 @@ export function projectCanonicalSessionEntryShape(value: Record<string, unknown>
           ...(reason ? { reason } : {}),
         }
       : undefined);
-  if (fallbackNotice) {
-    canonicalValue.fallbackNotice = fallbackNotice;
-  } else {
-    delete canonicalValue.fallbackNotice;
-  }
+  setOptionalField("fallbackNotice", fallbackNotice);
   const memoryFlush =
     normalizeMemoryFlush(canonicalValue.memoryFlush) ??
     (legacyFlushFailureCount && legacyFlushFailureCount > 0
@@ -155,10 +143,13 @@ export function projectCanonicalSessionEntryShape(value: Record<string, unknown>
       : legacyFlushCompactionCount !== undefined
         ? { kind: "succeeded" as const, compactionCount: legacyFlushCompactionCount }
         : undefined);
-  if (memoryFlush) {
-    canonicalValue.memoryFlush = memoryFlush;
+  setOptionalField("memoryFlush", memoryFlush);
+  const archiveReason = normalizeSessionEntryArchiveReason(canonicalValue.archiveReason);
+  if (canonicalValue.archivedAt !== undefined) {
+    setOptionalField("archiveReason", archiveReason);
   } else {
-    delete canonicalValue.memoryFlush;
+    delete canonicalValue.archivedBy;
+    delete canonicalValue.archiveReason;
   }
   return canonicalValue as unknown as SessionEntry;
 }
@@ -306,9 +297,8 @@ function normalizeMemoryFlush(value: unknown): SessionEntry["memoryFlush"] | und
 }
 
 function normalizeCount(value: unknown): number | undefined {
-  return typeof value === "number" && Number.isFinite(value) && value >= 0
-    ? Math.floor(value)
-    : undefined;
+  const number = asNonNegativeFiniteNumber(value);
+  return number === undefined ? undefined : Math.floor(number);
 }
 
 /** Normalizes persisted session store entries before they reach runtime callers. */

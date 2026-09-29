@@ -1,6 +1,7 @@
 import type {
   AgentHarnessSessionDeletionMutation,
   AgentHarnessSessionDeletionParams,
+  AgentHarness,
 } from "openclaw/plugin-sdk/agent-harness-runtime";
 import { isIncognitoSessionKey } from "../incognito-session.js";
 import {
@@ -21,11 +22,17 @@ import type {
   CodexAppServerThreadBinding,
   CodexSessionGenerationRetirementResult,
 } from "./session-binding.js";
+import { getCodexSessionInitializationRollback } from "./session-initialization.js";
 import { retainSharedCodexAppServerClientByInstanceId } from "./shared-client.js";
-import { withCodexAppServerThreadMutation } from "./thread-ownership.js";
+import {
+  isSameCodexAppServerThreadOwner,
+  withCodexAppServerThreadMutation,
+} from "./thread-ownership.js";
 
 async function releaseSessionSubscription(
-  client: NonNullable<ReturnType<typeof retainSharedCodexAppServerClientByInstanceId>>["client"],
+  client: NonNullable<
+    Awaited<ReturnType<typeof retainSharedCodexAppServerClientByInstanceId>>
+  >["client"],
   binding: CodexAppServerThreadBinding,
   sessionKey: string | undefined,
   assertCurrent?: () => void,
@@ -33,7 +40,8 @@ async function releaseSessionSubscription(
   assertCurrent?.();
   // End child ownership before the parent subscription, so late completions
   // cannot deliver into a replacement OpenClaw session generation.
-  codexNativeSubagentMonitorRuntime.retireParent(client, binding.threadId);
+  await codexNativeSubagentMonitorRuntime.retireParent(client, binding.threadId);
+  assertCurrent?.();
   const released = await releaseCodexAppServerLiveThread(client, binding.threadId, assertCurrent);
   assertCurrent?.();
   if (!released && isIncognitoSessionKey(sessionKey)) {
@@ -52,6 +60,28 @@ async function releaseSessionSubscription(
   }
 }
 
+/** Retire the old native context when the host commits a rewind or branch switch. */
+export async function withCodexAppServerSessionContextReset<T>(
+  bindingStore: CodexAppServerBindingStore,
+  params: Parameters<NonNullable<AgentHarness["withSessionContextReset"]>>[0],
+  run: (mutation: AgentHarnessSessionDeletionMutation) => Promise<T>,
+): Promise<T> {
+  params.assertCurrent();
+  const plan = await bindingStore.prepareSessionGenerationReclaim({
+    kind: "session",
+    agentId: params.agentId,
+    sessionKey: params.sessionKey,
+    sessionId: params.sessionId,
+  });
+  params.assertCurrent();
+  // Prepare the recorded predecessor directly; a rejected cut must not adopt or reset it.
+  const sessionId =
+    plan.kind === "verify" && plan.expectedPreviousSessionId === params.previousSessionId
+      ? plan.expectedPreviousSessionId
+      : params.sessionId;
+  return withCodexAppServerSessionDeletion(bindingStore, { ...params, sessionId }, run);
+}
+
 /** Prepare exact binding deletion before the session owner commits either database. */
 export async function withCodexAppServerSessionDeletion<T>(
   bindingStore: CodexAppServerBindingStore,
@@ -65,16 +95,20 @@ export async function withCodexAppServerSessionDeletion<T>(
     sessionKey: params.sessionKey,
     sessionId: params.sessionId,
   };
-  return await bindingStore.withSessionDeletion(
-    identity,
-    assertCurrent,
-    async (binding, mutation) => {
+  const remove = () =>
+    bindingStore.withSessionDeletion(identity, assertCurrent, async (binding, mutation) => {
       assertCurrent();
-      if (binding?.connectionScope === "supervision") {
+      const rollbackInitialization = getCodexSessionInitializationRollback(
+        bindingStore,
+        params,
+        identity,
+        binding,
+      );
+      if (binding?.connectionScope === "supervision" && !rollbackInitialization) {
         throw new Error("Cannot delete a session while its Codex binding is owned by supervision");
       }
       const clientLease = binding?.clientId
-        ? retainSharedCodexAppServerClientByInstanceId(binding.clientId)
+        ? await retainSharedCodexAppServerClientByInstanceId(binding.clientId)
         : undefined;
       const assertUnclaimed = () => {
         assertCurrent();
@@ -104,6 +138,10 @@ export async function withCodexAppServerSessionDeletion<T>(
         });
       } finally {
         try {
+          if (committed && rollbackInitialization) {
+            assertCurrent();
+            await rollbackInitialization();
+          }
           // An artifact publication failure after COMMIT still ends this subscription;
           // only the session owner's transaction rollback may restore the binding.
           if (committed && binding && clientLease) {
@@ -131,11 +169,11 @@ export async function withCodexAppServerSessionDeletion<T>(
             });
           }
         } finally {
-          clientLease?.release();
+          await clientLease?.release();
         }
       }
-    },
-  );
+    });
+  return params.initialization ? await bindingStore.withThreadArchiveFence(remove) : await remove();
 }
 
 /** Retire binding and native subscription under the same generation/physical-client ownership fence. */
@@ -148,33 +186,35 @@ export async function retireCodexAppServerSessionGeneration(params: {
     params.mode === "reset"
       ? params.bindingStore.resetSessionGeneration(params.identity)
       : params.bindingStore.retireSessionGeneration(params.identity);
-  const expectedBinding = await params.bindingStore.read(params.identity);
+  const expectedBinding = params.bindingStore.read(params.identity);
   if (!expectedBinding) {
     // Leasing an absent/retired row manufactures state or rejects its fence;
     // callers need the original absent/conflict result for reset reclamation.
     return await retireGeneration();
   }
-  return await params.bindingStore.withLease(params.identity, async () => {
-    const binding = await params.bindingStore.read(params.identity);
-    if (binding?.threadId !== expectedBinding.threadId) {
-      return "conflict";
-    }
-    const result = await retireGeneration();
-    if (result !== "applied" || !binding?.clientId) {
-      return result;
-    }
+  return await withCodexAppServerThreadMutation(expectedBinding.threadId, () =>
+    params.bindingStore.withLease(params.identity, async () => {
+      const binding = params.bindingStore.read(params.identity);
+      if (!binding || !isSameCodexAppServerThreadOwner(binding, expectedBinding)) {
+        return "conflict";
+      }
+      const result = await retireGeneration();
+      if (result !== "applied" || !binding?.clientId) {
+        return result;
+      }
 
-    // Locate the original physical client only after its exact binding was
-    // retired; delayed reset events must never unsubscribe a newer generation.
-    const clientLease = retainSharedCodexAppServerClientByInstanceId(binding.clientId);
-    if (!clientLease) {
+      // Locate the original physical client only after its exact binding was
+      // retired; delayed reset events must never unsubscribe a newer generation.
+      const clientLease = await retainSharedCodexAppServerClientByInstanceId(binding.clientId);
+      if (!clientLease) {
+        return result;
+      }
+      try {
+        await releaseSessionSubscription(clientLease.client, binding, params.identity.sessionKey);
+      } finally {
+        await clientLease.release();
+      }
       return result;
-    }
-    try {
-      await releaseSessionSubscription(clientLease.client, binding, params.identity.sessionKey);
-    } finally {
-      clientLease.release();
-    }
-    return result;
-  });
+    }),
+  );
 }

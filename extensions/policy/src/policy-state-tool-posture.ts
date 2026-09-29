@@ -1,3 +1,4 @@
+import { resolveExecModePolicy } from "openclaw/plugin-sdk/exec-approvals-runtime";
 import {
   asNonArrayRecord,
   isRecord,
@@ -6,6 +7,8 @@ import {
 } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { collectPolicyConfiguredAgents, ocPathSegment } from "./policy-state-helpers.js";
 import type { PolicyToolPostureEvidence } from "./policy-state-types.js";
+
+type ExecMode = "deny" | "allowlist" | "ask" | "auto" | "full";
 
 export function scanPolicyToolPosture(
   cfg: Record<string, unknown>,
@@ -49,17 +52,7 @@ export function scanPolicyToolPosture(
 
 function pushToolPostureEvidence(
   entries: PolicyToolPostureEvidence[],
-  params: {
-    readonly id: string;
-    readonly scope: "global" | "agent";
-    readonly agentId?: string;
-    readonly tools: Record<string, unknown>;
-    readonly inheritedTools: Record<string, unknown>;
-    readonly sandbox: Record<string, unknown>;
-    readonly inheritedSandbox: Record<string, unknown>;
-    readonly sourceBase: string;
-    readonly inheritedSourceBase: string;
-  },
+  params: ToolPostureParams,
 ): void {
   const localProfile = readString(params.tools.profile);
   const inheritedProfile = readString(params.inheritedTools.profile);
@@ -112,29 +105,54 @@ function pushToolExecPosture(
 
   const localSecurity = readString(localExec.security);
   const inheritedSecurity = readString(inheritedExec.security);
+  const localAsk = readString(localExec.ask);
+  const inheritedAsk = readString(inheritedExec.ask);
+  const localMode = readExecMode(localExec.mode);
+  const inheritedMode = readExecMode(inheritedExec.mode);
   // Config conformance intentionally ignores exec-approvals.json runtime/operator state.
   const sandboxMode = readString(params.sandbox.mode) ?? readString(params.inheritedSandbox.mode);
   const sandboxCanApply = sandboxMode === "all";
-  pushToolPostureValue(entries, params, {
-    suffix: "exec/security",
-    kind: "execSecurity",
-    value:
-      localSecurity ??
-      inheritedSecurity ??
-      (host === "sandbox" || (host === "auto" && sandboxCanApply) ? "deny" : "full"),
-    explicit: localSecurity !== undefined || inheritedSecurity !== undefined,
-    inherited: localSecurity === undefined && inheritedSecurity !== undefined,
-  });
-
-  const localAsk = readString(localExec.ask);
-  const inheritedAsk = readString(inheritedExec.ask);
-  pushToolPostureValue(entries, params, {
-    suffix: "exec/ask",
-    kind: "execAsk",
-    value: localAsk ?? inheritedAsk ?? "off",
-    explicit: localAsk !== undefined || inheritedAsk !== undefined,
-    inherited: localAsk === undefined && inheritedAsk !== undefined,
-  });
+  const defaultSecurity =
+    host === "sandbox" || (host === "auto" && sandboxCanApply) ? "deny" : "full";
+  const selectedMode =
+    localMode === undefined
+      ? inheritedMode === undefined
+        ? undefined
+        : { value: inheritedMode, inherited: true }
+      : { value: localMode, inherited: false };
+  const modePosture =
+    selectedMode === undefined
+      ? undefined
+      : {
+          ...selectedMode,
+          // A selected mode owns both posture fields, so the resolver ignores legacy inputs.
+          ...resolveExecModePolicy({
+            mode: selectedMode.value,
+            security: "full",
+            ask: "off",
+          }),
+        };
+  for (const [field, kind, local, inherited, fallback] of [
+    ["security", "execSecurity", localSecurity, inheritedSecurity, defaultSecurity],
+    ["ask", "execAsk", localAsk, inheritedAsk, "off"],
+  ] as const) {
+    const usesMode =
+      modePosture?.inherited === false || (local === undefined && modePosture?.inherited === true);
+    pushToolPostureValue(entries, params, {
+      suffix: `exec/${field}`,
+      sourceSuffix: usesMode ? "exec/mode" : undefined,
+      kind,
+      value:
+        modePosture?.inherited === false
+          ? modePosture[field]
+          : (local ?? modePosture?.[field] ?? inherited ?? fallback),
+      explicit: modePosture !== undefined || local !== undefined || inherited !== undefined,
+      inherited:
+        modePosture?.inherited === true
+          ? local === undefined
+          : local === undefined && inherited !== undefined,
+    });
+  }
 }
 
 function pushToolElevatedPosture(
@@ -199,6 +217,7 @@ function pushToolPostureValue(
   params: ToolPostureParams,
   entry: {
     readonly suffix: string;
+    readonly sourceSuffix?: string;
     readonly kind: PolicyToolPostureEvidence["kind"];
     readonly value: boolean | string | undefined;
     readonly explicit: boolean;
@@ -208,12 +227,26 @@ function pushToolPostureValue(
   entries.push({
     id: `${params.id}-${entry.suffix.replaceAll("/", "-")}`,
     kind: entry.kind,
-    source: `${entry.inherited ? params.inheritedSourceBase : params.sourceBase}/${entry.suffix}`,
+    source: `${entry.inherited ? params.inheritedSourceBase : params.sourceBase}/${entry.sourceSuffix ?? entry.suffix}`,
     scope: params.scope,
     ...(params.agentId === undefined ? {} : { agentId: params.agentId }),
     ...(entry.value === undefined ? {} : { value: entry.value }),
     explicit: entry.explicit,
   });
+}
+
+function readExecMode(value: unknown): ExecMode | undefined {
+  const mode = readString(value)?.toLowerCase();
+  switch (mode) {
+    case "deny":
+    case "allowlist":
+    case "ask":
+    case "auto":
+    case "full":
+      return mode;
+    default:
+      return undefined;
+  }
 }
 
 function pushToolPostureList(

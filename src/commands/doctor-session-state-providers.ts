@@ -23,35 +23,20 @@ import { listPluginDoctorSessionRouteStateOwners } from "../plugins/doctor-contr
 import type { DoctorSessionRouteStateOwner } from "../plugins/doctor-session-route-state-owner-types.js";
 import { isValidAgentHarnessSessionStoreEntry } from "../sessions/agent-harness-session-key.js";
 import { parseAgentSessionKey } from "../sessions/session-key-utils.js";
+import type { DoctorPrompter } from "./doctor-prompter.js";
+import { countLabel } from "./doctor-state-integrity-format.js";
 
-type DoctorPrompterLike = {
-  confirmRuntimeRepair: (params: {
-    message: string;
-    initialValue?: boolean;
-    requiresInteractiveConfirmation?: boolean;
-  }) => Promise<boolean>;
+type DoctorPrompterLike = Pick<DoctorPrompter, "confirmRuntimeRepair"> & {
   note?: typeof note;
 };
-
-function countLabel(count: number, singular: string, plural = `${singular}s`): string {
-  return `${count} ${count === 1 ? singular : plural}`;
-}
 
 function normalizeIdSet(values: readonly string[] | undefined): Set<string> {
   return new Set((values ?? []).map((value) => normalizeProviderId(value)));
 }
 
-function normalizePrefixList(values: readonly string[] | undefined): string[] {
-  return normalizeStringEntriesLower(values);
-}
-
 function ownsPrefixedValue(prefixes: readonly string[], value: unknown): boolean {
   const normalized = normalizeString(value)?.toLowerCase();
   return normalized !== undefined && prefixes.some((prefix) => normalized.startsWith(prefix));
-}
-
-function countSessionLabel(count: number): string {
-  return countLabel(count, "session");
 }
 
 function repairExample(repair: DoctorSessionRouteStateRepair): string {
@@ -109,13 +94,6 @@ function resolveConfiguredDoctorSessionStateRoute(params: {
   };
 }
 
-function resolvePluginDoctorSessionRouteStateOwners(params: {
-  cfg: OpenClawConfig;
-  env?: NodeJS.ProcessEnv;
-}): DoctorSessionRouteStateOwner[] {
-  return listPluginDoctorSessionRouteStateOwners({ config: params.cfg, env: params.env });
-}
-
 function entryMayContainPluginSessionRouteState(sessionKey: string, entry: SessionEntry): boolean {
   if (isValidAgentHarnessSessionStoreEntry(sessionKey, entry)) {
     return false;
@@ -135,6 +113,7 @@ function entryMayContainPluginSessionRouteState(sessionKey: string, entry: Sessi
     normalizeString(record.agentRuntimeOverride) !== undefined ||
     record.cliSessionBindings !== undefined ||
     record.cliSessionIds !== undefined ||
+    normalizeString(record.claudeCliSessionId) !== undefined ||
     normalizeString(record.authProfileOverride) !== undefined ||
     normalizeString(record.authProfileOverrideSource) !== undefined
   );
@@ -216,6 +195,8 @@ function hasOwnedCliSession(params: {
   return params.cliSessionKeys.some((key) => {
     const normalized = normalizeProviderId(key);
     return (
+      (normalized === "claude-cli" &&
+        normalizeString(params.entry.claudeCliSessionId) !== undefined) ||
       (bindings !== null &&
         typeof bindings === "object" &&
         normalized in bindings &&
@@ -244,7 +225,7 @@ function scanEntryForOwner(params: {
   const providerIds = normalizeIdSet(params.owner.providerIds);
   const runtimeIds = normalizeIdSet(params.owner.runtimeIds);
   const cliSessionKeys = [...normalizeIdSet(params.owner.cliSessionKeys)];
-  const authProfilePrefixes = normalizePrefixList(params.owner.authProfilePrefixes);
+  const authProfilePrefixes = normalizeStringEntriesLower(params.owner.authProfilePrefixes);
   const routeAllowsOwner = routeAllowsOwnerState({ owner: params.owner, route: params.route });
   const routeRuntime = normalizeString(params.route?.runtime);
   const routeAllowsOwnerRuntime =
@@ -293,25 +274,20 @@ function scanEntryForOwner(params: {
   const explicitOwnedOverride =
     directOverrideIsOwned && directOverrideSource !== undefined && directOverrideSource !== "auto";
   if (!routeAllowsOwnerRuntime && !explicitOwnedOverride) {
-    const harnessId = normalizeString(params.entry.agentHarnessId);
-    if (harnessId && runtimeIds.has(normalizeProviderId(harnessId))) {
-      addReason(reasons, "pinned runtime");
-      pinnedRuntimeKeys.push("agentHarnessId");
-    }
-    const runtimeOverride = normalizeString(params.entry.agentRuntimeOverride);
-    if (runtimeOverride && runtimeIds.has(normalizeProviderId(runtimeOverride))) {
-      addReason(reasons, "pinned runtime");
-      pinnedRuntimeKeys.push("agentRuntimeOverride");
+    for (const key of ["agentHarnessId", "agentRuntimeOverride"]) {
+      const runtime = normalizeString(params.entry[key]);
+      if (runtime && runtimeIds.has(normalizeProviderId(runtime))) {
+        addReason(reasons, "pinned runtime");
+        pinnedRuntimeKeys.push(key);
+      }
     }
   }
   if (!routeAllowsOwner && !explicitOwnedOverride) {
-    const runtimeModel = normalizeString(params.entry.model);
-    const runtimeRef = runtimeModel
-      ? parseModelRef(runtimeModel, normalizeString(params.entry.modelProvider) ?? "", {
-          allowManifestNormalization: false,
-          allowPluginNormalization: false,
-        })
-      : null;
+    const runtimeRef = resolvePersistedOverrideModelRef({
+      defaultProvider: "",
+      overrideProvider: params.entry.modelProvider,
+      overrideModel: params.entry.model,
+    });
     if (runtimeRef && providerIds.has(normalizeProviderId(runtimeRef.provider))) {
       addReason(reasons, "runtime model state");
     }
@@ -359,7 +335,7 @@ export function createPluginSessionStateDoctorScanner(params: {
       if (!isRecord(entry)) {
         return;
       }
-      owners ??= resolvePluginDoctorSessionRouteStateOwners(params);
+      owners ??= listPluginDoctorSessionRouteStateOwners({ config: params.cfg, env: params.env });
       if (owners.length === 0) {
         return;
       }
@@ -449,6 +425,8 @@ function applySessionRouteStateRepair(params: {
     clear("providerOverride");
     clear("modelOverride");
     clear("modelOverrideSource");
+    clear("modelOverrideFallbackOriginProvider");
+    clear("modelOverrideFallbackOriginModel");
     clear("modelOverrideRouteResolution");
     clear("liveModelSwitchPending");
   }
@@ -469,6 +447,10 @@ function applySessionRouteStateRepair(params: {
       clearRecordKeys(params.entry, "cliSessionBindings", params.repair.cliSessionKeys) || changed;
     changed =
       clearRecordKeys(params.entry, "cliSessionIds", params.repair.cliSessionKeys) || changed;
+    if (params.repair.cliSessionKeys.includes("claude-cli")) {
+      // Doctor's later binding migration must not restore a conversation this repair cleared.
+      clear("claudeCliSessionId");
+    }
   }
   if (params.repair.reasons.includes("auto auth profile override")) {
     clear("authProfileOverride");
@@ -507,7 +489,7 @@ export async function runPluginSessionStateDoctorRepairs(params: {
   const { scan } = params;
   if (scan.repairs.length > 0) {
     for (const [ownerLabel, repairs] of groupRepairsByOwner(scan.repairs)) {
-      const staleCount = countSessionLabel(repairs.length);
+      const staleCount = countLabel(repairs.length, "session");
       params.warnings.push(
         [
           `- Found stale ${ownerLabel} session routing state in ${staleCount} outside the current configured model/runtime route.`,
@@ -565,8 +547,9 @@ export async function runPluginSessionStateDoctorRepairs(params: {
         }
         if (repaired > 0) {
           params.changes.push(
-            `- Cleared stale ${ownerLabel} session routing state for ${countSessionLabel(
+            `- Cleared stale ${ownerLabel} session routing state for ${countLabel(
               repaired,
+              "session",
             )}.`,
           );
         }
@@ -581,8 +564,9 @@ export async function runPluginSessionStateDoctorRepairs(params: {
     for (const [ownerLabel, hits] of grouped) {
       params.warnings.push(
         [
-          `- Found explicit ${ownerLabel} model overrides in ${countSessionLabel(
+          `- Found explicit ${ownerLabel} model overrides in ${countLabel(
             hits.length,
+            "session",
           )} outside the current configured route.`,
           "  Doctor leaves explicit or legacy user selections untouched; switch them with /model or reset the session if that provider is no longer intended.",
           `  Examples: ${hits

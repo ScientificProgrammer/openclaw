@@ -1,8 +1,8 @@
 // Executes normalized outbound payloads against the selected channel transport.
 import { resolveChunkMode, resolveTextChunkLimit } from "../../auto-reply/chunk.js";
 import { payloadRequiresDurablePayloadTransport } from "../../channels/message/capabilities.js";
+import { renderPresentationForDelivery } from "../../channels/plugins/outbound/presentation-delivery.js";
 import { createSubsystemLogger } from "../../logging/subsystem.js";
-import type { OutboundMediaAccess } from "../../media/load-options.js";
 import { getOrCreatePromise } from "../../shared/lazy-promise.js";
 import { diagnosticErrorCategory } from "../diagnostic-error-metadata.js";
 import {
@@ -13,6 +13,7 @@ import { formatErrorMessage } from "../errors.js";
 import { throwIfAborted } from "./abort.js";
 import { createChannelHandler } from "./deliver-channel.js";
 import type { ChannelHandler, DeliverOutboundPayloadsCoreParams } from "./deliver-contracts.js";
+import { assertOutboundHandoffCurrent } from "./deliver-handoff.js";
 import { suppressedPayloadOutcome, toOutboundDeliveryError } from "./deliver-hooks.js";
 import {
   buildPayloadSummary,
@@ -20,7 +21,6 @@ import {
   maybeNotifyAfterDeliveredPayload,
   maybePinDeliveredMessage,
   normalizeEmptyPayloadForDelivery,
-  renderPresentationForDelivery,
   resolveOutboundMediaAccessForSend,
   stripInternalRuntimeScaffoldingFromPayload,
 } from "./deliver-payload.js";
@@ -70,8 +70,7 @@ export async function deliverOutboundPayloadsCore(
     onDeliveryResult: params.onDeliveryResult,
   });
   let activeSourceIndex: number | undefined;
-  const resolveMediaAccess = (mediaSources: readonly string[]): OutboundMediaAccess =>
-    resolveOutboundMediaAccessForSend(params, channel, mediaSources);
+  let payloadSendStarted: boolean;
   const createHandler = (mediaSources: readonly string[]) =>
     createChannelHandler({
       cfg,
@@ -88,7 +87,8 @@ export async function deliverOutboundPayloadsCore(
       gifPlayback: params.gifPlayback,
       forceDocument: params.forceDocument,
       silent: params.silent,
-      mediaAccess: resolveMediaAccess(mediaSources),
+      abortSignal,
+      mediaAccess: resolveOutboundMediaAccessForSend(params, channel, mediaSources),
       gatewayClientScopes: params.gatewayClientScopes,
       conversationReadOrigin: params.conversationReadOrigin,
       deliveryQueueId: params.deliveryQueueId,
@@ -97,9 +97,11 @@ export async function deliverOutboundPayloadsCore(
       onPlatformSendStart: async (route) => {
         // Channel handlers can fan one logical payload into multiple sends.
         // Carry its source index without polluting the persisted platform route.
+        payloadSendStarted = true;
         await params.onPlatformSendStart?.(route, activeSourceIndex);
       },
       onDirectAdapterHandoff: params.onDirectAdapterHandoff,
+      assertDirectAdapterHandoff: params.assertDirectAdapterHandoff,
       onPlatformSendDispatch: params.onPlatformSendDispatch,
       onDeliveryResult: reportIdentifiedDeliveryResult,
     });
@@ -200,13 +202,7 @@ export async function deliverOutboundPayloadsCore(
     params.onPayloadDeliveryOutcome?.(outcome);
   }
   const deliveredMirrorPayloads: NormalizedOutboundPayload[] = [];
-  const recordDeliveredPayload = (
-    payloadSummary: NormalizedOutboundPayload,
-    deliveredResults: readonly OutboundDeliveryResult[],
-  ): void => {
-    if (deliveredResults.length === 0) {
-      return;
-    }
+  const recordDeliveredPayload = (payloadSummary: NormalizedOutboundPayload): void => {
     // Post-send observers are bookkeeping only. Never turn an identified
     // platform delivery into a retryable failure if an observer misbehaves.
     try {
@@ -231,6 +227,7 @@ export async function deliverOutboundPayloadsCore(
     resetPayloadResults();
     const payloadIndex = preparedEntry.sourceIndex;
     activeSourceIndex = payloadIndex;
+    payloadSendStarted = false;
     const payload = preparedEntry.payload;
     const payloadResultStartIndex = results.length;
     let effectivePayload: typeof payload | null | undefined;
@@ -363,9 +360,10 @@ export async function deliverOutboundPayloadsCore(
       let mediaMessageIds: { first?: string; last?: string } | undefined;
       if (
         deliveryHandler.sendPayload &&
-        payloadRequiresDurablePayloadTransport(effectivePayload, {
-          sendTextOnlyErrorPayloads: deliveryHandler.sendTextOnlyErrorPayloads,
-        })
+        ((deliveryHandler.supportsMediaPayload && payloadSummary.mediaUrls.length > 1) ||
+          payloadRequiresDurablePayloadTransport(effectivePayload, {
+            sendTextOnlyErrorPayloads: deliveryHandler.sendTextOnlyErrorPayloads,
+          }))
       ) {
         const delivery = await deliveryHandler.sendPayload(
           effectivePayload,
@@ -398,7 +396,7 @@ export async function deliverOutboundPayloadsCore(
         }
       } else if (!deliveryHandler.supportsMedia) {
         log.warn(
-          "Plugin outbound adapter does not implement sendMedia; media URLs will be dropped and text fallback will be used",
+          "Plugin outbound adapter does not implement sendMedia or sendFormattedMedia; media URLs will be dropped and text fallback will be used",
           {
             channel,
             to,
@@ -408,7 +406,7 @@ export async function deliverOutboundPayloadsCore(
         const fallbackText = payloadSummary.text.trim();
         if (!fallbackText) {
           throw new Error(
-            "Plugin outbound adapter does not implement sendMedia and no text fallback is available for media payload",
+            "Plugin outbound adapter does not implement sendMedia or sendFormattedMedia and no text fallback is available for media payload",
           );
         }
         await sendTextChunks(deliveryHandler, fallbackText, sendOverrides);
@@ -423,23 +421,18 @@ export async function deliverOutboundPayloadsCore(
           overrides: sendOverrides,
           consumeReplyTo: applySendReplyToConsumption,
         });
+        const sendMedia = deliveryHandler.sendFormattedMedia ?? deliveryHandler.sendMedia;
         for (const unit of mediaUnits) {
           if (unit.kind !== "media") {
             continue;
           }
           throwIfAborted(abortSignal);
           const resultIndex = results.length;
-          const delivery = deliveryHandler.sendFormattedMedia
-            ? await deliveryHandler.sendFormattedMedia(
-                unit.caption ?? "",
-                unit.mediaUrl,
-                withPreparedTarget(unit.overrides),
-              )
-            : await deliveryHandler.sendMedia(
-                unit.caption ?? "",
-                unit.mediaUrl,
-                withPreparedTarget(unit.overrides),
-              );
+          const delivery = await sendMedia(
+            unit.caption ?? "",
+            unit.mediaUrl,
+            withPreparedTarget(unit.overrides),
+          );
           const recorded = await recordIdentifiedDeliveryResult(delivery);
           adoptSuccessfulResultsSince(resultIndex);
           if (recorded) {
@@ -456,7 +449,7 @@ export async function deliverOutboundPayloadsCore(
           status: "sent",
           results: deliveredResults,
         });
-        recordDeliveredPayload(mirroredPayload, deliveredResults);
+        recordDeliveredPayload(mirroredPayload);
       } else {
         recordPayloadOutcome(
           suppressedPayloadOutcome({
@@ -486,6 +479,7 @@ export async function deliverOutboundPayloadsCore(
         target: deliveryTarget(),
         messageId: firstMessageId,
         gatewayClientScopes: params.gatewayClientScopes,
+        assertDirectAdapterHandoff: params.assertDirectAdapterHandoff,
       });
       await maybeNotifyAfterDeliveredPayload({
         handler: deliveryHandler,
@@ -494,7 +488,17 @@ export async function deliverOutboundPayloadsCore(
         results: deliveredResults,
       });
       completeDeliveryDiagnostics(deliveredResults.length);
-    } catch (err) {
+    } catch (caughtError) {
+      let err = caughtError;
+      if (!payloadSendStarted) {
+        // Rendering and handler preparation cannot have dispatched this payload.
+        // Preserve earlier payload evidence when reporting its rejected handoff.
+        try {
+          assertOutboundHandoffCurrent(params.assertDirectAdapterHandoff);
+        } catch (rejection) {
+          err = rejection;
+        }
+      }
       const failedPayloadResults = results.slice(payloadResultStartIndex);
       adoptSuccessfulResultsSince(payloadResultStartIndex);
       if (effectivePayload && failedPayloadResults.length > 0) {

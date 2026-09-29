@@ -12,11 +12,10 @@ export type DiagnosticTracePropagationBridge<TEvent, TMetadata> = Readonly<{
   resolveTraceContext: (traceContext: DiagnosticTraceContext) => DiagnosticTraceContext | undefined;
 }>;
 
-type RegisteredDiagnosticTracePropagationBridge = Readonly<{
-  shouldPrepareEvent?: (event: unknown) => boolean;
-  prepareEvent?: (event: unknown, metadata: unknown) => void;
-  resolveTraceContext: (traceContext: DiagnosticTraceContext) => DiagnosticTraceContext | undefined;
-}>;
+type RegisteredDiagnosticTracePropagationBridge = DiagnosticTracePropagationBridge<
+  unknown,
+  unknown
+>;
 
 type DiagnosticTracePropagationResolution =
   | { active: false }
@@ -69,7 +68,11 @@ function getDiagnosticTracePropagationState(): DiagnosticTracePropagationState {
 function activeDiagnosticTracePropagationBridge():
   | RegisteredDiagnosticTracePropagationBridge
   | undefined {
-  return Array.from(getDiagnosticTracePropagationState().bridges).at(-1);
+  let active: RegisteredDiagnosticTracePropagationBridge | undefined;
+  for (const bridge of getDiagnosticTracePropagationState().bridges) {
+    active = bridge;
+  }
+  return active;
 }
 
 export function registerDiagnosticTracePropagationBridge(

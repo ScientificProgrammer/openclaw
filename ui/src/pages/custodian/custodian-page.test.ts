@@ -2,6 +2,8 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { GatewayBrowserClient } from "../../api/gateway.ts";
+import { CUSTODIAN_PANEL_TOGGLE_EVENT } from "../../components/panel-toggle-contract.ts";
+import * as uuid from "../../lib/uuid.ts";
 import { waitForFast } from "../../test-helpers/wait-for.ts";
 import { createContext, mountPage } from "./custodian-page.test-harness.ts";
 
@@ -10,7 +12,7 @@ describe("custodian page", () => {
     // A persisted companion id would turn every mount into a rejoin candidate;
     // tests exercising the rejoin path seed the key explicitly instead.
     localStorage.clear();
-    vi.spyOn(crypto, "randomUUID").mockReturnValue("00000000-0000-4000-8000-000000000001");
+    vi.spyOn(uuid, "generateUUID").mockReturnValue("00000000-0000-4000-8000-000000000001");
     window.history.replaceState({}, "", "/");
   });
 
@@ -140,16 +142,22 @@ describe("custodian page", () => {
     const { context } = createContext(request);
     const { page } = await mountPage(context);
 
-    await waitForFast(() =>
-      expect(page.querySelectorAll('.custodian__wizard-step input[type="radio"]')).toHaveLength(5),
-    );
+    const trigger = await waitForFast(() => {
+      const button = page.querySelector<HTMLButtonElement>(
+        ".custodian__wizard-step .picker-select__trigger",
+      );
+      expect(button).not.toBeNull();
+      return button!;
+    });
     expect(page.querySelector("openclaw-option-card")).toBeNull();
     expect(page.querySelector(".agent-chat__composer-shell")).toBeNull();
-    page
-      .querySelectorAll<HTMLInputElement>('.custodian__wizard-step input[type="radio"]')[4]!
+    trigger.click();
+    await waitForFast(() =>
+      expect(page.querySelectorAll('.custodian__wizard-step [role="option"]')).toHaveLength(5),
+    );
+    [...page.querySelectorAll<HTMLElement>('.custodian__wizard-step [role="option"]')]
+      .find((option) => option.textContent?.includes("Twitch"))!
       .click();
-    await page.updateComplete;
-    page.querySelector<HTMLButtonElement>(".custodian__wizard-step .btn.primary")!.click();
 
     await waitForFast(() => expect(request).toHaveBeenCalledTimes(2));
     await waitForFast(() =>
@@ -451,14 +459,13 @@ describe("custodian page", () => {
     expect(replacementRequest).not.toHaveBeenCalled();
   });
 
-  it("keeps loaded transcript rows when a welcome retry cannot refresh them", async () => {
+  it("keeps loaded transcript rows while retrying the welcome without reloading history", async () => {
     const request = vi
       .fn()
       .mockResolvedValueOnce({
         turns: [{ role: "assistant", text: "Loaded transcript row", at: 1 }],
       })
       .mockRejectedValueOnce(new Error("temporary welcome failure"))
-      .mockRejectedValueOnce(new Error("temporary history failure"))
       .mockResolvedValueOnce({
         sessionId: "engine-session-after-retry",
         reply: "Recovered welcome.",
@@ -474,13 +481,12 @@ describe("custodian page", () => {
     expect(request.mock.calls.map(([method]) => method)).toEqual([
       "openclaw.chat.history",
       "openclaw.chat",
-      "openclaw.chat.history",
       "openclaw.chat",
     ]);
     expect(page.textContent).toContain("Loaded transcript row");
   });
 
-  it("keeps failed sensitive replies masked for correction and retry", async () => {
+  it("keeps a sent sensitive reply masked when its response fails", async () => {
     const request = vi
       .fn()
       .mockResolvedValueOnce({
@@ -489,7 +495,10 @@ describe("custodian page", () => {
         sensitive: true,
         action: "none",
       })
-      .mockRejectedValueOnce(new Error("Request failed"));
+      .mockImplementationOnce((_method, _params, options?: { onSent?: () => void }) => {
+        options?.onSent?.();
+        return Promise.reject(new Error("Request failed"));
+      });
     const { context } = createContext(request);
     const { page } = await mountPage(context);
     await waitForFast(() => expect(request).toHaveBeenCalledOnce());
@@ -510,6 +519,7 @@ describe("custodian page", () => {
     await waitForFast(() => expect(page.querySelector('[role="alert"]')).not.toBeNull());
     await page.updateComplete;
     expect(input.isConnected).toBe(true);
+    expect(input.value).toBe("");
     expect(page.textContent).toContain("Sensitive reply sent");
     expect(page.innerHTML).not.toContain("test-token-placeholder");
   });
@@ -1052,10 +1062,16 @@ describe("custodian page", () => {
       action: "open-agent",
     });
     const { context } = createContext(request);
+    const closePanel = vi.fn();
+    window.addEventListener(CUSTODIAN_PANEL_TOGGLE_EVENT, closePanel, { once: true });
     await mountPage(context);
     await vi.waitFor(() => expect(request).toHaveBeenCalledOnce());
 
-    expect(context.navigate).toHaveBeenCalledWith("chat");
+    expect(context.navigate).toHaveBeenCalledWith("chat", {
+      pathname: "/chat/main",
+      search: "?__openclawComposerFocus=1",
+    });
+    expect(closePanel).toHaveBeenCalledWith(expect.objectContaining({ detail: { open: false } }));
   });
 
   it("exits setup through normal chat navigation", async () => {

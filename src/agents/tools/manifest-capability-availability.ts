@@ -1,10 +1,7 @@
-/**
- * Manifest capability availability checks.
- *
- * Combines plugin contracts, availability, config signals, auth profiles, env candidates, and base URL guards.
- */
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
+import { normalizePluginsConfig } from "../../plugins/config-state.js";
 import { getCurrentPluginMetadataSnapshot } from "../../plugins/current-plugin-metadata-snapshot.js";
+import { createInstalledPluginEnabledPredicate } from "../../plugins/installed-plugin-index.js";
 import { isManifestPluginAvailableForControlPlane } from "../../plugins/manifest-contract-eligibility.js";
 import type { PluginManifestRecord } from "../../plugins/manifest-registry.js";
 import {
@@ -18,35 +15,32 @@ import type { PluginMetadataSnapshot } from "../../plugins/plugin-metadata-snaps
 import { getActivePluginRegistryWorkspaceDirFromState } from "../../plugins/runtime-state.js";
 import { listProfilesForProvider } from "../auth-profiles/profile-list.js";
 import type { AuthProfileStore } from "../auth-profiles/types.js";
-
-/** Manifest contract keys that represent provider-backed tool capabilities. */
-type CapabilityContractKey =
-  | "imageGenerationProviders"
-  | "videoGenerationProviders"
-  | "musicGenerationProviders"
-  | "mediaUnderstandingProviders";
-
-type CapabilityProviderMetadataKey =
-  | "imageGenerationProviderMetadata"
-  | "videoGenerationProviderMetadata"
-  | "musicGenerationProviderMetadata";
+import { isAuthModeAllowedForModel } from "../model-auth-policy.js";
+import {
+  profileTypeToAuthMode,
+  resolveProviderEntryApiKeyProfileReference,
+} from "../model-auth-provider-config.js";
 
 type CapabilityMetadataSnapshot = Pick<PluginMetadataSnapshot, "index" | "plugins">;
 
-function metadataKeyForCapabilityContract(
-  key: CapabilityContractKey,
-): CapabilityProviderMetadataKey | undefined {
-  switch (key) {
-    case "imageGenerationProviders":
-      return "imageGenerationProviderMetadata";
-    case "videoGenerationProviders":
-      return "videoGenerationProviderMetadata";
-    case "musicGenerationProviders":
-      return "musicGenerationProviderMetadata";
-    case "mediaUnderstandingProviders":
-      return undefined;
-  }
-  return undefined;
+const CAPABILITY_METADATA_KEYS = {
+  imageGenerationProviders: "imageGenerationProviderMetadata",
+  videoGenerationProviders: "videoGenerationProviderMetadata",
+  musicGenerationProviders: "musicGenerationProviderMetadata",
+  mediaUnderstandingProviders: undefined,
+} as const;
+
+type CapabilityContractKey = keyof typeof CAPABILITY_METADATA_KEYS;
+
+const GENERATION_AUTH_CAPABILITIES = {
+  imageGenerationProviders: "image-generation",
+  videoGenerationProviders: "video-generation",
+  musicGenerationProviders: "music-generation",
+} as const;
+
+export function capabilityAuthOperation(key: CapabilityContractKey): string | undefined {
+  // Media understanding has separate image-input and transcription operations.
+  return key === "mediaUnderstandingProviders" ? undefined : GENERATION_AUTH_CAPABILITIES[key];
 }
 
 function listCapabilityAuthSignals(params: {
@@ -59,7 +53,7 @@ function listCapabilityAuthSignals(params: {
     NonNullable<PluginManifestRecord["imageGenerationProviderMetadata"]>[string]["authSignals"]
   >[number]["providerBaseUrl"];
 }> {
-  const metadataKey = metadataKeyForCapabilityContract(params.key);
+  const metadataKey = CAPABILITY_METADATA_KEYS[params.key];
   const metadata = metadataKey ? params.plugin[metadataKey]?.[params.providerId] : undefined;
   if (metadata?.authSignals?.length) {
     return metadata.authSignals;
@@ -68,18 +62,6 @@ function listCapabilityAuthSignals(params: {
   return [params.providerId, ...(metadata?.aliases ?? []), ...(metadata?.authProviders ?? [])].map(
     (provider) => ({ provider }),
   );
-}
-
-function isPluginAvailableForCapability(params: {
-  snapshot: CapabilityMetadataSnapshot;
-  plugin: PluginManifestRecord;
-  config?: OpenClawConfig;
-}): boolean {
-  return isManifestPluginAvailableForControlPlane({
-    snapshot: params.snapshot,
-    plugin: params.plugin,
-    config: params.config,
-  });
 }
 
 function hasAvailableCapabilityPlugin(
@@ -92,21 +74,21 @@ function hasAvailableCapabilityPlugin(
   if (params.config?.plugins?.enabled === false) {
     return false;
   }
-  for (const plugin of params.snapshot.plugins) {
-    if (
-      !isPluginAvailableForCapability({
+  const normalizedConfig = normalizePluginsConfig(params.config?.plugins);
+  const isInstalledPluginEnabled = createInstalledPluginEnabledPredicate(
+    params.snapshot.index.plugins,
+    params.config,
+  );
+  return params.snapshot.plugins.some(
+    (plugin) =>
+      isManifestPluginAvailableForControlPlane({
         snapshot: params.snapshot,
         plugin,
         config: params.config,
-      })
-    ) {
-      continue;
-    }
-    if (accepts(plugin)) {
-      return true;
-    }
-  }
-  return false;
+        normalizedConfig,
+        isInstalledPluginEnabled,
+      }) && accepts(plugin),
+  );
 }
 
 function hasConfiguredCapabilityProviderSignal(params: {
@@ -116,7 +98,7 @@ function hasConfiguredCapabilityProviderSignal(params: {
   config?: OpenClawConfig;
   authStore?: AuthProfileStore;
 }): boolean {
-  const metadataKey = metadataKeyForCapabilityContract(params.key);
+  const metadataKey = CAPABILITY_METADATA_KEYS[params.key];
   const metadata = metadataKey ? params.plugin[metadataKey]?.[params.providerId] : undefined;
   if (
     metadata?.configSignals?.some((signal) =>
@@ -142,15 +124,53 @@ function hasConfiguredCapabilityProviderSignal(params: {
     ) {
       continue;
     }
-    // A provider is available when either profile auth or a declared env candidate exists.
-    if (params.authStore && listProfilesForProvider(params.authStore, signal.provider).length > 0) {
+    const capability = capabilityAuthOperation(params.key);
+    const binding =
+      capability && params.authStore
+        ? resolveProviderEntryApiKeyProfileReference({
+            cfg: params.config,
+            provider: signal.provider,
+            store: params.authStore,
+          })
+        : undefined;
+    // Explicit bindings own execution; another account cannot make a rejected
+    // selection available just because it supports the same capability.
+    if (binding?.kind === "profile-incompatible") {
+      continue;
+    }
+    const profileIds =
+      binding?.kind === "profile"
+        ? [binding.profileId]
+        : params.authStore
+          ? listProfilesForProvider(params.authStore, signal.provider)
+          : [];
+    if (
+      profileIds.some((profileId) => {
+        const credential = params.authStore?.profiles[profileId];
+        return (
+          credential &&
+          (!capability ||
+            isAuthModeAllowedForModel({
+              provider: signal.provider,
+              capability,
+              mode: profileTypeToAuthMode(credential.type),
+              authFlow: credential.type === "oauth" ? credential.authFlow : undefined,
+            }))
+        );
+      })
+    ) {
       return true;
+    }
+    if (binding?.kind === "profile") {
+      continue;
     }
     if (
       hasNonEmptyManifestEnvCandidate(
         process.env,
         manifestPluginSetupProviderEnvVars(params.plugin, signal.provider),
-      )
+      ) &&
+      (!capability ||
+        isAuthModeAllowedForModel({ provider: signal.provider, capability, mode: "api-key" }))
     ) {
       return true;
     }

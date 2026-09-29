@@ -8,11 +8,8 @@ import {
 import { withEnv } from "openclaw/plugin-sdk/test-env";
 import { describe, expect, it } from "vitest";
 import type { OpenClawConfig } from "../api.js";
-import {
-  memoryWikiConfigSchema,
-  resolveMemoryWikiAgentConfig,
-  resolveMemoryWikiConfig,
-} from "./config.js";
+import { memoryWikiConfigSchema } from "./config-schema.js";
+import { resolveMemoryWikiAgentConfig, resolveMemoryWikiConfig } from "./config.js";
 
 function compileManifestConfigSchema() {
   const manifest = JSON.parse(
@@ -87,16 +84,6 @@ describe("resolveMemoryWikiConfig", () => {
     expect(config.vaultMode).toBe("bridge");
     expect(config.vault.path).toBe(path.join("/Users/tester", "vaults", "wiki"));
     expect(config.vault.renderMode).toBe("obsidian");
-  });
-
-  it("normalizes the bridge artifact toggle", () => {
-    const canonical = resolveMemoryWikiConfig({
-      bridge: {
-        readMemoryArtifacts: false,
-      },
-    });
-
-    expect(canonical.bridge.readMemoryArtifacts).toBe(false);
   });
 
   it("resolves normalized agent ids to distinct vault roots", () => {

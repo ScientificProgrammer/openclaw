@@ -4,7 +4,8 @@ import SwiftUI
 @MainActor
 struct ChatCameraFlipButton: View {
     let control: OpenClawChatTalkControl
-    let size: CGFloat
+    let controlHeight: CGFloat
+    let visualSize: CGFloat
 
     static func isAvailable(for control: OpenClawChatTalkControl) -> Bool {
         control.isEnabled && control.cameraFacing != nil && control.flipCamera != nil
@@ -17,11 +18,12 @@ struct ChatCameraFlipButton: View {
             Image(systemName: "arrow.triangle.2.circlepath.camera")
                 .font(OpenClawChatTypography.body(size: 14, weight: .semibold, relativeTo: .subheadline))
                 .foregroundStyle(.primary)
-                .frame(width: self.size, height: self.size)
+                .frame(width: self.visualSize, height: self.visualSize)
                 .background {
                     Circle()
                         .fill(OpenClawChatTheme.accent.opacity(0.12))
                 }
+                .frame(width: self.controlHeight, height: self.controlHeight)
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -57,69 +59,60 @@ struct ChatTalkButton: View {
     var body: some View {
         switch self.style {
         case .full:
-            self.fullButton
+            self.button { self.fullLabel }
         case let .compact(controlHeight, iconControlSize):
-            self.compactButton(controlHeight: controlHeight, iconControlSize: iconControlSize)
+            self.button { self.compactLabel(controlHeight: controlHeight, iconControlSize: iconControlSize) }
         }
     }
 
-    private var fullButton: some View {
+    private func button(@ViewBuilder label: () -> some View) -> some View {
         Button {
             self.control.toggle(self.sessionKey)
-        } label: {
-            HStack(spacing: 6) {
-                ChatTalkButtonGlyph(control: self.control)
-                    .font(OpenClawChatTypography.captionSemiBold)
-                Text(self.control.isEnabled ? "Stop" : "Talk")
-                    .font(OpenClawChatTypography.captionSemiBold)
-                    .lineLimit(1)
-            }
-            .foregroundStyle(self.control.isEnabled ? .white : .primary)
-            .padding(.horizontal, 10)
-            .frame(height: 32)
-            .background {
-                Capsule()
-                    .fill(self.fill)
-            }
-            .overlay {
-                Capsule()
-                    .strokeBorder(self.stroke, lineWidth: 1)
-            }
-        }
-        .buttonStyle(.plain)
-        .disabled(!self.control.isGatewayConnected && !self.control.isEnabled)
-        .accessibilityLabel(self.control.isEnabled ? "Stop realtime chat" : "Start realtime chat")
-        .accessibilityValue(self.accessibilityValue)
-        .accessibilityIdentifier("chat-realtime-control")
-        .help(self.helpText)
-        .chatTalkInputDeviceMenu(self.control)
+        } label: { label() }
+            .buttonStyle(.plain)
+            .disabled(!self.control.isGatewayConnected && !self.control.isEnabled)
+            .accessibilityLabel(self.control.isEnabled ? "Stop realtime chat" : "Start realtime chat")
+            .accessibilityValue(self.accessibilityValue)
+            .accessibilityIdentifier("chat-realtime-control")
+            .help(self.helpText)
+            .chatTalkInputDeviceMenu(self.control)
     }
 
-    private func compactButton(controlHeight: CGFloat, iconControlSize: CGFloat) -> some View {
-        Button {
-            self.control.toggle(self.sessionKey)
-        } label: {
+    private var fullLabel: some View {
+        HStack(spacing: 6) {
             ChatTalkButtonGlyph(control: self.control)
-                .font(OpenClawChatTypography.body(size: 14, weight: .semibold, relativeTo: .subheadline))
-                .foregroundStyle(.white)
-                .frame(width: iconControlSize, height: iconControlSize)
-                // Prominent filled circle so the mic reads as the primary action,
-                // mirroring the send button it swaps with once a draft exists.
-                .background {
-                    Circle()
-                        .fill(self.control.isEnabled ? self.fill : AnyShapeStyle(OpenClawChatTheme.accent))
-                        .opacity(self.control.isGatewayConnected || self.control.isEnabled ? 1 : 0.4)
-                }
-                .frame(width: controlHeight, height: controlHeight)
-                .contentShape(Rectangle())
+                .font(OpenClawChatTypography.captionSemiBold)
+            Text(self.control.isEnabled ? "Stop" : "Talk")
+                .font(OpenClawChatTypography.captionSemiBold)
+                .lineLimit(1)
         }
-        .buttonStyle(.plain)
-        .disabled(!self.control.isGatewayConnected && !self.control.isEnabled)
-        .accessibilityLabel(self.control.isEnabled ? "Stop realtime chat" : "Start realtime chat")
-        .accessibilityValue(self.accessibilityValue)
-        .accessibilityIdentifier("chat-realtime-control")
-        .help(self.helpText)
-        .chatTalkInputDeviceMenu(self.control)
+        .foregroundStyle(self.control.isEnabled ? .white : .primary)
+        .padding(.horizontal, 10)
+        .frame(height: 32)
+        .background {
+            Capsule()
+                .fill(self.fill)
+        }
+        .overlay {
+            Capsule()
+                .strokeBorder(self.stroke, lineWidth: 1)
+        }
+    }
+
+    private func compactLabel(controlHeight: CGFloat, iconControlSize: CGFloat) -> some View {
+        ChatTalkButtonGlyph(control: self.control)
+            .font(OpenClawChatTypography.body(size: 14, weight: .semibold, relativeTo: .subheadline))
+            .foregroundStyle(.white)
+            .frame(width: iconControlSize, height: iconControlSize)
+            // Prominent filled circle so the mic reads as the primary action,
+            // mirroring the send button it swaps with once a draft exists.
+            .background {
+                Circle()
+                    .fill(self.control.isEnabled ? self.fill : AnyShapeStyle(OpenClawChatTheme.accent))
+                    .opacity(self.control.isGatewayConnected || self.control.isEnabled ? 1 : 0.4)
+            }
+            .frame(width: controlHeight, height: controlHeight)
+            .contentShape(Rectangle())
     }
 
     private var fill: AnyShapeStyle {

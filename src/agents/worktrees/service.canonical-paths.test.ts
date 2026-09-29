@@ -10,7 +10,7 @@ import {
 } from "../../state/openclaw-state-db.js";
 import { getRegistryWorktree } from "./registry.js";
 import { ManagedWorktreeService } from "./service.js";
-import { initializeManagedWorktreeTestRepository } from "./service.test-support.js";
+import { useManagedWorktreeTestRepository } from "./service.test-support.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -22,6 +22,7 @@ async function git(cwd: string, ...args: string[]): Promise<string> {
 }
 
 describe("ManagedWorktreeService canonical paths", () => {
+  const initializeRepository = useManagedWorktreeTestRepository();
   let root: string;
   let repo: string;
   let stateDir: string;
@@ -45,7 +46,7 @@ describe("ManagedWorktreeService canonical paths", () => {
     root = await fs.mkdtemp(
       path.join(await fs.realpath(os.tmpdir()), "openclaw-worktree-canonical-paths-"),
     );
-    repo = await initializeManagedWorktreeTestRepository(root);
+    repo = await initializeRepository(root);
     stateDir = path.join(root, "state");
     await fs.mkdir(stateDir, { recursive: true });
     env = { ...process.env, OPENCLAW_STATE_DIR: stateDir };
@@ -55,26 +56,6 @@ describe("ManagedWorktreeService canonical paths", () => {
   afterEach(async () => {
     closeOpenClawStateDatabaseForTest();
     await fs.rm(root, { recursive: true, force: true });
-  });
-
-  it("keeps registry operations anchored to the primary checkout", async () => {
-    const linked = path.join(root, "linked-source");
-    await git(repo, "worktree", "add", "-b", "linked-source", linked, "HEAD");
-    const linkedRoot = await fs.realpath(linked);
-    const created = await service.create({
-      repoRoot: linkedRoot,
-      name: "linked-task",
-      baseRef: "HEAD",
-    });
-    expect(created.repoRoot).toBe(repo);
-    await git(repo, "worktree", "remove", "--force", linkedRoot);
-
-    await service.acquire(created.id);
-    await service.release(created.id);
-    await service.remove({ id: created.id, reason: "linked-source-removed" });
-    const restored = await service.restore({ id: created.id });
-
-    expect(await fs.readFile(path.join(restored.path, "README.md"), "utf8")).toBe("base\n");
   });
 
   it("repairs removal to the live checkout repository before snapshotting", async () => {

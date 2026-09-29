@@ -2,6 +2,7 @@
 import { mkdtemp, readFile, rm, unlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { crc32, inflateSync } from "node:zlib";
 import { describe, expect, it } from "vitest";
 import type { OpenClawConfig } from "../../config/config.js";
 import type { SessionEntry } from "../../config/sessions.js";
@@ -326,37 +327,40 @@ describe("buildContextReply", () => {
   });
 
   it("prefers the target session entry from sessionStore for cached context stats", async () => {
-    const params = makeParams("/context detail", false, {
-      contextTokens: 8_192,
-      totalTokens: 111,
-    });
-    const sessionEntry = {
-      ...params.sessionEntry,
-      sessionId: params.sessionEntry?.sessionId ?? "session-main",
-      updatedAt: params.sessionEntry?.updatedAt ?? 1,
-      totalTokens: 111,
-      totalTokensFresh: true,
-      totalTokensVersion: 1,
-      inputTokens: 100,
-      outputTokens: 11,
-    } satisfies SessionEntry;
-    params.sessionEntry = sessionEntry;
-    params.sessionStore = {
-      [params.sessionKey]: {
-        ...sessionEntry,
-        totalTokens: 900,
+    await withTranscript([{ role: "user", content: "cached context fixture" }], async (target) => {
+      const params = makeParams("/context detail", false, {
+        contextTokens: 8_192,
+        totalTokens: 111,
+        ...target,
+      });
+      const sessionEntry = {
+        ...params.sessionEntry,
+        sessionId: target.sessionId,
+        updatedAt: params.sessionEntry?.updatedAt ?? 1,
+        totalTokens: 111,
         totalTokensFresh: true,
         totalTokensVersion: 1,
-        inputTokens: 700,
-        outputTokens: 200,
-      },
-    };
+        inputTokens: 100,
+        outputTokens: 11,
+      } satisfies SessionEntry;
+      params.sessionEntry = sessionEntry;
+      params.sessionStore = {
+        [params.sessionKey]: {
+          ...sessionEntry,
+          totalTokens: 900,
+          totalTokensFresh: true,
+          totalTokensVersion: 1,
+          inputTokens: 700,
+          outputTokens: 200,
+        },
+      };
 
-    const result = await buildContextReply(params);
+      const result = await buildContextReply(params);
 
-    expect(result.text).toContain("Actual context usage (cached): 900 tok");
-    expect(result.text).toContain("Session tokens (cached): 900 total / ctx=8,192");
-    expect(result.text).not.toContain("Actual context usage (cached): 111 tok");
+      expect(result.text).toContain("Actual context usage (cached): 900 tok");
+      expect(result.text).toContain("Session tokens (cached): 900 total / ctx=8,192");
+      expect(result.text).not.toContain("Actual context usage (cached): 111 tok");
+    });
   });
 
   it("renders context map as sensitive local PNG media", async () => {
@@ -380,6 +384,23 @@ describe("buildContextReply", () => {
       expect(png.subarray(12, 16).toString("ascii")).toBe("IHDR");
       expect(png.readUInt32BE(16)).toBe(1280);
       expect(png.readUInt32BE(20)).toBe(860);
+      expect(png.subarray(24, 29)).toEqual(Buffer.from([8, 6, 0, 0, 0]));
+      const imageData: Buffer[] = [];
+      for (let offset = 8; offset < png.length;) {
+        const end = offset + 8 + png.readUInt32BE(offset);
+        expect(crc32(png.subarray(offset + 4, end))).toBe(png.readUInt32BE(end));
+        if (png.toString("ascii", offset + 4, offset + 8) === "IDAT") {
+          imageData.push(png.subarray(offset + 8, end));
+        }
+        offset = end + 4;
+      }
+      const pixels = inflateSync(Buffer.concat(imageData));
+      expect(pixels).toHaveLength(860 * (1280 * 4 + 1));
+      for (let row = 0; row < 860; row += 1) {
+        expect(pixels[row * (1280 * 4 + 1)]).toBe(0);
+      }
+      expect(pixels.subarray(1, 5)).toEqual(Buffer.from([20, 26, 34, 255]));
+      expect(pixels.subarray(-4)).toEqual(Buffer.from([238, 241, 245, 255]));
     } finally {
       await unlink(result.mediaUrl);
     }

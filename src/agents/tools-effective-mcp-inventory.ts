@@ -5,10 +5,10 @@
  */
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import type { ProviderRuntimeModel } from "../plugins/provider-runtime-model.types.js";
-import { getPluginToolMeta } from "../plugins/tools.js";
+import { getPluginToolMeta } from "../plugins/tool-metadata.js";
+import type { McpToolCatalog } from "./agent-bundle-mcp-types.js";
 import { normalizeAgentRuntimeTools } from "./runtime-plan/tools.js";
 import {
-  filterProviderNormalizableTools,
   filterRuntimeCompatibleTools,
   type RuntimeToolSchemaDiagnostic,
 } from "./tool-schema-projection.js";
@@ -25,6 +25,15 @@ import type {
 import type { AnyAgentTool } from "./tools/common.js";
 
 const BUNDLE_MCP_PLUGIN_ID = "bundle-mcp";
+
+export function buildMcpCatalogNotices(catalog: McpToolCatalog): EffectiveToolInventoryNotice[] {
+  return (catalog.diagnostics ?? []).map((diagnostic) => ({
+    id: `mcp-server-diagnostic:${diagnostic.serverName}`,
+    severity: "warning",
+    message: `MCP server "${diagnostic.serverName}": ${diagnostic.message}`,
+    servers: [diagnostic.serverName],
+  }));
+}
 
 // Runtime schema diagnostics become operator-facing notices on the effective
 // inventory screen instead of silently hiding quarantined MCP tools.
@@ -80,12 +89,9 @@ export function buildRuntimeCompatibleMcpToolInventory(params: {
   entries: EffectiveToolInventoryEntry[];
   notices: EffectiveToolInventoryNotice[];
 } {
-  const preNormalizationProjection = filterProviderNormalizableTools(params.tools);
-  const preNormalizationDiagnostics: RuntimeToolSchemaDiagnostic[] = [
-    ...preNormalizationProjection.diagnostics,
-  ];
+  const preNormalizationDiagnostics: RuntimeToolSchemaDiagnostic[] = [];
   const normalizedTools = normalizeAgentRuntimeTools({
-    tools: [...preNormalizationProjection.tools],
+    tools: params.tools,
     provider: params.modelProvider ?? "",
     config: params.cfg,
     workspaceDir: params.workspaceDir,

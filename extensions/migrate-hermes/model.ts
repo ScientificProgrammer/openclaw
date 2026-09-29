@@ -1,22 +1,24 @@
-// Migrate Hermes plugin module implements model behavior.
 import {
   resolveAgentEffectiveModelPrimary,
   resolveDefaultAgentId,
   setAgentEffectiveModelPrimary,
 } from "openclaw/plugin-sdk/agent-runtime";
-import { resolveMigrationConfigRuntime } from "openclaw/plugin-sdk/migration";
+import {
+  markMigrationItemConflict,
+  markMigrationItemError,
+  markMigrationItemSkipped,
+  resolveMigrationConfigRuntime,
+} from "openclaw/plugin-sdk/migration";
 import type { MigrationItem, MigrationProviderContext } from "openclaw/plugin-sdk/plugin-entry";
 import {
   asOptionalRecord,
+  isRecord,
   normalizeOptionalString,
 } from "openclaw/plugin-sdk/string-coerce-runtime";
 import {
   HERMES_REASON_ALREADY_CONFIGURED,
   HERMES_REASON_CONFIG_RUNTIME_UNAVAILABLE,
   HERMES_REASON_DEFAULT_MODEL_CONFIGURED,
-  hermesItemConflict,
-  hermesItemError,
-  hermesItemSkipped,
   readHermesModelDetails,
 } from "./items.js";
 
@@ -190,10 +192,7 @@ function readKimiBaseUrl(
   }
   const providers = asOptionalRecord(config.providers);
   for (const [id, value] of Object.entries(providers ?? {})) {
-    if (
-      normalizeHermesCustomProviderId(id) === normalizeHermesCustomProviderId(provider) &&
-      asOptionalRecord(value)
-    ) {
+    if (normalizeHermesCustomProviderId(id) === normalizeHermesCustomProviderId(provider)) {
       const providerBaseUrl = readBaseUrl(asOptionalRecord(value));
       if (providerBaseUrl) {
         return providerBaseUrl;
@@ -244,9 +243,7 @@ function hasExplicitHermesProvider(config: Record<string, unknown>, provider: st
   }
   const providers = config.providers;
   if (
-    providers &&
-    typeof providers === "object" &&
-    !Array.isArray(providers) &&
+    isRecord(providers) &&
     Object.keys(providers).some((id) => normalizeHermesCustomProviderId(id) === normalized)
   ) {
     return true;
@@ -254,11 +251,10 @@ function hasExplicitHermesProvider(config: Record<string, unknown>, provider: st
   return (
     Array.isArray(config.custom_providers) &&
     config.custom_providers.some((entry) => {
-      if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+      if (!isRecord(entry)) {
         return false;
       }
-      const record = entry as Record<string, unknown>;
-      const id = normalizeOptionalString(record.name) ?? normalizeOptionalString(record.id);
+      const id = normalizeOptionalString(entry.name) ?? normalizeOptionalString(entry.id);
       return id ? normalizeHermesCustomProviderId(id) === normalized : false;
     })
   );
@@ -318,15 +314,13 @@ export function resolveHermesModelRef(
     const provider = normalizeOptionalString(config.provider);
     return joinHermesProviderModel(config, provider, rawModel, env);
   }
-  if (model && typeof model === "object" && !Array.isArray(model)) {
-    const modelRecord = model as Record<string, unknown>;
-    const rawModel =
-      normalizeOptionalString(modelRecord.default) ?? normalizeOptionalString(modelRecord.model);
+  if (isRecord(model)) {
+    const rawModel = normalizeOptionalString(model.default) ?? normalizeOptionalString(model.model);
     const hasCustomEndpoint = Boolean(
-      normalizeOptionalString(modelRecord.base_url) ?? normalizeOptionalString(modelRecord.baseUrl),
+      normalizeOptionalString(model.base_url) ?? normalizeOptionalString(model.baseUrl),
     );
     const provider =
-      normalizeOptionalString(modelRecord.provider) ?? (hasCustomEndpoint ? "custom" : undefined);
+      normalizeOptionalString(model.provider) ?? (hasCustomEndpoint ? "custom" : undefined);
     return rawModel ? joinHermesProviderModel(config, provider, rawModel, env) : undefined;
   }
   const rootModel =
@@ -335,20 +329,11 @@ export function resolveHermesModelRef(
   return rootModel ? joinHermesProviderModel(config, rootProvider, rootModel, env) : undefined;
 }
 
-function resolveDefaultAgentModelState(config: MigrationProviderContext["config"]): {
-  agentId: string;
-  effectivePrimary?: string;
-} {
-  const agentId = resolveDefaultAgentId(config);
-  const effectivePrimary = resolveAgentEffectiveModelPrimary(config, agentId);
-  return {
-    agentId,
-    effectivePrimary,
-  };
-}
-
 export function resolveCurrentModelRef(ctx: MigrationProviderContext): string | undefined {
-  return resolveDefaultAgentModelState(ctx.config).effectivePrimary;
+  return resolveAgentEffectiveModelPrimary(
+    ctx.config,
+    ctx.targetAgentId ?? resolveDefaultAgentId(ctx.config),
+  );
 }
 
 class ModelApplyAbortError extends Error {
@@ -372,38 +357,43 @@ export async function applyModelItem(
   try {
     const configApi = resolveMigrationConfigRuntime(ctx);
     if (!configApi?.current || !configApi.mutateConfigFile) {
-      return hermesItemError(item, HERMES_REASON_CONFIG_RUNTIME_UNAVAILABLE);
+      return markMigrationItemError(item, HERMES_REASON_CONFIG_RUNTIME_UNAVAILABLE);
     }
-    const currentState = resolveDefaultAgentModelState(
+    const agentId = ctx.targetAgentId ?? resolveDefaultAgentId(ctx.config);
+    const currentModel = resolveAgentEffectiveModelPrimary(
       configApi.current() as MigrationProviderContext["config"],
+      agentId,
     );
-    if (currentState.effectivePrimary === details.model) {
-      return hermesItemSkipped(item, HERMES_REASON_ALREADY_CONFIGURED);
+    if (currentModel === details.model) {
+      return markMigrationItemSkipped(item, HERMES_REASON_ALREADY_CONFIGURED);
     }
-    if (currentState.effectivePrimary && !ctx.overwrite) {
-      return hermesItemConflict(item, HERMES_REASON_DEFAULT_MODEL_CONFIGURED);
+    if (currentModel && !ctx.overwrite) {
+      return markMigrationItemConflict(item, HERMES_REASON_DEFAULT_MODEL_CONFIGURED);
     }
     await configApi.mutateConfigFile({
       base: "runtime",
       afterWrite: { mode: "auto" },
       mutate(draft) {
-        const mutationState = resolveDefaultAgentModelState(draft);
-        if (mutationState.effectivePrimary === details.model) {
+        const mutationModel = resolveAgentEffectiveModelPrimary(draft, agentId);
+        if (mutationModel === details.model) {
           throw new ModelApplyAbortError("skipped", HERMES_REASON_ALREADY_CONFIGURED);
         }
-        if (mutationState.effectivePrimary && !ctx.overwrite) {
+        if (mutationModel && !ctx.overwrite) {
           throw new ModelApplyAbortError("conflict", HERMES_REASON_DEFAULT_MODEL_CONFIGURED);
         }
-        setAgentEffectiveModelPrimary(draft, mutationState.agentId, details.model);
+        // An explicit migration owner must not rewrite shared defaults when its model is inherited.
+        setAgentEffectiveModelPrimary(draft, agentId, details.model, {
+          forceAgent: Boolean(ctx.targetAgentId),
+        });
       },
     });
     return { ...item, status: "migrated" };
   } catch (err) {
     if (err instanceof ModelApplyAbortError) {
       return err.status === "conflict"
-        ? hermesItemConflict(item, err.reason)
-        : hermesItemSkipped(item, err.reason);
+        ? markMigrationItemConflict(item, err.reason)
+        : markMigrationItemSkipped(item, err.reason);
     }
-    return hermesItemError(item, err instanceof Error ? err.message : String(err));
+    return markMigrationItemError(item, err instanceof Error ? err.message : String(err));
   }
 }

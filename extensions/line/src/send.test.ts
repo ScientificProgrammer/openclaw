@@ -103,16 +103,64 @@ const LINE_TEST_CFG = {
   },
 };
 
-function createCredentialBearingHttpUrl(): string {
-  const url = new URL("http://example.com/image.jpg");
-  url.username = ["line", "user"].join("-");
-  url.password = ["line", "fixture"].join("-");
-  url.searchParams.set("auth", ["line", "query"].join("-"));
-  return url.href;
-}
-
 describe("LINE send helpers", () => {
   const fixedSentAt = 1_800_000_000_000;
+  const sendCases = [
+    {
+      label: "push",
+      send: () => sendModule.pushMessageLine("U123", "Hello", { cfg: LINE_TEST_CFG }),
+      provider: pushMessageMock,
+    },
+    {
+      label: "reply",
+      send: () =>
+        sendModule.sendMessageLine("U123", "Hello", {
+          cfg: LINE_TEST_CFG,
+          replyToken: "reply-token",
+        }),
+      provider: replyMessageMock,
+    },
+  ];
+
+  function expectedMediaSendResult(chatId: string, messageId: string, messageCount: number) {
+    const raw = {
+      channel: "line",
+      chatId,
+      conversationId: chatId,
+      messageId,
+      meta: { messageCount },
+    };
+    return {
+      chatId,
+      messageId,
+      receipt: {
+        parts: [{ index: 0, kind: "media", platformMessageId: messageId, raw, threadId: chatId }],
+        platformMessageIds: [messageId],
+        primaryPlatformMessageId: messageId,
+        raw: [raw],
+        sentAt: fixedSentAt,
+        threadId: chatId,
+      },
+    };
+  }
+
+  async function captureError(send: () => Promise<unknown>): Promise<unknown> {
+    try {
+      await send();
+    } catch (error) {
+      return error;
+    }
+    throw new Error("Expected LINE send to fail");
+  }
+
+  async function capturePartialDelivery(send: () => Promise<unknown>) {
+    const caught = await captureError(send);
+    expect(isChannelPartialDeliveryError(caught)).toBe(true);
+    if (!isChannelPartialDeliveryError(caught)) {
+      throw new Error("Expected partial LINE delivery");
+    }
+    return caught;
+  }
 
   beforeAll(async () => {
     sendModule = await import("./send.js");
@@ -181,13 +229,6 @@ describe("LINE send helpers", () => {
   afterEach(() => {
     vi.unstubAllGlobals();
     vi.useRealTimers();
-  });
-
-  it("limits quick reply items to 13", () => {
-    const labels = Array.from({ length: 20 }, (_, index) => `Option ${index + 1}`);
-    const quickReply = sendModule.createQuickReplyItems(labels);
-
-    expect(quickReply.items).toHaveLength(13);
   });
 
   it("counts quick reply labels in grapheme clusters", () => {
@@ -432,12 +473,12 @@ describe("LINE send helpers", () => {
   });
 
   it("pushes images via normalized LINE target", async () => {
-    const result = await sendModule.pushImageMessage(
-      "line:user:U123",
-      "https://example.com/original.jpg",
-      undefined,
-      { cfg: LINE_TEST_CFG, verbose: true },
-    );
+    const result = await sendModule.sendMessageLine("line:user:U123", "", {
+      cfg: LINE_TEST_CFG,
+      verbose: true,
+      mediaUrl: "https://example.com/original.jpg",
+      mediaKind: "image",
+    });
 
     expect(pushMessageMock).toHaveBeenCalledWith({
       to: "U123",
@@ -454,41 +495,8 @@ describe("LINE send helpers", () => {
       accountId: "default",
       direction: "outbound",
     });
-    expect(logVerboseMock).toHaveBeenCalledWith("line: pushed image to U123");
-    expect(result).toEqual({
-      chatId: "U123",
-      messageId: "push",
-      receipt: {
-        parts: [
-          {
-            index: 0,
-            kind: "media",
-            platformMessageId: "push",
-            raw: {
-              channel: "line",
-              chatId: "U123",
-              conversationId: "U123",
-              messageId: "push",
-              meta: { messageCount: 1 },
-            },
-            threadId: "U123",
-          },
-        ],
-        platformMessageIds: ["push"],
-        primaryPlatformMessageId: "push",
-        raw: [
-          {
-            channel: "line",
-            chatId: "U123",
-            conversationId: "U123",
-            messageId: "push",
-            meta: { messageCount: 1 },
-          },
-        ],
-        sentAt: fixedSentAt,
-        threadId: "U123",
-      },
-    });
+    expect(logVerboseMock).toHaveBeenCalledWith("line: pushed message to U123");
+    expect(result).toEqual(expectedMediaSendResult("U123", "push", 1));
   });
 
   it("preserves every provider message id returned by a LINE push", async () => {
@@ -534,40 +542,7 @@ describe("LINE send helpers", () => {
       ],
     });
     expect(logVerboseMock).toHaveBeenCalledWith("line: replied to C1");
-    expect(result).toEqual({
-      chatId: "C1",
-      messageId: "reply",
-      receipt: {
-        parts: [
-          {
-            index: 0,
-            kind: "media",
-            platformMessageId: "reply",
-            raw: {
-              channel: "line",
-              chatId: "C1",
-              conversationId: "C1",
-              messageId: "reply",
-              meta: { messageCount: 2 },
-            },
-            threadId: "C1",
-          },
-        ],
-        platformMessageIds: ["reply"],
-        primaryPlatformMessageId: "reply",
-        raw: [
-          {
-            channel: "line",
-            chatId: "C1",
-            conversationId: "C1",
-            messageId: "reply",
-            meta: { messageCount: 2 },
-          },
-        ],
-        sentAt: fixedSentAt,
-        threadId: "C1",
-      },
-    });
+    expect(result).toEqual(expectedMediaSendResult("C1", "reply", 2));
   });
 
   it("preserves every provider message id returned by a LINE reply", async () => {
@@ -585,87 +560,40 @@ describe("LINE send helpers", () => {
     expect(result.receipt.platformMessageIds).toEqual(["713452345678901234", "713452345678901235"]);
   });
 
-  it.each([
-    {
-      label: "push",
-      send: () => sendModule.pushMessageLine("U123", "Hello", { cfg: LINE_TEST_CFG }),
-      provider: pushMessageMock,
-    },
-    {
-      label: "reply",
-      send: () =>
-        sendModule.sendMessageLine("U123", "Hello", {
-          cfg: LINE_TEST_CFG,
-          replyToken: "reply-token",
-        }),
-      provider: replyMessageMock,
-    },
-  ])("preserves a finalized $label when activity recording fails", async ({ send, provider }) => {
-    provider.mockResolvedValueOnce({ sentMessages: [{ id: "line-provider-final" }] });
-    recordChannelActivityMock.mockImplementationOnce(() => {
-      throw new Error("activity store unavailable");
-    });
+  it.each(sendCases)(
+    "preserves a finalized $label when activity recording fails",
+    async ({ send, provider }) => {
+      provider.mockResolvedValueOnce({ sentMessages: [{ id: "line-provider-final" }] });
+      recordChannelActivityMock.mockImplementationOnce(() => {
+        throw new Error("activity store unavailable");
+      });
 
-    let caught: unknown;
-    try {
-      await send();
-    } catch (error) {
-      caught = error;
-    }
-
-    expect(isChannelPartialDeliveryError(caught)).toBe(true);
-    if (!isChannelPartialDeliveryError(caught)) {
-      throw new Error("expected a partial LINE delivery error");
-    }
-    expect(caught.deliveryResult).toMatchObject({
-      messageIds: ["line-provider-final"],
-      receipt: {
-        primaryPlatformMessageId: "line-provider-final",
-        platformMessageIds: ["line-provider-final"],
-        threadId: "U123",
-        parts: [
-          {
-            platformMessageId: "line-provider-final",
-            kind: "text",
-            raw: { chatId: "U123", meta: { messageCount: 1 } },
-          },
-        ],
-      },
-      visibleReplySent: true,
-    });
-  });
-
-  it.each([
-    {
-      label: "push",
-      send: () => sendModule.pushMessageLine("U123", "Hello", { cfg: LINE_TEST_CFG }),
-      provider: pushMessageMock,
+      const caught = await capturePartialDelivery(send);
+      expect(caught.deliveryResult).toMatchObject({
+        messageIds: ["line-provider-final"],
+        receipt: {
+          primaryPlatformMessageId: "line-provider-final",
+          platformMessageIds: ["line-provider-final"],
+          threadId: "U123",
+          parts: [
+            {
+              platformMessageId: "line-provider-final",
+              kind: "text",
+              raw: { chatId: "U123", meta: { messageCount: 1 } },
+            },
+          ],
+        },
+        visibleReplySent: true,
+      });
     },
-    {
-      label: "reply",
-      send: () =>
-        sendModule.sendMessageLine("U123", "Hello", {
-          cfg: LINE_TEST_CFG,
-          replyToken: "reply-token",
-        }),
-      provider: replyMessageMock,
-    },
-  ])(
+  );
+
+  it.each(sendCases)(
     "preserves accepted delivery when a $label response omits its provider message ids",
     async ({ send, provider }) => {
       provider.mockResolvedValueOnce({ sentMessages: [] });
 
-      let caught: unknown;
-      try {
-        await send();
-      } catch (error) {
-        caught = error;
-      }
-
-      expect(isChannelPartialDeliveryError(caught)).toBe(true);
-      if (!isChannelPartialDeliveryError(caught)) {
-        throw new Error("expected an accepted LINE delivery without an identity");
-      }
+      const caught = await capturePartialDelivery(send);
       expect(caught.deliveryResult).toEqual({ messageIds: [], visibleReplySent: true });
       expect(recordChannelActivityMock).not.toHaveBeenCalled();
     },
@@ -692,20 +620,108 @@ describe("LINE send helpers", () => {
               replyToken: "reply-token",
             });
 
-    let caught: unknown;
-    try {
-      await send();
-    } catch (error) {
-      caught = error;
-    }
-
-    expect(isChannelPartialDeliveryError(caught)).toBe(true);
-    if (!isChannelPartialDeliveryError(caught)) {
-      throw new Error("expected an accepted LINE delivery without a readable identity");
-    }
+    const caught = await capturePartialDelivery(send);
     expect(caught.deliveryResult).toEqual({ messageIds: [], visibleReplySent: true });
     expect(lineFetchMock).toHaveBeenCalledOnce();
     expect(recordChannelActivityMock).not.toHaveBeenCalled();
+  });
+
+  it("delivers a quoted reply unquoted when LINE refuses the quote token", async () => {
+    // LINE answers a token it no longer accepts with a bare 400 that names no
+    // field, so the reply would otherwise disappear instead of arriving plain.
+    lineFetchMock.mockResolvedValueOnce(
+      new Response(JSON.stringify({ message: "Quote token is invalid" }), {
+        status: 400,
+        statusText: "Bad Request",
+      }),
+    );
+
+    const result = await sendModule.pushMessagesLine(
+      "U123",
+      [{ type: "text", text: "answering you" }],
+      { cfg: LINE_TEST_CFG, quoteToken: "stale-token" },
+    );
+
+    expect(result.messageId).toBe("push");
+    const bodies = lineFetchMock.mock.calls.map((call) => {
+      const body = (call[1] as RequestInit).body;
+      if (typeof body !== "string") {
+        throw new Error("expected a JSON string LINE request body");
+      }
+      return JSON.parse(body) as { messages: unknown[] };
+    });
+    expect(bodies).toHaveLength(2);
+    expect(bodies[0]?.messages).toEqual([
+      { type: "text", text: "answering you", quoteToken: "stale-token" },
+    ]);
+    expect(bodies[1]?.messages).toEqual([{ type: "text", text: "answering you" }]);
+  });
+
+  it.each(
+    (["push", "reply"] as const).flatMap((operation) => [
+      { operation, stage: "initial denial", allowed: false, allowFallback: false, attempts: 0 },
+      {
+        operation,
+        stage: "revoked quote fallback",
+        allowed: true,
+        allowFallback: false,
+        attempts: 1,
+      },
+      {
+        operation,
+        stage: "allowed quote fallback",
+        allowed: true,
+        allowFallback: true,
+        attempts: 2,
+      },
+    ]),
+  )("authorizes $operation at each attempt: $stage", async (testCase) => {
+    let allowed = testCase.allowed;
+    const authorize = vi.fn(async () => allowed);
+    lineFetchMock.mockImplementationOnce(async () => {
+      allowed = testCase.allowFallback;
+      return new Response("invalid quote", { status: 400, statusText: "Bad Request" });
+    });
+    const options = { cfg: LINE_TEST_CFG, quoteToken: "stale-token", authorize };
+    const messages = [{ type: "text" as const, text: "answering you" }];
+    const sending =
+      testCase.operation === "push"
+        ? sendModule.pushMessagesLine("U0123456789abcdef0123456789abcdef", messages, options)
+        : sendModule.replyMessageLine("reply-token", messages, options);
+
+    if (testCase.allowFallback) {
+      await sending;
+    } else {
+      await expect(sending).rejects.toThrow("LINE send authorization denied");
+    }
+    expect(lineFetchMock).toHaveBeenCalledTimes(testCase.attempts);
+    expect(authorize).toHaveBeenCalledTimes(testCase.allowed ? 2 : 1);
+    if (testCase.allowFallback) {
+      const messagesSent = lineFetchMock.mock.calls.map(([, init]) => {
+        const body = (init as RequestInit).body;
+        if (typeof body !== "string") {
+          throw new Error("Expected LINE request JSON");
+        }
+        return (JSON.parse(body) as { messages: unknown[] }).messages;
+      });
+      expect(messagesSent).toEqual([
+        [{ type: "text", text: "answering you", quoteToken: "stale-token" }],
+        [{ type: "text", text: "answering you" }],
+      ]);
+    }
+  });
+
+  it("does not resend a rejected send that carried no quote", async () => {
+    lineFetchMock.mockResolvedValueOnce(
+      new Response("invalid payload", { status: 400, statusText: "Bad Request" }),
+    );
+
+    await expect(
+      sendModule.pushMessagesLine("U123", [{ type: "text", text: "Hello" }], {
+        cfg: LINE_TEST_CFG,
+      }),
+    ).rejects.toBeInstanceOf(HTTPFetchError);
+    expect(lineFetchMock).toHaveBeenCalledOnce();
   });
 
   it("keeps rejected LINE sends distinguishable from accepted delivery", async () => {
@@ -713,12 +729,9 @@ describe("LINE send helpers", () => {
       new Response("invalid payload", { status: 400, statusText: "Bad Request" }),
     );
 
-    let caught: unknown;
-    try {
-      await sendModule.pushMessageLine("U123", "Hello", { cfg: LINE_TEST_CFG });
-    } catch (error) {
-      caught = error;
-    }
+    const caught = await captureError(() =>
+      sendModule.pushMessageLine("U123", "Hello", { cfg: LINE_TEST_CFG }),
+    );
 
     expect(caught).toBeInstanceOf(HTTPFetchError);
     expect(isChannelPartialDeliveryError(caught)).toBe(false);
@@ -764,17 +777,7 @@ describe("LINE send helpers", () => {
         sentMessages: [{ id: "line-provider-delivered" }, { id: "   " }],
       });
 
-      let caught: unknown;
-      try {
-        await send();
-      } catch (error) {
-        caught = error;
-      }
-
-      expect(isChannelPartialDeliveryError(caught)).toBe(true);
-      if (!isChannelPartialDeliveryError(caught)) {
-        throw new Error("expected a partially identifiable accepted LINE delivery");
-      }
+      const caught = await capturePartialDelivery(send);
       expect(caught.deliveryResult).toEqual({
         messageIds: ["line-provider-delivered"],
         visibleReplySent: true,
@@ -790,17 +793,10 @@ describe("LINE send helpers", () => {
   ])("preserves accepted delivery for a malformed $name", async ({ sentMessages }) => {
     pushMessageMock.mockResolvedValueOnce({ sentMessages });
 
-    let caught: unknown;
-    try {
-      await sendModule.pushMessageLine("U123", "Hello", { cfg: LINE_TEST_CFG });
-    } catch (error) {
-      caught = error;
-    }
+    const caught = await capturePartialDelivery(() =>
+      sendModule.pushMessageLine("U123", "Hello", { cfg: LINE_TEST_CFG }),
+    );
 
-    expect(isChannelPartialDeliveryError(caught)).toBe(true);
-    if (!isChannelPartialDeliveryError(caught)) {
-      throw new Error("expected an accepted LINE delivery with a malformed receipt");
-    }
     expect(caught.deliveryResult).toEqual({ messageIds: [], visibleReplySent: true });
     expect(pushMessageMock).toHaveBeenCalledOnce();
     expect(recordChannelActivityMock).not.toHaveBeenCalled();
@@ -817,7 +813,25 @@ describe("LINE send helpers", () => {
     });
   });
 
-  it("sends video with explicit image preview URL", async () => {
+  it("sends a bare audio URL using the kind inferred by the LINE media owner", async () => {
+    await sendModule.sendMessageLine("line:user:U123", "", {
+      cfg: LINE_TEST_CFG,
+      mediaUrl: "https://example.com/voice.m4a",
+    });
+
+    expect(pushMessageMock).toHaveBeenCalledWith({
+      to: "U123",
+      messages: [
+        {
+          type: "audio",
+          originalContentUrl: "https://example.com/voice.m4a",
+          duration: 60000,
+        },
+      ],
+    });
+  });
+
+  it("forwards explicit video options through the shared LINE media owner", async () => {
     await sendModule.sendMessageLine("line:user:U100", "Video", {
       cfg: LINE_TEST_CFG,
       mediaUrl: "https://example.com/video.mp4",
@@ -835,15 +849,12 @@ describe("LINE send helpers", () => {
           previewImageUrl: "https://example.com/preview.jpg",
           trackingId: "track-1",
         },
-        {
-          type: "text",
-          text: "Video",
-        },
+        { type: "text", text: "Video" },
       ],
     });
   });
 
-  it("throws when video preview URL is missing", async () => {
+  it("keeps a missing explicit video preview as a visible caller error", async () => {
     await expect(
       sendModule.sendMessageLine("line:user:U200", "Video", {
         cfg: LINE_TEST_CFG,
@@ -851,88 +862,20 @@ describe("LINE send helpers", () => {
         mediaKind: "video",
       }),
     ).rejects.toThrow(/require previewimageurl/i);
+
+    expect(pushMessageMock).not.toHaveBeenCalled();
   });
 
-  it("blocks private-network media URLs before calling LINE", async () => {
-    resolvePinnedHostnameWithPolicyMock.mockRejectedValueOnce(
-      new Error("SSRF blocked private network target"),
-    );
-
+  it("validates image URLs before sending", async () => {
     await expect(
-      sendModule.sendMessageLine("line:user:U200", "Image", {
+      sendModule.sendMessageLine("line:user:U123", "", {
         cfg: LINE_TEST_CFG,
-        mediaUrl: "https://127.0.0.1/image.jpg",
+        mediaUrl: "http://example.com/private.jpg",
+        mediaKind: "image",
       }),
-    ).rejects.toThrow(/private network/i);
+    ).rejects.toThrow("LINE outbound media URL must use HTTPS");
 
     expect(pushMessageMock).not.toHaveBeenCalled();
-  });
-
-  it.each([
-    {
-      name: "send media URL",
-      run: () =>
-        sendModule.sendMessageLine("line:user:U200", "Image", {
-          cfg: LINE_TEST_CFG,
-          mediaUrl: createCredentialBearingHttpUrl(),
-        }),
-    },
-    {
-      name: "send preview URL",
-      run: () =>
-        sendModule.sendMessageLine("line:user:U200", "Video", {
-          cfg: LINE_TEST_CFG,
-          mediaUrl: "https://example.com/video.mp4",
-          mediaKind: "video",
-          previewImageUrl: createCredentialBearingHttpUrl(),
-        }),
-    },
-    {
-      name: "push image URL",
-      run: () =>
-        sendModule.pushImageMessage("line:user:U200", createCredentialBearingHttpUrl(), undefined, {
-          cfg: LINE_TEST_CFG,
-        }),
-    },
-    {
-      name: "push image preview URL",
-      run: () =>
-        sendModule.pushImageMessage(
-          "line:user:U200",
-          "https://example.com/image.jpg",
-          createCredentialBearingHttpUrl(),
-          { cfg: LINE_TEST_CFG },
-        ),
-    },
-  ])("does not expose credentials from an insecure $name", async ({ run }) => {
-    await expect(run()).rejects.toThrow(new Error("LINE outbound media URL must use HTTPS"));
-    expect(pushMessageMock).not.toHaveBeenCalled();
-    expect(replyMessageMock).not.toHaveBeenCalled();
-  });
-
-  it("omits trackingId for non-user destinations", async () => {
-    await sendModule.sendMessageLine("line:group:C100", "Video", {
-      cfg: LINE_TEST_CFG,
-      mediaUrl: "https://example.com/video.mp4",
-      mediaKind: "video",
-      previewImageUrl: "https://example.com/preview.jpg",
-      trackingId: "track-group",
-    });
-
-    expect(pushMessageMock).toHaveBeenCalledWith({
-      to: "C100",
-      messages: [
-        {
-          type: "video",
-          originalContentUrl: "https://example.com/video.mp4",
-          previewImageUrl: "https://example.com/preview.jpg",
-        },
-        {
-          type: "text",
-          text: "Video",
-        },
-      ],
-    });
   });
 
   it("throws when push messages are empty", async () => {

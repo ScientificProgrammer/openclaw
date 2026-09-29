@@ -7,6 +7,7 @@ import {
   type SessionsPatchParams,
 } from "../../../packages/gateway-protocol/src/index.js";
 import type { SessionEntry } from "../../config/sessions.js";
+import { isInternalSessionEffectsKey } from "../../config/sessions/internal-session-key.js";
 import { resolveAgentMainSessionKey } from "../../config/sessions/main-session.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { createSubsystemLogger } from "../../logging/subsystem.js";
@@ -14,33 +15,19 @@ import { parseAgentSessionKey } from "../../routing/session-key.js";
 import { createLazyRuntimeModule } from "../../shared/lazy-runtime.js";
 import {
   resolveCanonicalSessionEntryFromStoreKeys,
-  resolveGatewaySessionStoreTarget,
   resolveGatewaySessionStoreTargetWithStore,
 } from "../session-utils.js";
-import {
-  resolveWorkerPlacementExecutionMode,
-  resolveWorkerPlacementSessionRuntime,
-} from "../worker-environments/placement-session-runtime.js";
+import { resolveWorkerPlacementSessionRuntimeCapabilities } from "../worker-environments/placement-session-runtime.js";
+import type { SessionWorkerPlacementContext } from "../worker-environments/session-placement-lifecycle.js";
 import { resolveWorkerPlacementArchiveRestoreError } from "../worker-environments/session-placement-lifecycle.js";
 import type { GatewayRequestContext, RespondFn } from "./types.js";
-export {
-  resolveSessionWorkerPlacementMutationError,
-  SessionWorkerPlacementMutationError,
-} from "../worker-environments/session-placement-lifecycle.js";
 
 export const sessionLog = createSubsystemLogger("gateway/sessions");
-
-export function respondSessionWorkerPlacementMutationError(
-  error: { message: string },
-  respond: RespondFn,
-): void {
-  respond(false, undefined, errorShape(ErrorCodes.INVALID_REQUEST, error.message));
-}
 
 export function resolveSessionWorkerPlacementPatchError(params: {
   agentId: string;
   cfg: OpenClawConfig;
-  context: GatewayRequestContext;
+  context: SessionWorkerPlacementContext;
   entry: SessionEntry | undefined;
   key: string;
   patch: SessionsPatchParams;
@@ -55,6 +42,13 @@ export function resolveSessionWorkerPlacementPatchError(params: {
   if (!placement || placement.state === "local") {
     return undefined;
   }
+  if (
+    "permissionMode" in params.patch &&
+    placement.executionMode === "worker-turn" &&
+    placement.turnClaim
+  ) {
+    return "This remote worker cannot apply permissions while active. Stop the worker run, then change permissions.";
+  }
   if (params.patch.archived === false) {
     const restoreError = resolveWorkerPlacementArchiveRestoreError({
       context: params.context,
@@ -67,24 +61,25 @@ export function resolveSessionWorkerPlacementPatchError(params: {
   }
   if (
     !params.validateModelRuntime ||
-    params.patch.model === undefined ||
+    (params.patch.model === undefined &&
+      params.patch.agentRuntime === undefined &&
+      params.patch.nativeRuntimeConsent === undefined) ||
     !params.entry?.sessionId
   ) {
     return undefined;
   }
-  const runtime = resolveWorkerPlacementSessionRuntime({
+  const { executionMode } = resolveWorkerPlacementSessionRuntimeCapabilities({
     cfg: params.cfg,
     entry: params.entry,
     agentId: params.agentId,
     sessionKey: params.sessionKey,
   });
-  const executionMode = resolveWorkerPlacementExecutionMode(runtime);
   if (executionMode === placement.executionMode) {
     return undefined;
   }
   return executionMode
     ? `Session ${params.key} cannot change cloud placement execution mode while placement is ${placement.state}.`
-    : `Session ${params.key} cannot select the ${runtime} runtime while cloud worker placement is ${placement.state}.`;
+    : `Session ${params.key} cannot select a runtime without cloud placement support while cloud worker placement is ${placement.state}.`;
 }
 
 export const loadSessionsRuntimeModule = createLazyRuntimeModule(
@@ -108,19 +103,6 @@ export function requireSessionKey(key: unknown, respond: RespondFn): string | nu
   return normalized;
 }
 
-export function resolveGatewaySessionTargetFromKey(
-  key: string,
-  cfg: OpenClawConfig,
-  opts?: { agentId?: string },
-) {
-  const target = resolveGatewaySessionStoreTarget({
-    cfg,
-    key,
-    ...(opts?.agentId ? { agentId: opts.agentId } : {}),
-  });
-  return { cfg, target, storePath: target.storePath };
-}
-
 export function loadAccessorSessionEntryForGatewayTarget(params: {
   key: string;
   cfg: OpenClawConfig;
@@ -129,36 +111,16 @@ export function loadAccessorSessionEntryForGatewayTarget(params: {
   const target = resolveGatewaySessionStoreTargetWithStore({
     cfg: params.cfg,
     key: params.key,
-    clone: false,
+    exactRead: true,
     ...(params.agentId ? { agentId: params.agentId } : {}),
   });
-  let best:
-    | {
-        entry: SessionEntry;
-        sessionStoreKey: string;
-      }
-    | undefined;
-  for (const sessionStoreKey of target.storeKeys) {
-    const entry = target.store[sessionStoreKey];
-    if (entry) {
-      if (!best || (entry.updatedAt ?? 0) > (best.entry.updatedAt ?? 0)) {
-        best = { entry, sessionStoreKey };
-      }
-    }
-  }
-  if (best) {
-    return {
-      target,
-      storePath: target.storePath,
-      entry: best.entry,
-      canonicalKey: target.canonicalKey,
-      sessionStoreKey: best.sessionStoreKey,
-    };
-  }
   return {
     target,
     storePath: target.storePath,
-    entry: undefined,
+    // Exact probes include internal-effects rows that operator inventory reads hide.
+    entry: isInternalSessionEffectsKey(target.canonicalKey)
+      ? undefined
+      : resolveCanonicalSessionEntryFromStoreKeys(target.store, target.storeKeys),
     canonicalKey: target.canonicalKey,
     sessionStoreKey: target.canonicalKey,
   };
@@ -168,15 +130,20 @@ export function loadSessionEntriesForTarget(params: {
   key: string;
   cfg: OpenClawConfig;
   agentId?: string;
+  includeStoreChildEntries?: boolean;
 }) {
   const target = resolveGatewaySessionStoreTargetWithStore({
     cfg: params.cfg,
     key: params.key,
     clone: false,
+    exactRead: true,
+    includeStoreChildEntries: params.includeStoreChildEntries,
     ...(params.agentId ? { agentId: params.agentId } : {}),
   });
   const store = target.store;
-  const entry = resolveCanonicalSessionEntryFromStoreKeys(store, target.storeKeys);
+  const entry = isInternalSessionEffectsKey(target.canonicalKey)
+    ? undefined
+    : resolveCanonicalSessionEntryFromStoreKeys(store, target.storeKeys);
   return { target, storePath: target.storePath, store, entry };
 }
 

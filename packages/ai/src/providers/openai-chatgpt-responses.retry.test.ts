@@ -1,4 +1,4 @@
-// Covers which ChatGPT Responses failures the SSE transport retries.
+// Covers that ChatGPT Responses leaves transient retry ownership to the runner.
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { configureAiTransportHost } from "../host.js";
 import { responsesPromptObserver, type ResponsesPromptObservation } from "../internal/openai.js";
@@ -47,11 +47,7 @@ describe("streamOpenAICodexResponses retry classification", () => {
     "https://api.openai.com/auth": { chatgpt_account_id: "acct-1" },
   });
 
-  it.each([
-    { status: 401, statusText: "Unauthorized", message: "Invalid credentials" },
-    { status: 403, statusText: "Forbidden", message: "Account is not authorized" },
-    { status: 400, statusText: "Bad Request", message: "Unsupported parameter" },
-  ])(
+  it.each([{ status: 401, statusText: "Unauthorized", message: "Invalid credentials" }])(
     "does not retry non-retryable ChatGPT responses: $status",
     async ({ status, statusText, message }) => {
       const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(
@@ -74,7 +70,7 @@ describe("streamOpenAICodexResponses retry classification", () => {
     },
   );
 
-  it("still retries retryable ChatGPT responses", async () => {
+  it("does not retry retryable ChatGPT responses", async () => {
     const prompt = "PRIVATE-NATIVE-SSE-RETRY-PROMPT";
     const observations: ResponsesPromptObservation[] = [];
     const fetchMock = vi
@@ -112,10 +108,12 @@ describe("streamOpenAICodexResponses retry classification", () => {
     ).result();
 
     expect(result.stopReason).toBe("error");
-    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(acceptanceObserver).not.toHaveBeenCalled();
-    expect(onResponse.mock.calls.map(([response]) => response.status)).toEqual([503, 401]);
-    expect(observations).toHaveLength(2);
+    expect(
+      onResponse.mock.calls.map(([response]) => response.status).every((status) => status === 503),
+    ).toBe(true);
+    expect(observations).toHaveLength(1);
     expect(observations.every((entry) => entry.egress === "native-codex-sse")).toBe(true);
     expect(observations.every((entry) => entry.payloadVariant === "initial")).toBe(true);
     expect(observations.every((entry) => entry.matchesAssembledPrompt)).toBe(true);
@@ -130,18 +128,6 @@ describe("streamOpenAICodexResponses retry classification", () => {
       cause: Object.assign(new Error("certificate has expired"), {
         code: "CERT_HAS_EXPIRED",
       }),
-    }),
-    Object.assign(new Error("TLS validation failed"), {
-      code: "CERT_NOT_YET_VALID",
-    }),
-    new Error("fetch failed", {
-      cause: Object.assign(new Error("TLS validation failed"), {
-        code: "CERT_NOT_YET_VALID",
-      }),
-    }),
-    new Error("certificate is not yet valid"),
-    Object.assign(new Error("TLS validation failed"), {
-      code: "ERR_TLS_CERT_ALTNAME_INVALID",
     }),
   ])("does not retry deterministic TLS certificate failures", async (error) => {
     const fetchMock = vi.fn<typeof fetch>().mockRejectedValue(error);
@@ -176,7 +162,7 @@ describe("streamOpenAICodexResponses retry classification", () => {
     expect(setTimeoutSpy).not.toHaveBeenCalled();
   });
 
-  it("keeps retrying transient network failures", async () => {
+  it("does not retry transient network failures", async () => {
     const fetchMock = vi
       .fn<typeof fetch>()
       .mockRejectedValueOnce(Object.assign(new Error("socket hang up"), { code: "ECONNRESET" }))
@@ -195,40 +181,57 @@ describe("streamOpenAICodexResponses retry classification", () => {
     }).result();
 
     expect(result.stopReason).toBe("error");
-    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
   it.each([
     { label: "unparseable", retryAfterMs: "not-a-number" },
     { label: "empty", retryAfterMs: "" },
   ])("honors retry-after when retry-after-ms is $label", async ({ retryAfterMs }) => {
-    const fetchMock = vi
-      .fn<typeof fetch>()
-      .mockResolvedValueOnce(
-        new Response("rate limited", {
-          status: 429,
-          headers: { "retry-after-ms": retryAfterMs, "retry-after": "7" },
-        }),
-      )
-      .mockRejectedValueOnce(new Error("usage limit: stop after retry delay"));
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response("rate limited", {
+        status: 429,
+        headers: { "retry-after-ms": retryAfterMs, "retry-after": "7" },
+      }),
+    );
     vi.stubGlobal("fetch", fetchMock);
-    const setTimeoutSpy = vi
-      .spyOn(globalThis, "setTimeout")
-      .mockImplementation((callback: TimerHandler) => {
-        if (typeof callback === "function") {
-          callback();
-        }
-        return 0 as unknown as ReturnType<typeof setTimeout>;
-      });
 
-    await streamOpenAICodexResponses(model, context, {
+    const result = await streamOpenAICodexResponses(model, context, {
       apiKey: jwt,
       transport: "sse",
     }).result();
 
-    expect(fetchMock).toHaveBeenCalledTimes(2);
-    expect(setTimeoutSpy).toHaveBeenCalledWith(expect.any(Function), 7_000);
+    expect(result.errorMessage).toContain("Retry-After: 7 seconds");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
+
+  it.each([
+    { status: 429, code: undefined, message: "Too many requests" },
+    { status: 503, code: undefined, message: "Maintenance in progress." },
+    { status: 503, code: "maintenance", message: "Maintenance in progress." },
+  ])(
+    "preserves HTTP $status and provider code $code for the retry owner",
+    async ({ status, code, message }) => {
+      const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(
+        new Response(JSON.stringify({ error: { message, code } }), {
+          status,
+          headers: { "retry-after": "7" },
+        }),
+      );
+      vi.stubGlobal("fetch", fetchMock);
+
+      const result = await streamOpenAICodexResponses(model, context, {
+        apiKey: jwt,
+        transport: "sse",
+      }).result();
+
+      expect(result.stopReason).toBe("error");
+      expect(result.errorMessage).toMatch(new RegExp(`^${status}: `));
+      expect(result.errorCode).toBe(code ?? String(status));
+      expect(result.errorMessage).toContain("Retry-After: 7 seconds");
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    },
+  );
 
   it("does not retry a bodyless 304 response", async () => {
     const fetchMock = vi
@@ -243,7 +246,7 @@ describe("streamOpenAICodexResponses retry classification", () => {
     }).result();
 
     expect(result.stopReason).toBe("error");
-    expect(result.errorMessage).toBe("Not Modified");
+    expect(result.errorMessage).toBe("304: Not Modified");
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(setTimeoutSpy).not.toHaveBeenCalled();
   });

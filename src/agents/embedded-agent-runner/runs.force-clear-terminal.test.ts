@@ -15,28 +15,23 @@ import {
   createOpenClawTestState,
   type OpenClawTestState,
 } from "../../test-utils/openclaw-test-state.js";
+import { createDeferredEmbeddedRunLifecycleManager } from "./run/deferred-lifecycle-owner.js";
 import {
   abortAndDrainEmbeddedAgentRun,
   clearActiveEmbeddedRun,
   isEmbeddedAgentRunHandleActive,
   setActiveEmbeddedRun,
 } from "./runs.js";
-import { testing } from "./runs.test-support.js";
+import { createEmbeddedRunHandle as createRunHandle, testing } from "./runs.test-support.js";
 
-type RunHandle = Parameters<typeof setActiveEmbeddedRun>[1];
-
-function createRunHandle(
-  overrides: {
-    abort?: () => void;
-    isStreaming?: boolean;
-  } = {},
-): RunHandle {
-  return {
-    queueMessage: async () => {},
-    isStreaming: () => overrides.isStreaming ?? true,
-    isCompacting: () => false,
-    abort: overrides.abort ?? (() => {}),
-  };
+function forceClear(sessionId: string, sessionKey?: string, settleMs = 0) {
+  return abortAndDrainEmbeddedAgentRun({
+    sessionId,
+    sessionKey,
+    settleMs,
+    forceClear: true,
+    reason: "stuck_recovery",
+  });
 }
 
 describe("force-clear terminal state persistence", () => {
@@ -85,13 +80,7 @@ describe("force-clear terminal state persistence", () => {
         followupObservedActiveHandle.push(isEmbeddedAgentRunHandleActive(sessionId));
       });
 
-      const recovery = abortAndDrainEmbeddedAgentRun({
-        sessionId,
-        sessionKey,
-        reason: "stuck_recovery",
-        forceClear: true,
-        settleMs: 100,
-      });
+      const recovery = forceClear(sessionId, sessionKey, 100);
       expect(isReplyRunActiveForSessionId(sessionId)).toBe(true);
       expect(followupObservedActiveHandle).toEqual([]);
 
@@ -139,13 +128,7 @@ describe("force-clear terminal state persistence", () => {
       followupObservedActiveHandle.push(isEmbeddedAgentRunHandleActive(sessionId));
     });
 
-    const result = await abortAndDrainEmbeddedAgentRun({
-      sessionId,
-      sessionKey,
-      reason: "stuck_recovery",
-      forceClear: true,
-      settleMs: 20,
-    });
+    const result = await forceClear(sessionId, sessionKey, 20);
 
     expect(result).toEqual({ aborted: false, drained: false, forceCleared: true });
     expect(operation.result).toEqual({ kind: "failed", code: "run_stalled" });
@@ -174,13 +157,7 @@ describe("force-clear terminal state persistence", () => {
       followupObservedActiveOwner.push(isReplyRunActiveForSessionId(sessionId));
     });
 
-    const result = await abortAndDrainEmbeddedAgentRun({
-      sessionId,
-      sessionKey,
-      reason: "stuck_recovery",
-      forceClear: true,
-      settleMs: 20,
-    });
+    const result = await forceClear(sessionId, sessionKey, 20);
 
     expect(result).toEqual({ aborted: false, drained: false, forceCleared: true });
     expect(operation.result).toEqual({ kind: "failed", code: "run_stalled" });
@@ -207,13 +184,7 @@ describe("force-clear terminal state persistence", () => {
       followupObservedActiveOwner.push(isReplyRunActiveForSessionId(sessionId));
     });
 
-    const result = await abortAndDrainEmbeddedAgentRun({
-      sessionId,
-      sessionKey,
-      reason: "stuck_recovery",
-      forceClear: true,
-      settleMs: 20,
-    });
+    const result = await forceClear(sessionId, sessionKey, 20);
 
     expect(result).toEqual({ aborted: false, drained: false, forceCleared: true });
     expect(cancel).toHaveBeenCalledWith("superseded");
@@ -238,13 +209,7 @@ describe("force-clear terminal state persistence", () => {
     operation.setPhase("running");
     setActiveEmbeddedRun(sessionId, handle, sessionKey);
 
-    const result = await abortAndDrainEmbeddedAgentRun({
-      sessionId,
-      sessionKey,
-      reason: "stuck_recovery",
-      forceClear: true,
-      settleMs: 20,
-    });
+    const result = await forceClear(sessionId, sessionKey, 20);
 
     expect(result).toEqual({ aborted: true, drained: false, forceCleared: true });
     expect(abort).toHaveBeenCalled();
@@ -270,13 +235,7 @@ describe("force-clear terminal state persistence", () => {
 
     setActiveEmbeddedRun(sessionId, createRunHandle(), sessionKey);
 
-    const result = await abortAndDrainEmbeddedAgentRun({
-      sessionId,
-      sessionKey,
-      forceClear: true,
-      reason: "stuck_recovery",
-      settleMs: 0,
-    });
+    const result = await forceClear(sessionId, sessionKey);
 
     expect(result.forceCleared).toBe(true);
 
@@ -306,15 +265,7 @@ describe("force-clear terminal state persistence", () => {
     );
     setActiveEmbeddedRun(sessionId, createRunHandle(), sessionKey);
 
-    await expect(
-      abortAndDrainEmbeddedAgentRun({
-        sessionId,
-        sessionKey,
-        forceClear: true,
-        reason: "stuck_recovery",
-        settleMs: 0,
-      }),
-    ).resolves.toMatchObject({ forceCleared: true });
+    await expect(forceClear(sessionId, sessionKey)).resolves.toMatchObject({ forceCleared: true });
 
     expect(loadSessionEntry({ agentId: "ops", sessionKey, storePath })).toMatchObject({
       sessionId,
@@ -335,15 +286,7 @@ describe("force-clear terminal state persistence", () => {
     );
     setActiveEmbeddedRun(sessionId, handle, sessionKey);
 
-    await expect(
-      abortAndDrainEmbeddedAgentRun({
-        sessionId,
-        sessionKey,
-        forceClear: true,
-        reason: "stuck_recovery",
-        settleMs: 0,
-      }),
-    ).resolves.toMatchObject({ forceCleared: true });
+    await expect(forceClear(sessionId, sessionKey)).resolves.toMatchObject({ forceCleared: true });
 
     clearActiveEmbeddedRun(sessionId, handle, sessionKey);
 
@@ -355,19 +298,67 @@ describe("force-clear terminal state persistence", () => {
     });
   });
 
+  it.each(["direct", "deferred"])(
+    "persists forced terminal state only in the selected agent's global store via %s registration",
+    async (registration) => {
+      const agentId = "work";
+      const sessionKey = "global";
+      const sessionId = `${agentId}-global`;
+      const startedAt = Date.now() - 60_000;
+      setRuntimeConfigSnapshot({
+        agents: { ownership: "explicit", entries: { main: {}, work: {} } },
+        session: { scope: "global" },
+      });
+      for (const owner of ["main", "work"]) {
+        await upsertSessionEntryCore(
+          { agentId: owner, sessionKey },
+          {
+            sessionId: `${owner}-global`,
+            updatedAt: startedAt,
+            startedAt,
+            status: "running",
+            lifecycleRunId: `${owner}-run`,
+          },
+        );
+      }
+      const deferred =
+        registration === "deferred"
+          ? createDeferredEmbeddedRunLifecycleManager({
+              agentId,
+              sessionId,
+              sessionKey,
+              runId: `${agentId}-run`,
+            })
+          : undefined;
+      if (deferred) {
+        deferred.handoffToCli();
+      } else {
+        setActiveEmbeddedRun(sessionId, createRunHandle(), sessionKey, undefined, agentId);
+      }
+      await expect(forceClear(sessionId, sessionKey)).resolves.toMatchObject({
+        forceCleared: true,
+      });
+      const entry = loadSessionEntry({ agentId, sessionKey });
+      expect(entry).toMatchObject({ sessionId, status: "killed", abortedLastRun: true });
+      expect(entry?.endedAt).toBeGreaterThanOrEqual(startedAt);
+      expect(entry?.lifecycleRunId).toBeUndefined();
+      await deferred?.complete();
+      const otherAgentId = "main";
+      expect(loadSessionEntry({ agentId: otherAgentId, sessionKey })).toMatchObject({
+        sessionId: `${otherAgentId}-global`,
+        status: "running",
+        lifecycleRunId: `${otherAgentId}-run`,
+      });
+    },
+  );
+
   it("does not fail when the session entry is absent", async () => {
     const sessionKey = "agent:main:missing";
     const sessionId = "session-missing";
 
     setActiveEmbeddedRun(sessionId, createRunHandle(), sessionKey);
 
-    const result = await abortAndDrainEmbeddedAgentRun({
-      sessionId,
-      sessionKey,
-      forceClear: true,
-      reason: "stuck_recovery",
-      settleMs: 0,
-    });
+    const result = await forceClear(sessionId, sessionKey);
 
     expect(result.forceCleared).toBe(true);
   });
@@ -387,12 +378,7 @@ describe("force-clear terminal state persistence", () => {
 
     setActiveEmbeddedRun(sessionId, createRunHandle());
 
-    const result = await abortAndDrainEmbeddedAgentRun({
-      sessionId,
-      forceClear: true,
-      reason: "stuck_recovery",
-      settleMs: 0,
-    });
+    const result = await forceClear(sessionId);
 
     expect(result.forceCleared).toBe(true);
 
@@ -425,13 +411,7 @@ describe("force-clear terminal state persistence", () => {
       },
     );
 
-    const result = await abortAndDrainEmbeddedAgentRun({
-      sessionId: oldSessionId,
-      sessionKey,
-      forceClear: true,
-      reason: "stuck_recovery",
-      settleMs: 0,
-    });
+    const result = await forceClear(oldSessionId, sessionKey);
 
     expect(result.forceCleared).toBe(true);
 
@@ -459,13 +439,7 @@ describe("force-clear terminal state persistence", () => {
     });
     setActiveEmbeddedRun(sessionId, original, sessionKey);
 
-    const result = await abortAndDrainEmbeddedAgentRun({
-      sessionId,
-      sessionKey,
-      forceClear: true,
-      reason: "stuck_recovery",
-      settleMs: 0,
-    });
+    const result = await forceClear(sessionId, sessionKey);
 
     expect(result).toEqual({ aborted: true, drained: false, forceCleared: false });
     expect(isEmbeddedAgentRunHandleActive(sessionId)).toBe(true);
@@ -492,13 +466,7 @@ describe("force-clear terminal state persistence", () => {
     });
     setActiveEmbeddedRun(oldSessionId, original, sessionKey);
 
-    const result = await abortAndDrainEmbeddedAgentRun({
-      sessionId: oldSessionId,
-      sessionKey,
-      forceClear: true,
-      reason: "stuck_recovery",
-      settleMs: 0,
-    });
+    const result = await forceClear(oldSessionId, sessionKey);
 
     expect(result).toEqual({ aborted: true, drained: false, forceCleared: true });
     expect(isEmbeddedAgentRunHandleActive(newSessionId)).toBe(true);

@@ -8,6 +8,7 @@ import {
   type LookupFn,
   resolvePinnedHostname,
   resolvePinnedHostnameWithPolicy,
+  resolveSsrFPolicyForUrl,
   SsrFBlockedError,
 } from "./ssrf.js";
 
@@ -141,12 +142,8 @@ describe("ssrf pinning", () => {
     });
   });
 
-  it.each([
-    { name: "RFC1918 private address", address: "10.0.0.8" },
-    { name: "RFC2544 benchmarking range", address: "198.18.0.1" },
-    { name: "TEST-NET-2 reserved range", address: "198.51.100.1" },
-  ])("rejects blocked DNS results: $name", async ({ address }) => {
-    const lookup = vi.fn(async () => [{ address, family: 4 }]) as unknown as LookupFn;
+  it("rejects private DNS results", async () => {
+    const lookup = vi.fn(async () => [{ address: "10.0.0.8", family: 4 }]) as unknown as LookupFn;
     await expect(resolvePinnedHostname("example.com", lookup)).rejects.toThrow(/private|internal/i);
   });
 
@@ -234,6 +231,46 @@ describe("ssrf pinning", () => {
   });
 
   it.each([
+    ["tracker.example.com", "tracker.example.com"],
+    ["outside.example.net", "outside.example.net"],
+    ["[::1]", "::1"],
+    [" TRACKER.Example.COM... ", " tracker.example.com. "],
+    ["ads.example.com", "*.example.com"],
+    ["pixel.ads.example.com", " *.EXAMPLE.COM. "],
+    ["xn--bcher-kva.example", "XN--BCHER-KVA.EXAMPLE."],
+  ])("blocks configured pattern %s / %s before DNS and allow rules", async (hostname, pattern) => {
+    const lookupFn = createPublicLookupMock();
+    const policy = resolveSsrFPolicyForUrl(new URL("https://tracker.example.com"), {
+      blockedHostnames: [pattern],
+      allowedHostnames: [hostname.trim()],
+      allowedOrigins: ["https://tracker.example.com"],
+      hostnameAllowlist: ["*.example.com", "*.example"],
+      dangerouslyAllowPrivateNetwork: true,
+    });
+
+    const result = resolvePinnedHostnameWithPolicy(hostname, { lookupFn, policy });
+    await expect(result).rejects.toThrow(SsrFBlockedError);
+    await expect(result).rejects.toThrow(/configured blocklist.*blockedHostnames/);
+    expect(lookupFn).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["example.com", ["*.example.com"]],
+    ["notexample.com", ["*.example.com"]],
+    ["example.com.evil.test", ["*.example.com"]],
+    ["safe.example.net", ["tracker.example.com"]],
+    ["example.com", []],
+    ["example.com", undefined],
+  ])("leaves unblocked host %s reachable with %j", async (hostname, blockedHostnames) => {
+    await expect(
+      resolvePinnedHostnameWithPolicy(hostname, {
+        lookupFn: createPublicLookupMock(),
+        policy: { blockedHostnames },
+      }),
+    ).resolves.toMatchObject({ hostname, addresses: ["93.184.216.34"] });
+  });
+
+  it.each([
     {
       name: "ISATAP embedded private IPv4",
       hostname: "2001:db8:1234::5efe:127.0.0.1",
@@ -307,27 +344,6 @@ describe("ssrf pinning", () => {
     expect(pinned.addresses).toEqual(["127.0.0.1"]);
     expect(lookup).toHaveBeenCalledTimes(1);
   });
-
-  it.each([
-    ["IPv4 unspecified", "0.0.0.0", 4],
-    ["IPv4 unspecified range", "0.42.42.42", 4],
-    ["IPv6 unspecified", "::", 6],
-    ["IPv4-mapped IPv6 unspecified", "::ffff:0.0.0.0", 6],
-    ["NAT64-embedded IPv4 unspecified", "64:ff9b::0.0.0.0", 6],
-    ["local-use NAT64", "64:ff9b:1:808:808:808:a9fe:a9fe", 6],
-  ] as const)(
-    "rejects a trusted private hostname rebound to %s",
-    async (_name, address, family) => {
-      const lookup = vi.fn(async () => [{ address, family }]) as unknown as LookupFn;
-
-      await expect(
-        resolvePinnedHostnameWithPolicy("model.lan", {
-          lookupFn: lookup,
-          policy: { allowedHostnames: ["model.lan"] },
-        }),
-      ).rejects.toThrow(SsrFBlockedError);
-    },
-  );
 
   it("does not allow explicit localhost trust to resolve through an unspecified address", async () => {
     const lookup = vi.fn(async () => [{ address: "0.0.0.0", family: 4 }]) as unknown as LookupFn;

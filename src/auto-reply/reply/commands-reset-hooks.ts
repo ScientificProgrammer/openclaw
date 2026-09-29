@@ -13,10 +13,6 @@ import type { HandleCommandsParams } from "./commands-types.js";
 
 const routeReplyRuntimeLoader = createLazyImportLoader(() => import("./route-reply.runtime.js"));
 
-function loadRouteReplyRuntime() {
-  return routeReplyRuntimeLoader.load();
-}
-
 export type ResetCommandAction = "new" | "reset";
 
 function parseTranscriptMessages(entries: unknown[]): unknown[] {
@@ -113,11 +109,12 @@ export async function emitResetCommandHooks(params: {
     const channel = params.ctx.OriginatingChannel || params.command.channel;
     const to = params.ctx.OriginatingTo || params.command.from || params.command.to;
     if (channel && to) {
-      const { routeReply } = await loadRouteReplyRuntime();
+      const { routeReply } = await routeReplyRuntimeLoader.load();
       const result = await routeReply({
         payload: { text: hookEvent.messages.join("\n\n") },
         channel,
         to,
+        agentId: hookAgentId,
         sessionKey: params.sessionKey,
         accountId: params.ctx.AccountId,
         requesterSenderId: params.command.senderId,

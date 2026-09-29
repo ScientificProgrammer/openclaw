@@ -35,25 +35,44 @@ it("filters legacy row metadata with a noncanonical transcript id", () => {
   ).toBeUndefined();
 });
 
+it("keeps only recognized archive reasons on archived rows", () => {
+  expect(
+    normalizePersistedSessionEntryShape({
+      sessionId: "archived-session",
+      updatedAt: 42,
+      archivedAt: 41,
+      archiveReason: "active-session-cap",
+    }),
+  ).toMatchObject({ archiveReason: "active-session-cap" });
+  expect(
+    normalizePersistedSessionEntryShape({
+      sessionId: "active-session",
+      updatedAt: 42,
+      archivedBy: { type: "human", id: "stale-actor" },
+      archiveReason: "active-session-cap",
+    }),
+  ).not.toMatchObject({ archivedBy: expect.anything(), archiveReason: expect.anything() });
+  expect(
+    normalizePersistedSessionEntryShape({
+      sessionId: "legacy-archive",
+      updatedAt: 42,
+      archivedAt: 41,
+      archivedBy: { type: "human", id: "operator-1" },
+      archiveReason: "unknown",
+    }),
+  ).toMatchObject({ archivedBy: { type: "human", id: "operator-1" } });
+});
+
 it("preserves shipped pending key-as-session-id rows without a transcript id", () => {
-  expect(
-    normalizePersistedSessionEntryShape(
-      {
-        sessionId: "agent:child:main",
-        updatedAt: 42,
-      },
-      { sessionKey: "agent:child:main" },
-    ),
-  ).toMatchObject({ initializationPending: true, updatedAt: 42 });
-  expect(
-    normalizePersistedSessionEntryShape(
-      {
-        sessionId: "agent:child:main",
-        updatedAt: 42,
-      },
-      { sessionKey: "agent:child:main" },
-    ),
-  ).not.toHaveProperty("sessionId");
+  const entry = normalizePersistedSessionEntryShape(
+    {
+      sessionId: "agent:child:main",
+      updatedAt: 42,
+    },
+    { sessionKey: "agent:child:main" },
+  );
+  expect(entry).toMatchObject({ initializationPending: true, updatedAt: 42 });
+  expect(entry).not.toHaveProperty("sessionId");
 });
 
 it("rejects locked key-as-session-id rows instead of treating them as pending", () => {

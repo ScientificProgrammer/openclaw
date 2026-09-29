@@ -1,8 +1,3 @@
-/**
- * Subagent spawn ownership resolver.
- *
- * Resolves which session controls spawn state, thread binding, and completion delivery.
- */
 import type { OpenClawConfig } from "../../../config/types.openclaw.js";
 import {
   resolveDisplaySessionKey,
@@ -10,19 +5,12 @@ import {
   resolveMainSessionAlias,
 } from "../../tools/sessions-helpers.js";
 
-type SubagentSpawnOwnership = {
-  controllerSessionKey: string;
-  threadBindingRequesterSessionKey: string;
-  completionRequesterSessionKey: string;
-  completionRequesterDisplayKey: string;
-};
-
 /** Normalizes requester/completion owner aliases into internal and display session keys. */
 export function resolveSubagentSpawnOwnership(params: {
   cfg: OpenClawConfig;
   agentSessionKey?: string;
   completionOwnerKey?: string;
-}): SubagentSpawnOwnership {
+}) {
   const { mainKey, alias } = resolveMainSessionAlias(params.cfg);
   const controllerSessionKey = params.agentSessionKey
     ? resolveInternalSessionKey({
@@ -48,7 +36,6 @@ export function resolveSubagentSpawnOwnership(params: {
 
   return {
     controllerSessionKey,
-    threadBindingRequesterSessionKey: controllerSessionKey,
     completionRequesterSessionKey,
     completionRequesterDisplayKey,
   };

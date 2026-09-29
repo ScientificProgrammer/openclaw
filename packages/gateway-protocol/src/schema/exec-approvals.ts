@@ -56,6 +56,17 @@ const ExecApprovalsDefaultsSchema = closedObject(ExecApprovalsPolicyFields);
 const ExecApprovalsAgentSchema = closedObject({
   ...ExecApprovalsPolicyFields,
   allowlist: Type.Optional(Type.Array(ExecApprovalsAllowlistEntrySchema)),
+  mcpTools: Type.Optional(
+    Type.Array(
+      closedObject({
+        server: Type.String({ minLength: 1, pattern: "\\S" }),
+        tool: Type.String({ minLength: 1, pattern: "\\S" }),
+        source: Type.Literal("allow-always"),
+        addedAt: Type.Number({ minimum: 0 }),
+        lastUsedAt: Type.Optional(Type.Number({ minimum: 0 })),
+      }),
+    ),
+  ),
 });
 
 /** Versioned exec approvals config file edited through gateway APIs. */
@@ -213,17 +224,8 @@ export const ExecApprovalGetParamsSchema = closedObject({
   id: NonEmptyString,
 });
 
-const ExecApprovalPolicySecuritySchema = Type.Union([
-  Type.Literal("deny"),
-  Type.Literal("allowlist"),
-  Type.Literal("full"),
-]);
-
 const ExecApprovalPolicySnapshotSchema = closedObject({
-  security: ExecApprovalPolicySecuritySchema,
-  ask: Type.Union([Type.Literal("off"), Type.Literal("on-miss"), Type.Literal("always")]),
-  askFallback: ExecApprovalPolicySecuritySchema,
-  autoAllowSkills: Type.Boolean(),
+  ...ExecApprovalsResolvedDefaultsSchema.properties,
   allowlistRules: Type.Array(
     closedObject({
       pattern: Type.String(),

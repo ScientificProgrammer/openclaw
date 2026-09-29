@@ -3,6 +3,7 @@
  */
 import { clampTimerTimeoutMs } from "@openclaw/normalization-core/number-coercion";
 import type { OpenClawConfig } from "../../../config/types.openclaw.js";
+import { resolveDeliveryNotSentRetryability } from "../../../infra/delivery-recovery.shared.js";
 import { isFastTestRuntimeEnv } from "../../../infra/env.js";
 import {
   isOutboundDeliveryError,
@@ -10,7 +11,7 @@ import {
 } from "../../../infra/outbound/deliver-types.js";
 import { defaultRuntime } from "../../../runtime.js";
 import { isFailoverError } from "../../failover-error.js";
-import type { SubagentAnnounceDeliveryResult } from "./subagent-announce-dispatch.js";
+import { isSessionTranscriptTurnMismatchErrorMessage } from "../../sessions/transcript-turn-error.js";
 
 const DEFAULT_SUBAGENT_ANNOUNCE_TIMEOUT_MS = 120_000;
 
@@ -19,17 +20,6 @@ export class SourceOwnerChangedError extends Error {
     super("subagent source lifecycle changed before completion delivery");
     this.name = "SourceOwnerChangedError";
   }
-}
-
-export function sourceOwnerChangedResult(): SubagentAnnounceDeliveryResult {
-  return {
-    delivered: false,
-    path: "none",
-    reason: "source_owner_changed",
-    error: "subagent source lifecycle changed before completion delivery",
-    terminal: true,
-    disposition: "intentional_non_delivery",
-  };
 }
 
 export function resolveSubagentAnnounceTimeoutMs(cfg: OpenClawConfig): number {
@@ -81,7 +71,7 @@ const PERMANENT_ANNOUNCE_DELIVERY_ERROR_PATTERNS: readonly RegExp[] = [
   WRITER_CLAIM_REBOUND_ANNOUNCE_RE,
 ];
 
-export function isWriterClaimReboundAnnounceError(error: unknown): boolean {
+function isWriterClaimReboundAnnounceError(error: unknown): boolean {
   return Boolean(
     (error &&
       typeof error === "object" &&
@@ -135,6 +125,7 @@ function isPermanentNonWriterAnnounceError(error: unknown): boolean {
     error,
     (candidate) =>
       isPlatformMessageRejectedError(candidate) ||
+      isSessionTranscriptTurnMismatchErrorMessage(summarizeDeliveryError(candidate)) ||
       (!isWriterClaimReboundAnnounceError(candidate) &&
         PERMANENT_ANNOUNCE_DELIVERY_ERROR_PATTERNS.some((pattern) =>
           pattern.test(summarizeDeliveryError(candidate)),
@@ -145,7 +136,16 @@ function isPermanentNonWriterAnnounceError(error: unknown): boolean {
 function isTransientAnnounceDeliveryError(error: unknown): boolean {
   // Any committed platform send makes another attempt a possible duplicate;
   // permanent owner rejections also override transient-looking wrapped causes.
-  if (hasAnnounceSendEvidence(error) || isPermanentNonWriterAnnounceError(error)) {
+  if (hasAnnounceSendEvidence(error)) {
+    return false;
+  }
+
+  const typedRetryability = resolveDeliveryNotSentRetryability(error);
+  if (typedRetryability !== undefined) {
+    return typedRetryability;
+  }
+
+  if (isPermanentNonWriterAnnounceError(error)) {
     return false;
   }
 
@@ -171,6 +171,10 @@ function isTransientAnnounceDeliveryError(error: unknown): boolean {
 }
 
 export function isPermanentAnnounceDeliveryError(error: unknown): boolean {
+  const typedRetryability = resolveDeliveryNotSentRetryability(error);
+  if (typedRetryability !== undefined) {
+    return !typedRetryability;
+  }
   return isPermanentNonWriterAnnounceError(error) || hasWriterClaimReboundAnnounceError(error);
 }
 
@@ -227,11 +231,15 @@ function resolveDirectAnnounceTransientRetryDelaysMs() {
 export async function runAnnounceDeliveryWithRetry<T>(params: {
   operation: string;
   signal?: AbortSignal;
+  prepareAttempt?: () => Promise<boolean>;
   isAttemptAllowed?: () => boolean;
   run: () => Promise<T>;
 }): Promise<T> {
   const retryDelaysMs = resolveDirectAnnounceTransientRetryDelaysMs();
   for (const [retryIndex, delayMs] of retryDelaysMs.entries()) {
+    if (params.prepareAttempt && !(await params.prepareAttempt())) {
+      throw new SourceOwnerChangedError();
+    }
     if (params.isAttemptAllowed?.() === false) {
       throw new SourceOwnerChangedError();
     }
@@ -254,6 +262,9 @@ export async function runAnnounceDeliveryWithRetry<T>(params: {
       );
       await waitForAnnounceRetryDelay(delayMs, params.signal);
     }
+  }
+  if (params.prepareAttempt && !(await params.prepareAttempt())) {
+    throw new SourceOwnerChangedError();
   }
   if (params.signal?.aborted) {
     throw new Error("announce delivery aborted");

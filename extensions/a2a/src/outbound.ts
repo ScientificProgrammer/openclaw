@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
+import { readProviderJsonResponse } from "openclaw/plugin-sdk/provider-http";
 import {
   fetchWithSsrFGuard,
   ssrfPolicyFromHttpBaseUrlAllowedOrigin,
@@ -32,6 +33,7 @@ type A2aOutboundSendParams = {
   accountId?: string | null;
   to: string;
   text: string;
+  assertDirectAdapterHandoff?: () => void;
 };
 
 export async function sendA2aChannelText(
@@ -83,6 +85,7 @@ export async function sendA2aChannelText(
       auditContext: "a2a.outbound_send",
       // A redirected A2A task could be delivered to an unintended agent.
       maxRedirects: 0,
+      beforeRequest: params.assertDirectAdapterHandoff,
       init: {
         method: "POST",
         headers,
@@ -96,7 +99,11 @@ export async function sendA2aChannelText(
         );
       }
 
-      const parsed = A2aOutboundResponseSchema.safeParse(await response.json());
+      const parsed = A2aOutboundResponseSchema.safeParse(
+        await readProviderJsonResponse(response, `peer ${peerName} A2A response`, {
+          requestHeaders: headers,
+        }),
+      );
       if (!parsed.success) {
         throw new Error(`peer ${peerName} returned an invalid A2A JSON-RPC response`);
       }

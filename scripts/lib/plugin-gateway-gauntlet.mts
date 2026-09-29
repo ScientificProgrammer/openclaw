@@ -2,10 +2,8 @@
 import fs from "node:fs";
 import path from "node:path";
 import JSON5 from "json5";
-import {
-  NON_PACKAGED_BUNDLED_PLUGIN_DIRS,
-  collectBundledPluginBuildEntries,
-} from "./bundled-plugin-build-entries.mjs";
+import { NON_PACKAGED_BUNDLED_PLUGIN_DIRS } from "../../src/shared/non-packaged-plugin-dirs.ts";
+import { collectBundledPluginBuildEntries } from "./bundled-plugin-build-entries.mjs";
 import { parsePositiveInt } from "./numeric-options.mjs";
 import { isRecord } from "./record-shared.mjs";
 
@@ -30,11 +28,6 @@ const MANIFEST_NAMES = ["openclaw.plugin.json", "openclaw.plugin.json5"];
 const ANSI_PATTERN = new RegExp(String.raw`\u001B\[[0-9;]*m`, "gu");
 const QA_SUMMARY_MAX_BYTES_ENV = "OPENCLAW_PLUGIN_GATEWAY_GAUNTLET_QA_SUMMARY_MAX_BYTES";
 const DEFAULT_QA_SUMMARY_MAX_BYTES = 2 * 1024 * 1024;
-
-function readPositiveIntEnv(name: string, fallback: number) {
-  const raw = process.env[name];
-  return raw === undefined || raw === "" ? fallback : parsePositiveInt(raw, name);
-}
 
 function normalizeStringOrEmpty(value: unknown) {
   return typeof value === "string" ? value.trim() : "";
@@ -445,37 +438,21 @@ function buildGauntletPrebuildEnv(
   } = {},
 ) {
   const buildIds = new Set(normalizeStringArray(options.buildIds));
-  const runtimeOnlyPrebuildEnv = options.skipDeclarationBuild
-    ? { OPENCLAW_RUN_NODE_SKIP_DTS_BUILD: "1" }
-    : {};
-  const hasRuntimeOnlyPrebuildEnv = Object.keys(runtimeOnlyPrebuildEnv).length > 0;
   if (options.includePrivateQa) {
     for (const pluginId of NON_PACKAGED_BUNDLED_PLUGIN_DIRS) {
       buildIds.add(pluginId);
     }
   }
-  if (!options.includePrivateQa) {
-    return buildIds.size === 0 && !hasRuntimeOnlyPrebuildEnv
-      ? env
-      : {
-          ...env,
-          PNPM_CONFIG_VERIFY_DEPS_BEFORE_RUN: env.PNPM_CONFIG_VERIFY_DEPS_BEFORE_RUN ?? "false",
-          ...runtimeOnlyPrebuildEnv,
-          ...(buildIds.size > 0
-            ? {
-                OPENCLAW_BUNDLED_PLUGIN_BUILD_IDS: [...buildIds]
-                  .toSorted((left, right) => left.localeCompare(right))
-                  .join(","),
-              }
-            : {}),
-        };
+  if (!options.includePrivateQa && !options.skipDeclarationBuild && buildIds.size === 0) {
+    return env;
   }
   return {
     ...env,
     PNPM_CONFIG_VERIFY_DEPS_BEFORE_RUN: env.PNPM_CONFIG_VERIFY_DEPS_BEFORE_RUN ?? "false",
-    ...runtimeOnlyPrebuildEnv,
-    OPENCLAW_BUILD_PRIVATE_QA: "1",
-    OPENCLAW_ENABLE_PRIVATE_QA_CLI: "1",
+    ...(options.skipDeclarationBuild ? { OPENCLAW_RUN_NODE_SKIP_DTS_BUILD: "1" } : {}),
+    ...(options.includePrivateQa
+      ? { OPENCLAW_BUILD_PRIVATE_QA: "1", OPENCLAW_ENABLE_PRIVATE_QA_CLI: "1" }
+      : {}),
     ...(buildIds.size > 0
       ? {
           OPENCLAW_BUNDLED_PLUGIN_BUILD_IDS: [...buildIds]
@@ -583,7 +560,10 @@ function readQaSuiteSummary(summaryPath: string) {
 }
 
 function readQaSuiteSummaryText(summaryPath: string) {
-  const maxBytes = readPositiveIntEnv(QA_SUMMARY_MAX_BYTES_ENV, DEFAULT_QA_SUMMARY_MAX_BYTES);
+  const maxBytes = parsePositiveInt(
+    process.env[QA_SUMMARY_MAX_BYTES_ENV] || String(DEFAULT_QA_SUMMARY_MAX_BYTES),
+    QA_SUMMARY_MAX_BYTES_ENV,
+  );
   const stat = fs.statSync(summaryPath);
   if (!stat.isFile()) {
     throw new Error(`QA suite summary is not a file: ${summaryPath}`);

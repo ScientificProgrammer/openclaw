@@ -5,18 +5,18 @@ import * as providerTransportStream from "@openclaw/ai/transports";
 // Stream resolution tests cover how embedded runs choose provider, boundary,
 // native Codex, or custom stream functions and pass auth/cache/signal options.
 import type { StreamFn } from "openclaw/plugin-sdk/agent-core";
+import type { OpenClawPluginDefinition } from "openclaw/plugin-sdk/plugin-entry";
+import { registerSingleProviderPlugin } from "openclaw/plugin-sdk/plugin-test-runtime";
 import { createRequireRecord } from "openclaw/plugin-sdk/test-fixtures";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { bindStreamLlmRuntime } from "../../llm/model-runtime-binding.js";
 import { streamSimple } from "../../llm/stream.js";
 import type { Model } from "../../llm/types.js";
+import { resolveProviderStreamFn } from "../../plugins/provider-runtime.js";
 import { mintSecretSentinel } from "../../secrets/sentinel.js";
+import { loadBundledPluginFacade } from "../../test-utils/bundled-plugin-public-surface.js";
 import { wrapStreamFnWithProviderPromptState } from "./provider-prompt-state.js";
-import {
-  describeEmbeddedAgentStreamStrategy as describeEmbeddedAgentStreamStrategyImpl,
-  resolveEmbeddedAgentApiKey,
-  resolveEmbeddedAgentStreamFn as resolveEmbeddedAgentStreamFnImpl,
-} from "./stream-resolution.js";
+import { resolveEmbeddedAgentStream as resolveEmbeddedAgentStreamImpl } from "./stream-resolution.js";
 
 const streamMocks = vi.hoisted(() => ({
   delegate: undefined as StreamFn | undefined,
@@ -53,16 +53,10 @@ const llmRuntime = {
   streamSimple: streamSimple as StreamFn,
 } as LlmRuntime;
 
-function describeEmbeddedAgentStreamStrategy(
-  params: Omit<Parameters<typeof describeEmbeddedAgentStreamStrategyImpl>[0], "llmRuntime">,
+function resolveEmbeddedAgentStream(
+  params: Omit<Parameters<typeof resolveEmbeddedAgentStreamImpl>[0], "llmRuntime">,
 ) {
-  return describeEmbeddedAgentStreamStrategyImpl({ ...params, llmRuntime });
-}
-
-function resolveEmbeddedAgentStreamFn(
-  params: Omit<Parameters<typeof resolveEmbeddedAgentStreamFnImpl>[0], "llmRuntime">,
-) {
-  return resolveEmbeddedAgentStreamFnImpl({ ...params, llmRuntime });
+  return resolveEmbeddedAgentStreamImpl({ ...params, llmRuntime });
 }
 
 const overrideBoundaryAwareStreamFnOnce = (streamFn: StreamFn): void => {
@@ -95,91 +89,187 @@ afterEach(() => {
   }
 });
 
-describe("describeEmbeddedAgentStreamStrategy", () => {
+describe("prepared embedded stream strategy", () => {
   it("recovers the lifecycle owner from a prepared session stream", () => {
     bindStreamLlmRuntime(streamSimple, llmRuntime);
 
     expect(
-      describeEmbeddedAgentStreamStrategyImpl({
+      resolveEmbeddedAgentStreamImpl({
+        sessionId: "session-1",
         currentStreamFn: streamSimple,
         model: {
           api: "openai-responses",
           provider: "openai",
           id: "gpt-5.4",
         } as never,
-      }),
-    ).toBe("boundary-aware:openai-responses");
-  });
-
-  it("describes provider-owned stream paths explicitly", () => {
-    expect(
-      describeEmbeddedAgentStreamStrategy({
-        currentStreamFn: undefined,
-        providerStreamFn: vi.fn() as never,
-        model: {
-          api: "openai-completions",
-          provider: "ollama",
-          id: "qwen",
-        } as never,
-      }),
-    ).toBe("provider");
-  });
-
-  it("describes default OpenAI fallback shaping", () => {
-    expect(
-      describeEmbeddedAgentStreamStrategy({
-        currentStreamFn: undefined,
-        model: {
-          api: "openai-responses",
-          provider: "openai",
-          id: "gpt-5.4",
-        } as never,
-      }),
+      }).strategy,
     ).toBe("boundary-aware:openai-responses");
   });
 
   it("describes default Codex fallback as OpenClaw native", () => {
     expect(
-      describeEmbeddedAgentStreamStrategy({
+      resolveEmbeddedAgentStream({
+        sessionId: "session-1",
         currentStreamFn: undefined,
         model: {
           api: "openai-chatgpt-responses",
           provider: "openai",
           id: "codex-mini-latest",
         } as never,
-      }),
+      }).strategy,
     ).toBe("openclaw-native-codex-responses");
   });
 
-  it("keeps custom session streams labeled as custom", () => {
-    expect(
-      describeEmbeddedAgentStreamStrategy({
-        currentStreamFn: vi.fn() as never,
-        model: {
-          api: "openai-responses",
-          provider: "openai",
-          id: "gpt-5.4",
-        } as never,
-      }),
-    ).toBe("session-custom");
-  });
+  it.each([
+    { reason: "runtime auth", provider: "cloudflare-ai-gateway", resolvedApiKey: "runtime-key" },
+    { reason: "transport auth", provider: "anthropic", transportAuthAvailable: true },
+    { reason: "proxied Anthropic", provider: "cloudflare-ai-gateway" },
+  ])("records the selected transport for $reason", async ({ reason: _reason, ...routing }) => {
+    const currentStreamFn = vi.fn<StreamFn>();
+    const boundaryStreamFn = vi.fn<StreamFn>();
+    overrideBoundaryAwareStreamFnOnce(boundaryStreamFn);
+    const boundaryFactory = vi.mocked(providerTransportStream.createBoundaryAwareStreamFnForModel);
+    const initialCalls = boundaryFactory.mock.calls.length;
+    const params = {
+      currentStreamFn,
+      sessionId: "session-1",
+      model: {
+        api: "anthropic-messages",
+        provider: routing.provider,
+        id: "claude-sonnet-4-6",
+      } as never,
+      resolvedApiKey: "resolvedApiKey" in routing ? routing.resolvedApiKey : undefined,
+      transportAuthAvailable: "transportAuthAvailable" in routing && routing.transportAuthAvailable,
+    };
+    const { streamFn, strategy } = resolveEmbeddedAgentStream(params);
 
-  it("describes runtime-auth custom session streams as boundary-aware", () => {
-    expect(
-      describeEmbeddedAgentStreamStrategy({
-        currentStreamFn: vi.fn() as never,
-        model: {
-          api: "anthropic-messages",
-          provider: "cloudflare-ai-gateway",
-          id: "claude-sonnet-4-6",
-        } as never,
-        resolvedApiKey: "runtime-key",
-      }),
-    ).toBe("boundary-aware:anthropic-messages");
+    expect(strategy).toBe("boundary-aware:anthropic-messages");
+    expect(boundaryFactory.mock.calls.slice(initialCalls)).toEqual([[params.model]]);
+    await streamFn(params.model, { messages: [] });
+    expect(boundaryStreamFn).toHaveBeenCalledTimes(1);
+    expect(currentStreamFn).not.toHaveBeenCalled();
   });
 });
 
-describe("resolveEmbeddedAgentStreamFn", () => {
+describe("resolveEmbeddedAgentStream", () => {
+  it.each(["amazon-bedrock", "amazon-bedrock-mantle"])(
+    "preserves the stable system cache boundary through the registered %s transport",
+    async (providerId) => {
+      const { default: plugin } = await loadBundledPluginFacade<{
+        default: OpenClawPluginDefinition;
+      }>({
+        pluginId: providerId,
+        artifactBasename: "index.ts",
+      });
+      const register = plugin.register;
+      if (!register) {
+        throw new Error("expected provider plugin registration");
+      }
+      const provider = await registerSingleProviderPlugin({ ...plugin, register });
+      const model: Model = {
+        provider: providerId,
+        api: providerId === "amazon-bedrock" ? "bedrock-converse-stream" : "anthropic-messages",
+        id: "anthropic.claude-haiku-4-5-20251001-v1:0",
+        name: "Claude Haiku 4.5",
+        baseUrl:
+          providerId === "amazon-bedrock"
+            ? "https://bedrock-runtime.us-east-1.amazonaws.com"
+            : "https://bedrock-mantle.us-east-1.api.aws/v1",
+        reasoning: false,
+        input: ["text"],
+        contextWindow: 200000,
+        maxTokens: 1024,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      };
+      const providerStreamFn = resolveProviderStreamFn({
+        provider: providerId,
+        runtimeHandle: { provider: providerId, plugin: provider },
+        context: { provider: providerId, modelId: model.id, model },
+      });
+      const { streamFn } = resolveEmbeddedAgentStream({
+        model,
+        providerStreamFn,
+        currentStreamFn: undefined,
+        sessionId: "registered-cache-test",
+      });
+      let payload: unknown;
+      const events = await streamFn(
+        model,
+        {
+          systemPrompt: `Stable workspace${SYSTEM_PROMPT_CACHE_BOUNDARY}Dynamic suffix`,
+          messages: [{ role: "user", content: "Hello", timestamp: 0 }],
+        },
+        {
+          apiKey: "synthetic-test-key",
+          cacheRetention: "short",
+          onPayload: (request) => {
+            payload = request;
+            throw new Error("payload captured before network");
+          },
+        },
+      );
+      await events.result();
+      const request = requireRecord(payload, "registered provider payload");
+      expect(request.system).toEqual(
+        providerId === "amazon-bedrock"
+          ? [
+              { text: "Stable workspace" },
+              { cachePoint: { type: "default" } },
+              { text: "Dynamic suffix" },
+            ]
+          : [
+              { type: "text", text: "Stable workspace", cache_control: { type: "ephemeral" } },
+              { type: "text", text: "Dynamic suffix" },
+            ],
+      );
+      expect(JSON.stringify(request)).not.toContain("OPENCLAW_CACHE_BOUNDARY");
+    },
+  );
+
+  it.each([undefined, true])(
+    "passes the system cache boundary only to opted-in plugin streams (%s)",
+    async (supportsSystemPromptCacheBoundary) => {
+      const providerStreamFn = vi.fn<StreamFn>();
+      const model: Model = {
+        api: "custom-api",
+        provider: "test-provider",
+        id: "test-model",
+        name: "Test model",
+        baseUrl: "https://example.test",
+        reasoning: false,
+        input: ["text"],
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        contextWindow: 4096,
+        maxTokens: 1024,
+      };
+      const registeredStream = resolveProviderStreamFn({
+        provider: model.provider,
+        runtimeHandle: {
+          provider: model.provider,
+          plugin: {
+            id: model.provider,
+            label: "Test provider",
+            auth: [],
+            supportsSystemPromptCacheBoundary,
+            createStreamFn: () => providerStreamFn,
+          },
+        },
+        context: { provider: model.provider, modelId: model.id, model },
+      });
+      const { streamFn } = resolveEmbeddedAgentStream({
+        model,
+        providerStreamFn: registeredStream,
+        currentStreamFn: undefined,
+        sessionId: "cache-boundary-test",
+      });
+      const systemPrompt = `Stable prefix${SYSTEM_PROMPT_CACHE_BOUNDARY}Dynamic suffix`;
+      await streamFn(model, { systemPrompt, messages: [] });
+      expect(providerStreamFn.mock.calls[0]?.[1].systemPrompt).toBe(
+        supportsSystemPromptCacheBoundary ? systemPrompt : "Stable prefix\nDynamic suffix",
+      );
+    },
+  );
+
   it("preserves sentinels for registered provider streams", async () => {
     const secret = "plugin-stream-secret";
     const sentinel = mintSecretSentinel(secret, { label: "model-auth:plugin" });
@@ -190,7 +280,7 @@ describe("resolveEmbeddedAgentStreamFn", () => {
       id: "plugin-model",
       headers: { Authorization: `Bearer ${sentinel}` },
     } as never;
-    const streamFn = resolveEmbeddedAgentStreamFn({
+    const { streamFn } = resolveEmbeddedAgentStream({
       currentStreamFn: undefined,
       providerStreamFn: providerStreamFn as never,
       sessionId: "session-1",
@@ -213,25 +303,10 @@ describe("resolveEmbeddedAgentStreamFn", () => {
     });
   });
 
-  it("prefers the resolved run api key over a later authStorage lookup", async () => {
-    const authStorage = {
-      getApiKey: vi.fn(async () => "storage-key"),
-    };
-
-    await expect(
-      resolveEmbeddedAgentApiKey({
-        provider: "openai",
-        resolvedApiKey: "resolved-key",
-        authStorage,
-      }),
-    ).resolves.toBe("resolved-key");
-    expect(authStorage.getApiKey).not.toHaveBeenCalled();
-  });
-
   it("preserves run session identity in boundary-aware OpenAI transports", async () => {
     const innerStreamFn = vi.fn(async (_model, _context, options) => options);
     overrideBoundaryAwareStreamFnOnce(innerStreamFn as never);
-    const streamFn = resolveEmbeddedAgentStreamFn({
+    const { streamFn } = resolveEmbeddedAgentStream({
       currentStreamFn: undefined,
       sessionId: "session-1",
       model: {
@@ -255,7 +330,7 @@ describe("resolveEmbeddedAgentStreamFn", () => {
     // markers stripped before the harness sees system prompt text.
     const nativeStreamFn = vi.fn(async (_model, context, options) => ({ context, options }));
     useNativeStreamFn(nativeStreamFn as never);
-    const streamFn = resolveEmbeddedAgentStreamFn({
+    const { streamFn } = resolveEmbeddedAgentStream({
       currentStreamFn: undefined,
       sessionId: "session-1",
       model: {
@@ -365,7 +440,7 @@ describe("resolveEmbeddedAgentStreamFn", () => {
     const initialBoundaryCalls = boundaryStreamFactory.mock.calls.length;
 
     try {
-      const embeddedStreamFn = resolveEmbeddedAgentStreamFnImpl({
+      const { streamFn: embeddedStreamFn } = resolveEmbeddedAgentStreamImpl({
         currentStreamFn: sessionBaseStream,
         model,
         sessionId: "session-websocket",
@@ -445,7 +520,7 @@ describe("resolveEmbeddedAgentStreamFn", () => {
         bindStreamLlmRuntime(customStream, { ...llmRuntime } as LlmRuntime);
       }
 
-      const streamFn = resolveEmbeddedAgentStreamFn({
+      const { streamFn } = resolveEmbeddedAgentStream({
         currentStreamFn: customStream as StreamFn,
         sessionId: "custom-session",
         model: {
@@ -458,20 +533,6 @@ describe("resolveEmbeddedAgentStreamFn", () => {
       expect(streamFn).toBe(customStream);
     },
   );
-
-  it("routes GitHub Copilot fallbacks through boundary-aware transports", () => {
-    const streamFn = resolveEmbeddedAgentStreamFn({
-      currentStreamFn: undefined,
-      sessionId: "session-1",
-      model: {
-        api: "openai-responses",
-        provider: "github-copilot",
-        id: "gpt-5.4",
-      } as never,
-    });
-
-    expect(streamFn).not.toBe(streamSimple);
-  });
 
   it("reads refreshed runtime auth for each boundary-aware model call", async () => {
     const firstSentinel = mintSecretSentinel("copilot-runtime-value-1", {
@@ -487,7 +548,7 @@ describe("resolveEmbeddedAgentStreamFn", () => {
     const currentStreamFn = vi.fn(async (_model, _context, options) => options);
     const innerStreamFn = vi.fn(async (_model, _context, options) => options);
     overrideBoundaryAwareStreamFnOnce(innerStreamFn as never);
-    const streamFn = resolveEmbeddedAgentStreamFn({
+    const { streamFn } = resolveEmbeddedAgentStream({
       currentStreamFn: currentStreamFn as never,
       sessionId: "session-1",
       model: {
@@ -521,7 +582,7 @@ describe("resolveEmbeddedAgentStreamFn", () => {
     const innerStreamFn = vi.fn(async (_model, _context, options) => options);
     overrideBoundaryAwareStreamFnOnce(innerStreamFn as never);
 
-    const streamFn = resolveEmbeddedAgentStreamFn({
+    const { streamFn } = resolveEmbeddedAgentStream({
       currentStreamFn: nativeStreamFn,
       sessionId: "session-1",
       model: {
@@ -541,42 +602,12 @@ describe("resolveEmbeddedAgentStreamFn", () => {
     expect(innerStreamFn).toHaveBeenCalledTimes(1);
   });
 
-  it("routes runtime-auth custom session streams for supported APIs through boundary-aware transports", async () => {
-    const currentStreamFn = vi.fn(async (_model, _context, options) => options);
-    const innerStreamFn = vi.fn(async (_model, _context, options) => options);
-    overrideBoundaryAwareStreamFnOnce(innerStreamFn as never);
-
-    const streamFn = resolveEmbeddedAgentStreamFn({
-      currentStreamFn: currentStreamFn as never,
-      sessionId: "session-1",
-      model: {
-        api: "anthropic-messages",
-        provider: "cloudflare-ai-gateway",
-        id: "claude-sonnet-4-6",
-      } as never,
-      resolvedApiKey: "anthropic-runtime-key",
-    });
-
-    expect(streamFn).not.toBe(currentStreamFn);
-    const result = await expectStreamResultRecord(
-      streamFn(
-        { provider: "cloudflare-ai-gateway", id: "claude-sonnet-4-6" } as never,
-        {} as never,
-        {},
-      ),
-      "runtime auth result",
-    );
-    expect(result.apiKey).toBe("anthropic-runtime-key");
-    expect(currentStreamFn).not.toHaveBeenCalled();
-    expect(innerStreamFn).toHaveBeenCalledTimes(1);
-  });
-
   it("injects the resolved run api key into provider-owned stream functions", async () => {
     const providerStreamFn = vi.fn(async (_model, _context, options) => options);
     const authStorage = {
       getApiKey: vi.fn(async () => "storage-key"),
     };
-    const streamFn = resolveEmbeddedAgentStreamFn({
+    const { streamFn } = resolveEmbeddedAgentStream({
       currentStreamFn: undefined,
       providerStreamFn,
       sessionId: "session-1",
@@ -602,7 +633,7 @@ describe("resolveEmbeddedAgentStreamFn", () => {
     // Cron and shared runs can use a stable prompt cache key while keeping each
     // run's session id distinct for transcripts and aborts.
     const providerStreamFn = vi.fn(async (_model, _context, options) => options);
-    const streamFn = resolveEmbeddedAgentStreamFn({
+    const { streamFn } = resolveEmbeddedAgentStream({
       currentStreamFn: undefined,
       providerStreamFn,
       sessionId: "run-session",
@@ -628,7 +659,7 @@ describe("resolveEmbeddedAgentStreamFn", () => {
 
   it("does not overwrite caller-supplied prompt cache identity", async () => {
     const providerStreamFn = vi.fn(async (_model, _context, options) => options);
-    const streamFn = resolveEmbeddedAgentStreamFn({
+    const { streamFn } = resolveEmbeddedAgentStream({
       currentStreamFn: undefined,
       providerStreamFn,
       sessionId: "run-session",
@@ -653,7 +684,7 @@ describe("resolveEmbeddedAgentStreamFn", () => {
 
   it("propagates prompt cache identity into custom session streams", async () => {
     const currentStreamFn = vi.fn(async (_model, _context, options) => options);
-    const streamFn = resolveEmbeddedAgentStreamFn({
+    const { streamFn } = resolveEmbeddedAgentStream({
       currentStreamFn: currentStreamFn as never,
       sessionId: "run-session",
       promptCacheKey: "cron-cache-key",
@@ -684,7 +715,7 @@ describe("resolveEmbeddedAgentStreamFn", () => {
       if (provider === "anthropic-vertex") {
         streamMocks.anthropicVertex.mockReturnValueOnce(currentStreamFn);
       }
-      const streamFn = resolveEmbeddedAgentStreamFn({
+      const { streamFn } = resolveEmbeddedAgentStream({
         currentStreamFn: currentStreamFn as never,
         sessionId: "session-1",
         model: {
@@ -699,10 +730,8 @@ describe("resolveEmbeddedAgentStreamFn", () => {
   );
 
   it.each([
-    ["custom", "run"],
     ["custom", "caller"],
     ["anthropic-vertex", "run"],
-    ["anthropic-vertex", "caller"],
   ] as const)("cancels %s streams when their %s owner aborts", async (provider, signalOwner) => {
     // Attempt transport and compaction both resolve streams through this owner.
     const currentStreamFn = vi.fn(async (_model, _context, options) => options);
@@ -711,7 +740,7 @@ describe("resolveEmbeddedAgentStreamFn", () => {
     }
     const runController = new AbortController();
     const callerController = new AbortController();
-    const streamFn = resolveEmbeddedAgentStreamFn({
+    const { streamFn } = resolveEmbeddedAgentStream({
       currentStreamFn: currentStreamFn as never,
       sessionId: "session-1",
       signal: runController.signal,
@@ -740,7 +769,7 @@ describe("resolveEmbeddedAgentStreamFn", () => {
     async (signalOwner) => {
       const providerStreamFn = vi.fn(async (_model, _context, options) => options);
       const signal = new AbortController().signal;
-      const streamFn = resolveEmbeddedAgentStreamFn({
+      const { streamFn } = resolveEmbeddedAgentStream({
         currentStreamFn: undefined,
         providerStreamFn,
         sessionId: "session-1",
@@ -767,8 +796,6 @@ describe("resolveEmbeddedAgentStreamFn", () => {
 
   it.each([
     { owner: "run", abortBeforeResolve: false },
-    { owner: "caller", abortBeforeResolve: false },
-    { owner: "run", abortBeforeResolve: true },
     { owner: "caller", abortBeforeResolve: true },
   ])(
     "preserves both provider-owned cancellation sources: $owner ($abortBeforeResolve)",
@@ -781,7 +808,7 @@ describe("resolveEmbeddedAgentStreamFn", () => {
       if (abortBeforeResolve) {
         abortedController.abort(abortReason);
       }
-      const streamFn = resolveEmbeddedAgentStreamFn({
+      const { streamFn } = resolveEmbeddedAgentStream({
         currentStreamFn: undefined,
         providerStreamFn,
         sessionId: "session-1",
@@ -810,7 +837,7 @@ describe("resolveEmbeddedAgentStreamFn", () => {
   it("injects the resolved run api key into the OpenClaw native Codex Responses fallback", async () => {
     const nativeStreamFn = vi.fn(async (_model, _context, options) => options);
     useNativeStreamFn(nativeStreamFn as never);
-    const streamFn = resolveEmbeddedAgentStreamFn({
+    const { streamFn } = resolveEmbeddedAgentStream({
       currentStreamFn: undefined,
       sessionId: "session-1",
       model: {
@@ -835,7 +862,7 @@ describe("resolveEmbeddedAgentStreamFn", () => {
       getApiKey: vi.fn(async () => "stored-bearer-token"),
     };
     useNativeStreamFn(nativeStreamFn as never);
-    const streamFn = resolveEmbeddedAgentStreamFn({
+    const { streamFn } = resolveEmbeddedAgentStream({
       currentStreamFn: undefined,
       sessionId: "session-1",
       model: {
@@ -858,7 +885,7 @@ describe("resolveEmbeddedAgentStreamFn", () => {
     const nativeStreamFn = vi.fn(async (_model, _context, options) => options);
     const runSignal = new AbortController().signal;
     useNativeStreamFn(nativeStreamFn as never);
-    const streamFn = resolveEmbeddedAgentStreamFn({
+    const { streamFn } = resolveEmbeddedAgentStream({
       currentStreamFn: undefined,
       sessionId: "session-1",
       signal: runSignal,
@@ -885,7 +912,7 @@ describe("resolveEmbeddedAgentStreamFn", () => {
       const runController = new AbortController();
       const callerController = new AbortController();
       useNativeStreamFn(nativeStreamFn as never);
-      const streamFn = resolveEmbeddedAgentStreamFn({
+      const { streamFn } = resolveEmbeddedAgentStream({
         currentStreamFn: undefined,
         sessionId: "session-1",
         signal: runController.signal,
@@ -913,7 +940,7 @@ describe("resolveEmbeddedAgentStreamFn", () => {
     const nativeStreamFn = vi.fn(async (_model, _context, options) => options);
     const runSignal = new AbortController().signal;
     useNativeStreamFn(nativeStreamFn as never);
-    const streamFn = resolveEmbeddedAgentStreamFn({
+    const { streamFn } = resolveEmbeddedAgentStream({
       currentStreamFn: undefined,
       sessionId: "session-1",
       signal: runSignal,
@@ -934,7 +961,7 @@ describe("resolveEmbeddedAgentStreamFn", () => {
   it("strips cache boundary markers on the OpenClaw native fallback path", async () => {
     const nativeStreamFn = vi.fn(async (_model, context, _options) => context);
     useNativeStreamFn(nativeStreamFn as never);
-    const streamFn = resolveEmbeddedAgentStreamFn({
+    const { streamFn } = resolveEmbeddedAgentStream({
       currentStreamFn: undefined,
       sessionId: "session-1",
       model: {

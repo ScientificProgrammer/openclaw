@@ -1,12 +1,10 @@
 // Non-interactive gateway onboarding tests cover local/remote setup, daemon install, and config writes.
 // Gateway auth-token storage has its own suite in onboard-non-interactive.gateway-auth-token.test.ts.
-import fs from "node:fs/promises";
 import path from "node:path";
-import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import type { RuntimeEnv } from "../runtime.js";
-import { makeTempWorkspace } from "../test-helpers/workspace.js";
-import { setTestEnvValue, withEnv, withEnvAsync } from "../test-utils/env.js";
+import { withEnv, withEnvAsync } from "../test-utils/env.js";
 import { withMockedPlatform } from "../test-utils/vitest-spies.js";
 import {
   capturedReplaceConfigFileCalls,
@@ -17,7 +15,6 @@ import {
   getPseudoPort,
   healthCommandMock,
   installGatewayDaemonNonInteractiveMock,
-  loadGatewayOnboardModules,
   gatewayOnboardConfigSnapshotMock as readConfigFileSnapshotMock,
   readLastGatewayErrorLineMock,
   readTestConfig,
@@ -25,14 +22,14 @@ import {
   runNonInteractiveSetup,
   gatewayOnboardRuntime as runtime,
   testConfigStore,
+  useGatewayOnboardTestHarness,
+  waitForGatewayReachableMock,
 } from "./onboard-non-interactive.gateway.test-mocks.js";
 import {
   createOnboardGatewayTimeoutCapture,
   createOnboardJsonCaptureRuntime,
   createOnboardLocalDaemonOptions,
-  createOnboardStateDirHarness,
   expectOnboardLocalJsonSetupFailure,
-  prepareOnboardGatewayTestEnv,
   readOnboardFirstMockCall,
   runOnboardLocalDaemonSetup,
 } from "./onboard-non-interactive.test-helpers.js";
@@ -206,24 +203,7 @@ describe("logNonInteractiveOnboardingFailure", () => {
 });
 
 describe("onboard (non-interactive): gateway and remote auth", () => {
-  let envSnapshot: ReturnType<typeof prepareOnboardGatewayTestEnv>;
-  let tempHome: string | undefined;
-  const { withStateDir } = createOnboardStateDirHarness(() => tempHome);
-  beforeAll(async () => {
-    envSnapshot = prepareOnboardGatewayTestEnv();
-
-    tempHome = await makeTempWorkspace("openclaw-onboard-");
-    setTestEnvValue("HOME", tempHome);
-
-    await loadGatewayOnboardModules();
-  });
-
-  afterAll(async () => {
-    if (tempHome) {
-      await fs.rm(tempHome, { recursive: true, force: true });
-    }
-    envSnapshot.restore();
-  });
+  const { withStateDir } = useGatewayOnboardTestHarness("openclaw-onboard-");
 
   afterEach(async () => {
     gatewayReachableState.mock = undefined;
@@ -256,7 +236,8 @@ describe("onboard (non-interactive): gateway and remote auth", () => {
             throw new Error(`exit:${code}`);
           },
         };
-        const message = "Config invalid. Run `openclaw doctor` to repair it, then re-run setup.";
+        const message =
+          "Config invalid. Run `openclaw doctor --fix` to apply supported repairs, then re-run setup.";
 
         await expect(
           runNonInteractiveSetup(
@@ -368,10 +349,10 @@ describe("onboard (non-interactive): gateway and remote auth", () => {
       const workspace = path.join(stateDir, "openclaw");
       const warningRuntime = { ...runtime, error: vi.fn() };
       const passwordRef = { source: "env" as const, provider: "default", id: "GATEWAY_PASSWORD" };
-      const seededAgents = [
-        { id: "alpha", default: true, model: "anthropic/claude-3-5-sonnet" },
-        { id: "beta", model: "openai/gpt-4o" },
-      ];
+      const seededAgents = {
+        alpha: { model: "fixture/alpha" },
+        beta: { model: "fixture/beta" },
+      };
       const seededBindings = [
         {
           type: "route" as const,
@@ -391,7 +372,11 @@ describe("onboard (non-interactive): gateway and remote auth", () => {
         },
       ];
       testConfigStore.set(resolveTestConfigPath(), {
-        agents: { list: seededAgents, defaults: { workspace } },
+        agents: {
+          ownership: "explicit",
+          entries: seededAgents,
+          defaults: { workspace, systemAgent: { agentId: "alpha" } },
+        },
         bindings: seededBindings,
         gateway: {
           mode: "local",
@@ -416,7 +401,7 @@ describe("onboard (non-interactive): gateway and remote auth", () => {
       );
 
       const cfg = readTestConfig();
-      expect(cfg.agents?.list?.map((a) => a.id)).toEqual(["alpha", "beta"]);
+      expect(cfg.agents?.entries).toEqual(seededAgents);
       expect(cfg.agents?.defaults?.workspace).toBe(workspace);
       expect(cfg.bindings).toEqual(seededBindings);
       expect(warningRuntime.error).toHaveBeenCalledWith(
@@ -570,7 +555,7 @@ describe("onboard (non-interactive): gateway and remote auth", () => {
     });
   }, 60_000);
 
-  it("preserves existing agents.list and bindings on remote onboard rerun (openclaw#84692)", async () => {
+  it("preserves existing agents and bindings on remote onboard rerun (openclaw#84692)", async () => {
     await withStateDir("state-remote-preserve-agents-", async (_stateDir) => {
       const port = getPseudoPort(30_000);
       const passwordRef = {
@@ -579,10 +564,10 @@ describe("onboard (non-interactive): gateway and remote auth", () => {
         id: "OPENCLAW_REMOTE_GATEWAY_PASSWORD",
       };
       const tokenRef = { source: "env" as const, provider: "default", id: "REMOTE_TOKEN" };
-      const seededAgents = [
-        { id: "alpha", model: "anthropic/claude-3-5-sonnet" },
-        { id: "beta", model: "openai/gpt-4o" },
-      ];
+      const seededAgents = {
+        alpha: { model: "fixture/alpha" },
+        beta: { model: "fixture/beta" },
+      };
       const seededBindings = [
         {
           type: "route" as const,
@@ -600,7 +585,7 @@ describe("onboard (non-interactive): gateway and remote auth", () => {
         },
       };
       testConfigStore.set(resolveTestConfigPath(), {
-        agents: { list: seededAgents },
+        agents: { ownership: "explicit", entries: seededAgents },
         bindings: seededBindings,
         hooks: seededHooks,
         gateway: {
@@ -626,7 +611,7 @@ describe("onboard (non-interactive): gateway and remote auth", () => {
       );
 
       const cfg = readTestConfig();
-      expect(cfg.agents?.list?.map((a) => a.id)).toEqual(["alpha", "beta"]);
+      expect(cfg.agents?.entries).toEqual(seededAgents);
       expect(cfg.bindings).toEqual(seededBindings);
       expect(cfg.hooks).toEqual(seededHooks);
       expect(cfg.gateway?.remote).toEqual({
@@ -680,7 +665,7 @@ describe("onboard (non-interactive): gateway and remote auth", () => {
     });
   }, 60_000);
 
-  it("completes explicit no-daemon setup when no gateway is listening", async () => {
+  it("completes explicit no-daemon setup without a startup wait when no gateway is listening", async () => {
     await withStateDir("state-local-health-hint-", async (stateDir) => {
       gatewayReachableState.mock = vi.fn(async () => ({
         ok: false,
@@ -696,6 +681,8 @@ describe("onboard (non-interactive): gateway and remote auth", () => {
       expect(log.mock.calls.flat().join("\n")).toMatch(
         /Setup complete; gateway was not installed or started because daemon installation was explicitly skipped\.[\s\S]*Gateway did not become reachable[\s\S]*Classification: not-listening[\s\S]*only waits for an already-running gateway unless you pass `--install-daemon` to `openclaw onboard`[\s\S]*openclaw onboard --install-daemon[\s\S]*openclaw onboard --skip-health/,
       );
+      expect(gatewayReachableState.mock).toHaveBeenCalledOnce();
+      expect(waitForGatewayReachableMock).not.toHaveBeenCalled();
     });
   }, 60_000);
 
@@ -892,43 +879,48 @@ describe("onboard (non-interactive): gateway and remote auth", () => {
     });
   }, 60_000);
 
-  it("emits structured JSON failure when a reachable gateway fails its health check", async () => {
-    await withStateDir("state-local-daemon-health-exit-json-", async (stateDir) => {
-      gatewayReachableState.mock = vi.fn(async () => ({ ok: true }));
-      healthCommandMock.mockImplementationOnce(async (...args: unknown[]) => {
-        // healthCommand prints its reachable-gateway diagnostic before its
-        // CLI-style exit; the capture runtime must keep it off JSON stdout.
-        // importActual yields the ExitError instance the prod graph sees; the
-        // test file's static import can be a second class instance under Vitest.
-        const { ExitError: RuntimeExitError } =
-          await vi.importActual<typeof import("../runtime.js")>("../runtime.js");
-        const healthRuntime = args[1] as RuntimeEnv;
-        healthRuntime.log("Gateway is reachable.");
-        healthRuntime.log("Gateway credentials rejected.");
-        throw new RuntimeExitError(1);
-      });
+  it.each([false, true])(
+    "emits structured JSON failure when a reachable gateway fails its health check (installDaemon: %s)",
+    async (installDaemon) => {
+      await withStateDir("state-local-daemon-health-exit-json-", async (stateDir) => {
+        gatewayReachableState.mock = vi.fn(async () => ({ ok: true }));
+        healthCommandMock.mockImplementationOnce(async (...args: unknown[]) => {
+          // healthCommand prints its reachable-gateway diagnostic before its
+          // CLI-style exit; the capture runtime must keep it off JSON stdout.
+          // importActual yields the ExitError instance the prod graph sees; the
+          // test file's static import can be a second class instance under Vitest.
+          const { ExitError: RuntimeExitError } =
+            await vi.importActual<typeof import("../runtime.js")>("../runtime.js");
+          const healthRuntime = args[1] as RuntimeEnv;
+          healthRuntime.log("Gateway is reachable.");
+          healthRuntime.log("Gateway credentials rejected.");
+          throw new RuntimeExitError(1);
+        });
 
-      const { runtimeWithCapture, readCapturedJson } = createOnboardJsonCaptureRuntime();
-      await expectOnboardLocalJsonSetupFailure({
-        runSetup: runNonInteractiveSetup,
-        stateDir,
-        runtime: runtimeWithCapture,
-      });
+        const { runtimeWithCapture, readCapturedJson } = createOnboardJsonCaptureRuntime();
+        await expectOnboardLocalJsonSetupFailure({
+          runSetup: (opts, runtimeEnv) =>
+            runNonInteractiveSetup({ ...opts, installDaemon }, runtimeEnv),
+          stateDir,
+          runtime: runtimeWithCapture,
+        });
 
-      const parsed = JSON.parse(readCapturedJson()) as {
-        ok: boolean;
-        phase: string;
-        message: string;
-        detail?: string;
-        hints?: string[];
-      };
-      expect(parsed.ok).toBe(false);
-      expect(parsed.phase).toBe("gateway-health");
-      expect(parsed.message).toContain("health check failed");
-      expect(parsed.detail).toContain("Gateway credentials rejected.");
-      expect(parsed.hints).toContain("Run `openclaw health` for full diagnostics.");
-    });
-  }, 60_000);
+        const parsed = JSON.parse(readCapturedJson()) as {
+          ok: boolean;
+          phase: string;
+          message: string;
+          detail?: string;
+          hints?: string[];
+        };
+        expect(parsed.ok).toBe(false);
+        expect(parsed.phase).toBe("gateway-health");
+        expect(parsed.message).toContain("health check failed");
+        expect(parsed.detail).toContain("Gateway credentials rejected.");
+        expect(parsed.hints).toContain("Run `openclaw health` for full diagnostics.");
+      });
+    },
+    60_000,
+  );
 
   it("routes thrown health-check errors through the onboarding failure owner", async () => {
     await withStateDir("state-local-health-failure-text-", async (stateDir) => {

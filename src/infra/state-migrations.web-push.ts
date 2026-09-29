@@ -7,6 +7,7 @@ import {
   executeSqliteQueryTakeFirstSync,
   getNodeSqliteKysely,
 } from "./kysely-sync.js";
+import { ensureWebPushSubscriptionBindingColumns } from "./push-web-store.kernel.js";
 import {
   webPushSubscriptionFromRow,
   webPushSubscriptionToRow,
@@ -15,7 +16,7 @@ import {
   type VapidKeyPair,
   type WebPushDatabase,
   type WebPushSubscription,
-} from "./push-web-store.js";
+} from "./push-web-store.records.js";
 import { withLegacyMigrationStateLock } from "./state-migrations.lock.js";
 import {
   claimLegacyMigrationSourceClaims,
@@ -190,6 +191,7 @@ function migrateIntoDatabase(params: {
   let importedVapidKeys = false;
   runOpenClawStateWriteTransaction(
     ({ db }) => {
+      ensureWebPushSubscriptionBindingColumns(db);
       const webPushDb = getNodeSqliteKysely<WebPushDatabase>(db);
       const expectedSubscriptions = new Map<string, WebPushSubscription>();
       for (const [endpointHash, legacySubscription] of params.legacy.subscriptions) {

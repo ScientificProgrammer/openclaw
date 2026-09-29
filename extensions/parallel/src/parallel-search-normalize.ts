@@ -1,8 +1,4 @@
 import { resolveIntegerOption } from "openclaw/plugin-sdk/number-runtime";
-// Transport-agnostic Parallel search normalization shared by the paid REST
-// provider (`parallel`) and the free Search MCP provider (`parallel-free`).
-// Both transports return the same v1 result shape, so query/result handling
-// lives here instead of being copied into each runtime.
 import {
   buildSearchCacheKey,
   DEFAULT_SEARCH_COUNT,
@@ -18,8 +14,9 @@ import {
   writeCachedSearchPayload,
 } from "openclaw/plugin-sdk/provider-web-search";
 import {
+  asOptionalObjectRecord,
+  isRecord,
   normalizeBoundedOptionalString,
-  normalizeOptionalString,
 } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { truncateUtf16Safe } from "openclaw/plugin-sdk/text-utility-runtime";
 import { PARALLEL_FREE_SESSION_ID_MAX_LENGTH } from "./parallel-free-web-search-provider.shared.js";
@@ -37,18 +34,6 @@ const PARALLEL_MAX_SEARCH_QUERIES = 5;
 // (and advertises it in the tool schema) so callers never send an out-of-contract id.
 const PARALLEL_SESSION_ID_MAX_LENGTH = 1000;
 const PARALLEL_CLIENT_MODEL_MAX_LENGTH = 100;
-
-export const normalizeParallelSessionId: (
-  value: string | undefined,
-  maxLength: number,
-) => string | undefined = normalizeBoundedOptionalString;
-
-type ParallelSearchResult = {
-  title?: unknown;
-  url?: unknown;
-  publish_date?: unknown;
-  excerpts?: unknown;
-};
 
 export type ParallelSearchResponse = {
   search_id?: unknown;
@@ -71,8 +56,12 @@ function normalizeParallelSearchRequest(
   configuredCount: unknown,
   sessionIdMaxLength: number,
 ): { error: ReturnType<typeof invalidSearchQueriesPayload> } | NormalizedParallelSearchRequest {
-  const objective = normalizeParallelObjective(readStringParam(args, "objective"));
-  const cliQuery = normalizeParallelObjective(readStringParam(args, "query"));
+  const objective =
+    truncateUtf16Safe(readStringParam(args, "objective") ?? "", PARALLEL_MAX_OBJECTIVE_CHARS) ||
+    undefined;
+  const cliQuery =
+    truncateUtf16Safe(readStringParam(args, "query") ?? "", PARALLEL_MAX_OBJECTIVE_CHARS) ||
+    undefined;
   let searchQueries = normalizeParallelSearchQueries(readStringArrayParam(args, "search_queries"));
   if (searchQueries.length === 0 && cliQuery) {
     searchQueries = normalizeParallelSearchQueries([cliQuery]);
@@ -84,8 +73,15 @@ function normalizeParallelSearchRequest(
     objective,
     searchQueries,
     count: resolveParallelSearchCount(args, configuredCount),
-    sessionId: normalizeParallelSessionId(readStringParam(args, "session_id"), sessionIdMaxLength),
-    clientModel: normalizeParallelClientModel(readStringParam(args, "client_model")),
+    sessionId: normalizeBoundedOptionalString(
+      readStringParam(args, "session_id"),
+      sessionIdMaxLength,
+    ),
+    clientModel:
+      truncateUtf16Safe(
+        readStringParam(args, "client_model") ?? "",
+        PARALLEL_CLIENT_MODEL_MAX_LENGTH,
+      ) || undefined,
   };
 }
 
@@ -125,6 +121,7 @@ export async function executeParallelSearchRequest(params: {
     provider: params.provider,
     objective: request.objective,
     searchQueries: request.searchQueries,
+    count: request.count,
     response,
     start,
   });
@@ -133,7 +130,7 @@ export async function executeParallelSearchRequest(params: {
   return payload;
 }
 
-export function resolveParallelSearchCount(
+function resolveParallelSearchCount(
   args: Record<string, unknown>,
   configuredCount: unknown,
 ): number {
@@ -150,31 +147,11 @@ export function resolveParallelSearchCount(
   });
 }
 
-export function normalizeParallelObjective(value: string | undefined): string | undefined {
-  const trimmed = normalizeOptionalString(value);
-  if (!trimmed) {
-    return undefined;
-  }
-  return trimmed.length <= PARALLEL_MAX_OBJECTIVE_CHARS
-    ? trimmed
-    : truncateUtf16Safe(trimmed, PARALLEL_MAX_OBJECTIVE_CHARS);
-}
-
-export function normalizeParallelClientModel(value: string | undefined): string | undefined {
-  const trimmed = normalizeOptionalString(value);
-  if (!trimmed) {
-    return undefined;
-  }
-  return trimmed.length <= PARALLEL_CLIENT_MODEL_MAX_LENGTH
-    ? trimmed
-    : truncateUtf16Safe(trimmed, PARALLEL_CLIENT_MODEL_MAX_LENGTH);
-}
-
 // Parallel's API caps each entry at 200 chars and accepts up to 5 queries. We
 // trim, drop empties/duplicates, truncate over-long entries to the API's hard
 // limit, and cap to the API's maximum so a malformed call from the model
 // doesn't 422 the request. See https://docs.parallel.ai/search/best-practices.
-export function normalizeParallelSearchQueries(value: unknown): string[] {
+function normalizeParallelSearchQueries(value: unknown): string[] {
   const candidates = Array.isArray(value) ? value : [];
   const seen = new Set<string>();
   const out: string[] = [];
@@ -186,10 +163,7 @@ export function normalizeParallelSearchQueries(value: unknown): string[] {
     if (!trimmed) {
       continue;
     }
-    const capped =
-      trimmed.length <= PARALLEL_MAX_SEARCH_QUERY_CHARS
-        ? trimmed
-        : truncateUtf16Safe(trimmed, PARALLEL_MAX_SEARCH_QUERY_CHARS);
+    const capped = truncateUtf16Safe(trimmed, PARALLEL_MAX_SEARCH_QUERY_CHARS);
     if (seen.has(capped)) {
       continue;
     }
@@ -211,22 +185,11 @@ function invalidSearchQueriesPayload() {
   };
 }
 
-export function normalizeParallelResults(payload: unknown): ParallelSearchResult[] {
-  if (!payload || typeof payload !== "object") {
-    return [];
-  }
-  const results = (payload as ParallelSearchResponse).results;
-  if (!Array.isArray(results)) {
-    return [];
-  }
-  return results.filter((entry): entry is ParallelSearchResult =>
-    Boolean(entry && typeof entry === "object" && !Array.isArray(entry)),
-  );
-}
-
 /** Maps a Parallel v1 response into wrapped `web_search` result entries. */
-function mapParallelResults(response: ParallelSearchResponse): Record<string, unknown>[] {
-  return normalizeParallelResults(response).map((entry) => {
+function mapParallelResults(response: ParallelSearchResponse, count: number) {
+  const rawResults = asOptionalObjectRecord(response)?.results;
+  const results = Array.isArray(rawResults) ? rawResults.filter(isRecord) : [];
+  return results.slice(0, count).map((entry) => {
     const title = typeof entry.title === "string" ? entry.title : "";
     const url = typeof entry.url === "string" ? entry.url : "";
     const published =
@@ -254,10 +217,11 @@ function buildParallelSearchPayload(params: {
   provider: "parallel" | "parallel-free";
   objective?: string;
   searchQueries: readonly string[];
+  count: number;
   response: ParallelSearchResponse;
   start: number;
 }): Record<string, unknown> {
-  const results = mapParallelResults(params.response);
+  const results = mapParallelResults(params.response, params.count);
   const payload: Record<string, unknown> = {
     ...(params.objective ? { objective: params.objective } : {}),
     searchQueries: params.searchQueries,
@@ -303,7 +267,7 @@ function stripParallelGeneratedSessionId(
   return rest;
 }
 
-export function buildParallelCacheKey(params: {
+function buildParallelCacheKey(params: {
   endpoint: string;
   objective?: string;
   searchQueries: readonly string[];

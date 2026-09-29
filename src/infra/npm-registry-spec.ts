@@ -110,21 +110,7 @@ function parseRegistryNpmSpecInternal(
     return { ok: false, error: "unsupported npm spec: invalid version/tag" };
   }
   const exactVersion = validSemver(selector);
-  if (exactVersion) {
-    return {
-      ok: true,
-      parsed: {
-        name,
-        raw: spec,
-        selector,
-        selectorKind: "exact-version",
-        selectorIsPrerelease:
-          parseSemverPrerelease(exactVersion) !== null &&
-          !isOpenClawStableCorrectionVersion(selector),
-      },
-    };
-  }
-  if (!DIST_TAG_RE.test(selector)) {
+  if (!exactVersion && !DIST_TAG_RE.test(selector)) {
     return {
       ok: false,
       error: "unsupported npm spec: use an exact version or dist-tag (ranges are not allowed)",
@@ -136,8 +122,11 @@ function parseRegistryNpmSpecInternal(
       name,
       raw: spec,
       selector,
-      selectorKind: "tag",
-      selectorIsPrerelease: false,
+      selectorKind: exactVersion ? "exact-version" : "tag",
+      selectorIsPrerelease:
+        exactVersion !== null &&
+        parseSemverPrerelease(exactVersion) !== null &&
+        !isOpenClawStableCorrectionVersion(selector),
     },
   };
 }
@@ -146,12 +135,6 @@ function parseRegistryNpmSpecInternal(
 export function parseRegistryNpmSpec(rawSpec: string): ParsedRegistryNpmSpec | null {
   const parsed = parseRegistryNpmSpecInternal(rawSpec);
   return parsed.ok ? parsed.parsed : null;
-}
-
-/** Returns whether a user-provided npm spec resolves to the official OpenClaw npm scope. */
-export function isOpenClawOrgNpmSpec(rawSpec: string | undefined): boolean {
-  const parsed = rawSpec ? parseRegistryNpmSpec(rawSpec) : null;
-  return parsed?.name.startsWith("@openclaw/") === true;
 }
 
 /** Validates a registry-only npm spec and returns a user-facing error when rejected. */
@@ -179,17 +162,12 @@ function parseOpenClawReleaseVersion(value: string): SemVer | null {
   const [label, sequence] = parsed.prerelease;
   const isStable = parsed.prerelease.length === 0;
   const isCorrection = isOpenClawCorrectionSemver(parsed) && typeof label === "number" && label > 0;
-  const isAlpha =
+  const isPrerelease =
     parsed.prerelease.length === 2 &&
-    label === "alpha" &&
+    (label === "alpha" || label === "beta") &&
     typeof sequence === "number" &&
     sequence > 0;
-  const isBeta =
-    parsed.prerelease.length === 2 &&
-    label === "beta" &&
-    typeof sequence === "number" &&
-    sequence > 0;
-  if (!isStable && !isCorrection && !isAlpha && !isBeta) {
+  if (!isStable && !isCorrection && !isPrerelease) {
     return null;
   }
   return parsed;

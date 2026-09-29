@@ -6,6 +6,15 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import pMap from "p-map";
+import {
+  booleanFlag,
+  parseFlagArgs,
+  requireOptionArgument,
+  stringFlag,
+  stringListFlag,
+  type FlagSpec,
+} from "./lib/arg-utils.mts";
+import { reportLimitViolations } from "./lib/check-limits.mts";
 import { coerceErrorMessage } from "./lib/error-format.mts";
 import {
   inspectManagedProcessGroup,
@@ -22,7 +31,6 @@ import {
   renderGroupedTestReport,
 } from "./lib/test-group-report.mts";
 import { formatMs } from "./lib/vitest-report-cli-utils.mts";
-import { resolveVitestNodeArgs } from "./run-vitest.mts";
 import {
   applyParallelVitestCachePaths,
   buildFullSuiteVitestRunPlans,
@@ -132,21 +140,51 @@ function usage() {
   ].join("\n");
 }
 
-function readRequiredValue(argv: string[], index: number, flag: string) {
-  const value = argv[index + 1];
-  if (!value || value.startsWith("-")) {
-    throw new Error(`${flag} requires a value`);
-  }
-  return value;
+type PositiveIntArgKey =
+  | "concurrency"
+  | "killGraceMs"
+  | "limit"
+  | "maxTestMs"
+  | "timeoutMs"
+  | "topFiles";
+
+const splitStringFlagOptions = { allowInline: false, rejectShortOptions: true } as const;
+
+function positiveIntFlag(flag: string, key: PositiveIntArgKey): FlagSpec<TestGroupReportArgs> {
+  return {
+    consume(argv, index) {
+      if (argv[index] !== flag) {
+        return null;
+      }
+      const value = parsePositiveInt(requireOptionArgument(argv, index, flag), flag);
+      return {
+        flag,
+        nextIndex: index + 1,
+        apply(args) {
+          args[key] = value;
+        },
+      };
+    },
+  };
 }
 
-function readPositiveIntValue(argv: string[], index: number, flag: string) {
-  return parsePositiveInt(readRequiredValue(argv, index, flag), flag);
-}
+const compareFlag: FlagSpec<TestGroupReportArgs> = {
+  consume(argv, index) {
+    if (argv[index] !== "--compare") {
+      return null;
+    }
+    const before = requireOptionArgument(argv, index, "--compare");
+    const after = requireOptionArgument(argv, index + 1, "--compare");
+    return {
+      flag: "--compare",
+      nextIndex: index + 2,
+      apply(args) {
+        args.compare = { before, after };
+      },
+    };
+  },
+};
 
-/**
- * Parses report, compare, and Vitest-run options for grouped test reports.
- */
 export function parseTestGroupReportArgs(argv: string[]) {
   const args: TestGroupReportArgs = {
     allowFailures: false,
@@ -165,122 +203,36 @@ export function parseTestGroupReportArgs(argv: string[]) {
     topFiles: 25,
     vitestArgs: [],
   };
-  const seenSingleValueFlags = new Set<string>();
-  const setSingleValueFlag = (flag: string, apply: () => void) => {
-    if (seenSingleValueFlags.has(flag)) {
-      throw new Error(`${flag} was provided more than once`);
-    }
-    seenSingleValueFlags.add(flag);
-    apply();
-  };
+  const separatorIndex = argv.indexOf("--");
+  const cliArgs = separatorIndex === -1 ? argv : argv.slice(0, separatorIndex);
+  args.vitestArgs = separatorIndex === -1 ? [] : argv.slice(separatorIndex + 1);
 
-  for (let index = 0; index < argv.length; index += 1) {
-    const arg = argv[index];
-    if (arg === "--") {
-      args.vitestArgs = argv.slice(index + 1);
-      break;
-    }
-    if (arg === "--help") {
-      args.help = true;
-      continue;
-    }
-    if (arg === "--allow-failures") {
-      args.allowFailures = true;
-      continue;
-    }
-    if (arg === "--full-suite") {
-      args.fullSuite = true;
-      continue;
-    }
-    if (arg === "--no-rss") {
-      args.rss = false;
-      continue;
-    }
-    if (arg === "--config") {
-      args.configs.push(readRequiredValue(argv, index, "--config"));
-      index += 1;
-      continue;
-    }
-    if (arg === "--compare") {
-      const before = readRequiredValue(argv, index, "--compare");
-      const after = readRequiredValue(argv, index + 1, "--compare");
-      setSingleValueFlag(arg, () => {
-        args.compare = { before, after };
-      });
-      index += 2;
-      continue;
-    }
-    if (arg === "--report") {
-      args.reports.push(readRequiredValue(argv, index, "--report"));
-      index += 1;
-      continue;
-    }
-    if (arg === "--group-by") {
-      const value = readRequiredValue(argv, index, "--group-by");
-      setSingleValueFlag(arg, () => {
-        args.groupBy = value;
-      });
-      index += 1;
-      continue;
-    }
-    if (arg === "--output") {
-      const value = readRequiredValue(argv, index, "--output");
-      setSingleValueFlag(arg, () => {
-        args.output = value;
-      });
-      index += 1;
-      continue;
-    }
-    if (arg === "--limit") {
-      const value = readPositiveIntValue(argv, index, "--limit");
-      setSingleValueFlag(arg, () => {
-        args.limit = value;
-      });
-      index += 1;
-      continue;
-    }
-    if (arg === "--max-test-ms") {
-      const value = readPositiveIntValue(argv, index, "--max-test-ms");
-      setSingleValueFlag(arg, () => {
-        args.maxTestMs = value;
-      });
-      index += 1;
-      continue;
-    }
-    if (arg === "--timeout-ms") {
-      const value = readPositiveIntValue(argv, index, "--timeout-ms");
-      setSingleValueFlag(arg, () => {
-        args.timeoutMs = value;
-      });
-      index += 1;
-      continue;
-    }
-    if (arg === "--kill-grace-ms") {
-      const value = readPositiveIntValue(argv, index, "--kill-grace-ms");
-      setSingleValueFlag(arg, () => {
-        args.killGraceMs = value;
-      });
-      index += 1;
-      continue;
-    }
-    if (arg === "--concurrency") {
-      const value = readPositiveIntValue(argv, index, "--concurrency");
-      setSingleValueFlag(arg, () => {
-        args.concurrency = value;
-      });
-      index += 1;
-      continue;
-    }
-    if (arg === "--top-files") {
-      const value = readPositiveIntValue(argv, index, "--top-files");
-      setSingleValueFlag(arg, () => {
-        args.topFiles = value;
-      });
-      index += 1;
-      continue;
-    }
-    throw new Error(`Unknown option: ${arg}`);
-  }
+  parseFlagArgs(
+    cliArgs,
+    args,
+    [
+      booleanFlag("--help", "help", true, { repeatable: true }),
+      booleanFlag("--allow-failures", "allowFailures", true, { repeatable: true }),
+      booleanFlag("--full-suite", "fullSuite", true, { repeatable: true }),
+      booleanFlag("--no-rss", "rss", false, { repeatable: true }),
+      stringListFlag("--config", "configs", splitStringFlagOptions),
+      compareFlag,
+      stringListFlag("--report", "reports", splitStringFlagOptions),
+      stringFlag("--group-by", "groupBy", splitStringFlagOptions),
+      stringFlag("--output", "output", splitStringFlagOptions),
+      positiveIntFlag("--limit", "limit"),
+      positiveIntFlag("--max-test-ms", "maxTestMs"),
+      positiveIntFlag("--timeout-ms", "timeoutMs"),
+      positiveIntFlag("--kill-grace-ms", "killGraceMs"),
+      positiveIntFlag("--concurrency", "concurrency"),
+      positiveIntFlag("--top-files", "topFiles"),
+    ],
+    {
+      onUnhandledArg(arg) {
+        throw new Error(`Unknown option: ${arg}`);
+      },
+    },
+  );
 
   if (!["area", "folder", "top"].includes(args.groupBy)) {
     throw new Error(`Unsupported --group-by value: ${args.groupBy}`);
@@ -332,9 +284,6 @@ function parseMaxRssBytes(output: string) {
   return null;
 }
 
-/**
- * Runs a command, captures text output, and terminates timed-out process groups.
- */
 export function spawnText(command: string, args: readonly string[], options: SpawnTextOptions) {
   const maxBuffer = options.maxBufferBytes ?? DEFAULT_SPAWN_OUTPUT_MAX_BYTES;
   const maxLogBytes = options.maxLogBytes ?? DEFAULT_SPAWN_LOG_MAX_BYTES;
@@ -482,15 +431,7 @@ export function spawnText(command: string, args: readonly string[], options: Spa
       }
       const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk), "utf8");
       const currentTail = target === "stderr" ? stderrTail : outputTail;
-      if (buffer.byteLength >= tailBytes) {
-        if (target === "stderr") {
-          stderrTail = buffer.subarray(buffer.byteLength - tailBytes);
-        } else {
-          outputTail = buffer.subarray(buffer.byteLength - tailBytes);
-        }
-        return;
-      }
-      let nextTail = Buffer.concat([currentTail, buffer]);
+      let nextTail = buffer.byteLength >= tailBytes ? buffer : Buffer.concat([currentTail, buffer]);
       if (nextTail.byteLength > tailBytes) {
         nextTail = nextTail.subarray(nextTail.byteLength - tailBytes);
       }
@@ -504,8 +445,6 @@ export function spawnText(command: string, args: readonly string[], options: Spa
       const buffer = Buffer.from(message, "utf8");
       if (logFd !== null) {
         fs.writeSync(logFd, buffer);
-        appendTail(buffer);
-        return;
       }
       appendTail(buffer);
     }
@@ -614,14 +553,6 @@ async function runVitestJsonReport(params: RunVitestParams) {
       // The JSON reporter can stay silent for the entire config. The profiler
       // owns the wall-clock timeout and process-group cleanup for this child.
       OPENCLAW_VITEST_NO_OUTPUT_TIMEOUT_MS: "0",
-      NODE_OPTIONS: [
-        (params.env?.NODE_OPTIONS ?? process.env.NODE_OPTIONS)?.trim(),
-        ...resolveVitestNodeArgs({ ...process.env, ...params.env }).filter(
-          (arg) => arg !== "--no-maglev",
-        ),
-      ]
-        .filter(Boolean)
-        .join(" "),
     },
     killGraceMs: params.killGraceMs,
     logPath: params.logPath,
@@ -840,9 +771,6 @@ function validateGroupedReport(
   }
 }
 
-/**
- * Resolves JSON report and per-run artifact directories from an output path.
- */
 export function resolveReportArtifactDirs(outputPath: string) {
   const outputDir = path.dirname(outputPath);
   const outputExt = path.extname(outputPath);
@@ -888,9 +816,6 @@ function buildFullSuiteLeafRunPlans() {
   }
 }
 
-/**
- * Resolves explicit or full-suite Vitest config plans for report generation.
- */
 export function resolveRunPlans(args: TestGroupReportArgs): TestGroupRunPlan[] {
   if (args.reports.length > 0) {
     return [];
@@ -912,9 +837,6 @@ export function resolveRunPlans(args: TestGroupReportArgs): TestGroupRunPlan[] {
   }));
 }
 
-/**
- * Builds env for full-suite report runs, including per-config cache paths.
- */
 export function resolveFullSuiteVitestEnv(
   args: Pick<TestGroupReportArgs, "fullSuite">,
   env: NodeJS.ProcessEnv = process.env,
@@ -933,9 +855,6 @@ export function resolveFullSuiteVitestEnv(
   };
 }
 
-/**
- * Resolves bounded concurrency for grouped report run plans.
- */
 export function resolveRunPlanConcurrency(
   args: Pick<TestGroupReportArgs, "concurrency" | "fullSuite">,
   runPlanCount: number,
@@ -972,9 +891,6 @@ export function resolveReportVitestArgs(
   return [...args.vitestArgs, "--isolate=true"];
 }
 
-/**
- * Builds concrete report run specs from parsed args and config plans.
- */
 export function resolveReportRunSpecs(
   args: TestGroupReportArgs,
   runPlans: TestGroupRunPlan[],
@@ -1201,10 +1117,17 @@ async function main() {
   console.log(renderGroupedTestReport(report, { limit: args.limit, topFiles: args.topFiles }));
   console.log(`[test-group-report] wrote ${path.relative(process.cwd(), output)}`);
 
-  if (args.maxTestMs !== null && report.slowTests.length > 0) {
-    console.error(
-      `[test-group-report] ${report.slowTests.length} tests exceeded ${formatMs(args.maxTestMs)}`,
-    );
+  const maxTestMs = args.maxTestMs;
+  if (
+    maxTestMs !== null &&
+    reportLimitViolations(
+      report.slowTests.map((test) => ({
+        file: test.file,
+        title: "Test duration budget",
+        message: `${test.fullName}: ${formatMs(test.durationMs)} exceeds ${formatMs(maxTestMs)}`,
+      })),
+    )
+  ) {
     process.exit(1);
   }
 

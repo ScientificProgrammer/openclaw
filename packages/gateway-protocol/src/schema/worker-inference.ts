@@ -1,5 +1,6 @@
 import { Type, type Static, type TProperties } from "typebox";
 import { Value } from "typebox/value";
+import { checkProtocolJson } from "../validation-errors.js";
 import { closedObject } from "./closed-object.js";
 import {
   WORKER_TRANSCRIPT_MAX_CONTENT_PARTS,
@@ -15,6 +16,7 @@ import {
   WorkerIdentifierSchema,
   WorkerTranscriptAssistantDiagnosticSchema,
   WorkerTranscriptUsageSchema,
+  WORKER_PROTOCOL_MAX_MEDIA_PAYLOAD_BYTES,
 } from "./worker-protocol-primitives.js";
 
 export const WORKER_INFERENCE_PROTOCOL_FEATURE = "worker-inference-v1";
@@ -22,7 +24,7 @@ export const WORKER_INFERENCE_METHODS = [
   "worker.inference.start",
   "worker.inference.cancel",
 ] as const;
-export const WORKER_PROTOCOL_MAX_INFERENCE_PAYLOAD_BYTES = 25 * 1024 * 1024;
+export const WORKER_PROTOCOL_MAX_INFERENCE_PAYLOAD_BYTES = WORKER_PROTOCOL_MAX_MEDIA_PAYLOAD_BYTES;
 export const WORKER_INFERENCE_MAX_CONTEXT_MESSAGES = 1_024;
 const WORKER_INFERENCE_MAX_TOOLS = 256;
 export const WORKER_INFERENCE_MAX_OUTPUT_TOKENS = 1_000_000;
@@ -404,38 +406,7 @@ export type WorkerInferenceTerminalParams = Static<typeof WorkerInferenceTermina
 export type WorkerInferenceTerminalFrame = Static<typeof WorkerInferenceTerminalFrameSchema>;
 
 function isSafeWorkerInferenceJson(data: unknown): boolean {
-  const stack: Array<{ depth: number; value: unknown }> = [{ depth: 0, value: data }];
-  const seen = new WeakSet<object>();
-  while (stack.length > 0) {
-    const current = stack.pop();
-    if (!current || current.depth > WORKER_TRANSCRIPT_MAX_JSON_DEPTH) {
-      return false;
-    }
-    if (
-      current.value === null ||
-      typeof current.value === "string" ||
-      typeof current.value === "boolean"
-    ) {
-      continue;
-    }
-    if (typeof current.value === "number") {
-      if (!Number.isFinite(current.value)) {
-        return false;
-      }
-      continue;
-    }
-    if (typeof current.value !== "object" || seen.has(current.value)) {
-      return false;
-    }
-    seen.add(current.value);
-    const values = Array.isArray(current.value)
-      ? current.value
-      : Object.values(current.value as Record<string, unknown>);
-    for (const value of values) {
-      stack.push({ depth: current.depth + 1, value });
-    }
-  }
-  return true;
+  return checkProtocolJson(data, WORKER_TRANSCRIPT_MAX_JSON_DEPTH) === undefined;
 }
 
 export function validateWorkerInferenceStartParams(

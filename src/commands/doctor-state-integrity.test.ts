@@ -8,10 +8,26 @@ import {
   resolveSessionStorePathCore,
   resolveSessionTranscriptsDirForAgent,
 } from "../config/sessions/paths.js";
-import { writeConfigMachineState } from "../state/config-machine-state.js";
+import {
+  deleteSessionEntryLifecycle,
+  loadSessionEntry,
+} from "../config/sessions/session-accessor.js";
+import { resolveSqliteTargetFromSessionStorePath } from "../config/sessions/session-sqlite-target.js";
+import { recordDeferredPluginMigrations } from "../infra/deferred-plugin-migrations.js";
+import { readDeferredPluginSessionImport } from "../infra/deferred-plugin-session-sources.js";
+import { writeConfigMachineState } from "../state/config-machine-state-write.js";
 import { closeOpenClawAgentDatabasesForTest } from "../state/openclaw-agent-db.js";
 import { closeOpenClawStateDatabaseForTest } from "../state/openclaw-state-db.js";
-import { captureEnv, deleteTestEnvValue, setTestEnvValue } from "../test-utils/env.js";
+import { withTestDir } from "../test-helpers/temp-dir.js";
+import {
+  captureEnv,
+  deleteTestEnvValue,
+  setTestEnvValue,
+  withEnvAsync,
+} from "../test-utils/env.js";
+import { withOpenClawTestState } from "../test-utils/openclaw-test-state.js";
+import { seedDeferredPluginSessionSource } from "./doctor-session-sqlite.deferred-plugin.test-support.js";
+import { runDoctorSessionSqlite } from "./doctor-session-sqlite.js";
 import {
   detectStateIntegrityHealthIssues,
   noteStateIntegrity as noteStateIntegrityRaw,
@@ -214,6 +230,59 @@ describe("structured state integrity findings", () => {
     );
   });
 
+  it.each([undefined, "~/custom-store/sessions.json"])(
+    "checks the source session store when process state is isolated (store=%s)",
+    (store) => {
+      const sourceHome = path.join(tempHome, "source-home");
+      const sourceState = path.join(sourceHome, ".openclaw");
+      const storeDir = store
+        ? path.join(sourceHome, "custom-store")
+        : path.join(sourceState, "agents", "main", "sessions");
+      fs.mkdirSync(sourceState, { recursive: true, mode: 0o700 });
+      fs.mkdirSync(storeDir, { recursive: true, mode: 0o700 });
+      const accessSync = fs.accessSync;
+      const accessSpy = vi.spyOn(fs, "accessSync").mockImplementation((target, mode) => {
+        if (target === storeDir) {
+          throw Object.assign(new Error("permission denied"), { code: "EACCES" });
+        }
+        return accessSync(target, mode);
+      });
+      const readFileSync = fs.readFileSync;
+      const mountInfo = vi.spyOn(fs, "readFileSync");
+      try {
+        // Source isolation is independent of the temporary directory's backing filesystem.
+        mountInfo.mockImplementation(
+          (target, options?: fs.ReadFileSyncOptions | BufferEncoding | null) => {
+            if (typeof options === "string") {
+              if (target === "/proc/self/mountinfo" && options === "utf8") {
+                return "22 1 0:21 / / rw,relatime - ext4 /dev/sda1 rw";
+              }
+              return readFileSync(target, options);
+            }
+            if (options == null) {
+              return readFileSync(target, options);
+            }
+            return readFileSync(target, options);
+          },
+        );
+        const issues = detectStateIntegrityHealthIssues(
+          withMainAgentRoster({ session: { store } }),
+          { env: { HOME: sourceHome, OPENCLAW_STATE_DIR: sourceState } },
+        );
+        expect(issues).toEqual([
+          expect.objectContaining({
+            kind: "runtime-dir-not-writable",
+            label: "Session store dir",
+            path: storeDir,
+          }),
+        ]);
+      } finally {
+        mountInfo.mockRestore();
+        accessSpy.mockRestore();
+      }
+    },
+  );
+
   it("reports an existing session directory that is not writable", () => {
     const stateDir = path.join(tempHome, ".openclaw");
     const sessionsDir = resolveSessionTranscriptsDirForAgent("main", process.env, () => tempHome);
@@ -310,6 +379,21 @@ describe("doctor state integrity oauth dir checks", () => {
     };
     const confirmRuntimeRepair = await runStateIntegrity(cfg);
     expect(hasRepairPromptMessage(confirmRuntimeRepair, "Create OAuth dir at")).toBe(true);
+    expect(stateIntegrityText()).toContain("CRITICAL: OAuth dir missing");
+  });
+
+  it("does not require the oauth dir for a pairing channel with no registered plugin", async () => {
+    const cfg: OpenClawConfig = {
+      channels: {
+        icenter: {
+          enabled: true,
+          dmPolicy: "pairing",
+        },
+      },
+    };
+    const confirmRuntimeRepair = await runStateIntegrity(cfg);
+    expect(hasRepairPromptMessage(confirmRuntimeRepair, "Create OAuth dir at")).toBe(false);
+    expect(stateIntegrityText()).not.toContain("CRITICAL: OAuth dir missing");
   });
 
   it("prompts for oauth dir when OPENCLAW_OAUTH_DIR is explicitly configured", async () => {
@@ -320,19 +404,32 @@ describe("doctor state integrity oauth dir checks", () => {
     expect(stateIntegrityText()).toContain("CRITICAL: OAuth dir missing");
   });
 
-  it("warns about orphaned on-disk agent directories missing from agents.list", async () => {
-    createAgentDir("big-brain");
-    createAgentDir("cerebro");
+  it.each([
+    {
+      name: "list",
+      roster: { list: [{ id: "main", default: true }] },
+      path: "agents.list",
+      otherPath: "agents.entries",
+      orphanIds: ["big-brain", "cerebro"],
+    },
+    {
+      name: "keyed",
+      roster: { entries: { main: { default: true } } },
+      path: "agents.entries",
+      otherPath: "agents.list",
+      orphanIds: ["orphan"],
+    },
+  ])("preserves $name roster paths in orphaned agent recovery advice", async (testCase) => {
+    for (const agentId of testCase.orphanIds) {
+      createAgentDir(agentId);
+    }
+    const text = await runStateIntegrityText({ agents: testCase.roster });
 
-    const text = await runStateIntegrityText({
-      agents: {
-        list: [{ id: "main", default: true }],
-      },
-    });
-
-    expect(text).toContain("without a matching agents.list entry");
-    expect(text).toContain("Examples: big-brain, cerebro");
+    expect(text).toContain(`without a matching ${testCase.path} entry`);
+    expect(text).toContain(`Restore the missing ${testCase.path} entries`);
+    expect(text).toContain(`Examples: ${testCase.orphanIds.join(", ")}`);
     expect(text).toContain("config-driven routing, identity, and model selection will ignore them");
+    expect(text).not.toContain(testCase.otherPath);
   });
 
   it("detects orphaned agent dirs even when the on-disk folder casing differs", async () => {
@@ -363,6 +460,20 @@ describe("doctor state integrity oauth dir checks", () => {
     expect(text).not.toContain("Examples:");
   });
 
+  it("ignores reserved system agent dirs that can never appear in agents.list", async () => {
+    createAgentDir("openclaw");
+    createAgentDir("crestodian");
+
+    const text = await runStateIntegrityText({
+      agents: {
+        list: [{ id: "main", default: true }],
+      },
+    });
+
+    expect(text).not.toContain("without a matching agents.list entry");
+    expect(text).not.toContain("Examples:");
+  });
+
   it("protects the shared legacy main auth-store dir for an ops-only roster", async () => {
     createAgentDir("main");
 
@@ -386,7 +497,7 @@ describe("doctor state integrity oauth dir checks", () => {
       },
     });
 
-    expect(text).toContain("without a matching agents.list entry");
+    expect(text).toContain("without a matching agents.entries entry");
     expect(text).toContain("Examples: main");
   });
 
@@ -434,7 +545,7 @@ describe("doctor state integrity oauth dir checks", () => {
     const text = stateIntegrityText();
     expect(text).toContain("automatic restart recovery tombstoned");
     expect(text).toContain("agent:main:subagent:wedged-child");
-    expect(text).toContain("openclaw tasks maintenance --apply");
+    expect(text).toContain("openclaw doctor --fix");
     expect(hasRepairPromptMessage(confirmRuntimeRepair, "Clear stale aborted recovery flags")).toBe(
       true,
     );
@@ -488,4 +599,163 @@ describe("doctor state integrity oauth dir checks", () => {
     expect(text.includes("without a matching agents.list entry")).toBe(!configuredAgentDirExists);
     expect(text.includes("Examples: Research (id research)")).toBe(!configuredAgentDirExists);
   });
+});
+
+describe("doctor retained session integrity", () => {
+  it("repairs canonical recovery state without editing retained rows deleted from SQLite", async () => {
+    await withOpenClawTestState({ label: "retained-session-integrity" }, async (state) => {
+      const { cfg, storePath, scope } = await seedDeferredPluginSessionSource(state, "default");
+      const store = JSON.parse(fs.readFileSync(storePath, "utf8"));
+      for (const sessionKey of ["agent:main:kept", "agent:main:deleted"]) {
+        Object.assign(store[sessionKey], {
+          abortedLastRun: true,
+          subagentRecovery: {
+            automaticAttempts: 2,
+            lastAttemptAt: 10,
+            lastRunId: `run-${sessionKey}`,
+            wedgedAt: 20,
+            wedgedReason: "recovery requires reconciliation",
+          },
+        });
+      }
+      fs.writeFileSync(storePath, JSON.stringify(store));
+      expect(
+        (await runDoctorSessionSqlite({ cfg, env: state.env, allAgents: true, mode: "import" }))
+          .totals.importedEntries,
+      ).toBe(2);
+      const source = fs.readFileSync(storePath);
+      const receiptParams = {
+        cfg,
+        env: state.env,
+        target: { agentId: "main", storePath },
+        sqlitePath: resolveSqliteTargetFromSessionStorePath(storePath, scope).path,
+      };
+      const receipt = readDeferredPluginSessionImport(receiptParams);
+      expect(receipt).toBeDefined();
+      await deleteSessionEntryLifecycle({
+        ...scope,
+        target: { canonicalKey: "agent:main:deleted", storeKeys: ["agent:main:deleted"] },
+        archiveTranscript: false,
+        deleteTranscriptWithoutArchive: true,
+      });
+      await recordDeferredPluginMigrations({
+        env: state.env,
+        pending: [],
+        resolvedPluginIds: ["fixture-plugin"],
+      });
+
+      await noteStateIntegrityRaw(cfg, {
+        confirmRuntimeRepair: async ({ message }) =>
+          message.startsWith("Clear stale aborted recovery flags"),
+        note: vi.fn(),
+      });
+
+      expect(loadSessionEntry({ ...scope, sessionKey: "agent:main:kept" })?.abortedLastRun).toBe(
+        false,
+      );
+      expect(loadSessionEntry({ ...scope, sessionKey: "agent:main:deleted" })).toBeUndefined();
+      expect(fs.readFileSync(storePath)).toEqual(source);
+      expect(readDeferredPluginSessionImport(receiptParams)).toEqual(receipt);
+    });
+  });
+});
+
+describe("doctor state directory discovery", () => {
+  it.each([
+    { homeSource: "HOME", activeDefault: false, defaultExists: true, warns: true },
+    { homeSource: "HOME", activeDefault: true, defaultExists: true, warns: false },
+    { homeSource: "HOME", activeDefault: false, defaultExists: false, warns: false },
+    { homeSource: "USERPROFILE", activeDefault: false, defaultExists: true, warns: true },
+    { homeSource: "OPENCLAW_HOME", activeDefault: false, defaultExists: true, warns: true },
+    { homeSource: "OPENCLAW_HOME", activeDefault: false, defaultExists: false, warns: false },
+  ])(
+    "compares only the effective home ($homeSource, activeDefault=$activeDefault, defaultExists=$defaultExists)",
+    async ({ homeSource, activeDefault, defaultExists, warns }) => {
+      await withTestDir({ prefix: "openclaw-doctor-discovery-" }, async (root) => {
+        const osHome = path.join(root, "os-home");
+        const effectiveHome =
+          homeSource === "OPENCLAW_HOME" ? path.join(root, "relocated") : osHome;
+        const defaultState = path.join(effectiveHome, ".openclaw");
+        const activeState = activeDefault ? defaultState : path.join(root, "selected-state");
+        fs.mkdirSync(activeState, { recursive: true, mode: 0o700 });
+        if (defaultExists) {
+          fs.mkdirSync(defaultState, { recursive: true, mode: 0o700 });
+        }
+        if (homeSource === "OPENCLAW_HOME") {
+          fs.mkdirSync(path.join(osHome, ".openclaw"), { recursive: true, mode: 0o700 });
+        }
+        await withEnvAsync(
+          {
+            HOME: homeSource === "USERPROFILE" ? undefined : osHome,
+            USERPROFILE: osHome,
+            OPENCLAW_HOME: homeSource === "OPENCLAW_HOME" ? effectiveHome : undefined,
+            OPENCLAW_STATE_DIR: activeState,
+            OPENCLAW_AGENT_DIR: undefined,
+            OPENCLAW_OAUTH_DIR: undefined,
+          },
+          async () => {
+            const attemptedProbes: string[] = [];
+            const readdir = fs.readdirSync;
+            const exists = fs.existsSync;
+            const stat = fs.statSync;
+            const isSiblingPath = (target: fs.PathLike) => {
+              const targetPath = path.resolve(String(target));
+              return (
+                /^\/(?:Users|home)(?:\/|$)/u.test(targetPath) &&
+                targetPath !== root &&
+                !targetPath.startsWith(`${root}${path.sep}`)
+              );
+            };
+            // Fence real account roots, but record every attempt so the old scanner fails.
+            const readdirSpy = vi.spyOn(fs, "readdirSync").mockImplementation((target, options) => {
+              if (isSiblingPath(target)) {
+                attemptedProbes.push(`readdir ${String(target)}`);
+                throw new Error("account-root enumeration is outside Doctor's state scope");
+              }
+              return readdir(target, options);
+            });
+            const existsSpy = vi.spyOn(fs, "existsSync").mockImplementation((target) => {
+              if (isSiblingPath(target)) {
+                attemptedProbes.push(`exists ${String(target)}`);
+                return false;
+              }
+              return exists(target);
+            });
+            const statSpy = vi.spyOn(fs, "statSync").mockImplementation((target, options) => {
+              if (isSiblingPath(target)) {
+                attemptedProbes.push(`stat ${String(target)}`);
+                throw new Error("sibling-account metadata is outside Doctor's state scope");
+              }
+              return stat(target, options);
+            });
+            noteMock.mockClear();
+            try {
+              await noteStateIntegrityRaw(withMainAgentRoster({}), {
+                confirmRuntimeRepair: vi.fn(async () => false),
+                note: noteMock,
+              });
+              const text = stateIntegrityText();
+              expect(attemptedProbes).toEqual([]);
+              expect(text.includes("Multiple state directories detected")).toBe(warns);
+              if (warns) {
+                expect(text).toContain(
+                  homeSource === "OPENCLAW_HOME"
+                    ? "  - $OPENCLAW_HOME/.openclaw"
+                    : "  - ~/.openclaw",
+                );
+                expect(text).toContain(`Active state dir: ${activeState}`);
+              }
+              expect(text).toContain("OAuth dir not present");
+            } finally {
+              readdirSpy.mockRestore();
+              existsSpy.mockRestore();
+              statSpy.mockRestore();
+              closeOpenClawAgentDatabasesForTest();
+              closeOpenClawStateDatabaseForTest();
+            }
+          },
+        );
+      });
+    },
+  );
 });

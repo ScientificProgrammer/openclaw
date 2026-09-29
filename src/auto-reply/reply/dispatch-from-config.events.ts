@@ -1,13 +1,5 @@
 import type { PluginHookReplyDispatchEvent } from "../../plugins/hook-types.js";
-import type { CommandSessionMetadataChange } from "./command-session-metadata.js";
-import type { ReplySessionBinding } from "./get-reply.types.js";
-
-export type InternalReplyResolverOptions = {
-  onDeliberateSilentTerminalReply?: () => void;
-  onPendingContinuation?: () => void;
-  onSessionMetadataChanges?: (changes: CommandSessionMetadataChange[]) => void;
-  onSessionPrepared?: (binding: ReplySessionBinding) => void;
-};
+import type { InternalGetReplyOptions } from "./get-reply.types.js";
 
 export type PluginBindingTranscriptOwner = {
   agentId: string;
@@ -15,6 +7,15 @@ export type PluginBindingTranscriptOwner = {
   sessionKey: string;
   transcriptWriteBlocked?: true;
 };
+
+export function admittedSessionSettingsRestrictRuntime(
+  settings: InternalGetReplyOptions["admittedSessionSettings"],
+): boolean {
+  return (
+    (settings?.permissionMode !== undefined && settings.permissionMode !== "full") ||
+    (settings?.toolOverrides !== undefined && Object.keys(settings.toolOverrides).length > 0)
+  );
+}
 
 export function createReplyDispatchEvent(
   params: Omit<PluginHookReplyDispatchEvent, "shouldSendToolSummaries"> & {

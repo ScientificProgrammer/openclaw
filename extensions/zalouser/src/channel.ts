@@ -1,4 +1,3 @@
-// Zalouser plugin module implements channel behavior.
 import { DEFAULT_ACCOUNT_ID } from "openclaw/plugin-sdk/account-id";
 import type { ChannelDirectoryEntry } from "openclaw/plugin-sdk/channel-contract";
 import { createChatChannelPlugin, type ChannelPlugin } from "openclaw/plugin-sdk/channel-core";
@@ -23,7 +22,7 @@ import {
   zalouserSecurityAdapter,
   zalouserThreadingAdapter,
 } from "./channel.adapters.js";
-import { listZalouserDirectoryGroupMembers } from "./directory.js";
+import { listZalouserDirectoryGroupMembers, mapZalouserDirectoryUser } from "./directory.js";
 import type { ZalouserProbeResult } from "./probe.js";
 import { createZalouserSetupWizardProxy, zalouserSetupContract } from "./setup-core.js";
 import { createZalouserPluginBase } from "./shared.js";
@@ -33,21 +32,6 @@ const loadZalouserChannelRuntime = createLazyRuntimeModule(() => import("./chann
 const zalouserSetupWizardProxy = createZalouserSetupWizardProxy(
   async () => (await import("./setup-surface.js")).zalouserSetupWizard,
 );
-
-function mapUser(params: {
-  id: string;
-  name?: string | null;
-  avatarUrl?: string | null;
-  raw?: unknown;
-}): ChannelDirectoryEntry {
-  return {
-    kind: "user",
-    id: params.id,
-    name: params.name ?? undefined,
-    avatarUrl: params.avatarUrl ?? undefined,
-    raw: params.raw,
-  };
-}
 
 function mapGroup(params: {
   id: string;
@@ -80,7 +64,7 @@ export const zalouserPlugin: ChannelPlugin<ResolvedZalouserAccount, ZalouserProb
           if (!parsed?.userId) {
             return null;
           }
-          return mapUser({
+          return mapZalouserDirectoryUser({
             id: parsed.userId,
             name: parsed.displayName ?? null,
             avatarUrl: parsed.avatar ?? null,
@@ -92,7 +76,7 @@ export const zalouserPlugin: ChannelPlugin<ResolvedZalouserAccount, ZalouserProb
           const account = resolveZalouserAccountSync({ cfg, accountId });
           const friends = await listZaloFriendsMatching(account.profile, query);
           const rows = friends.map((friend) =>
-            mapUser({
+            mapZalouserDirectoryUser({
               id: friend.userId,
               name: friend.displayName ?? null,
               avatarUrl: friend.avatar ?? null,

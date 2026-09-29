@@ -1,25 +1,17 @@
+import { containsAsciiControlCharacter } from "@openclaw/normalization-core/string-normalization";
 import {
   BOARD_WIDGET_TOOL_MAX_LENGTH,
   type BoardWidgetDeclared,
 } from "../../packages/gateway-protocol/src/index.js";
 import { normalizeSandboxHostCsp } from "../agents/sandbox-host.js";
 import { BoardValidationError } from "./board-layout.js";
+import { normalizeGitHubActionsGrant } from "./github-actions-capability.js";
 
 const MAX_DECLARED_ORIGINS = 32;
 const MAX_DECLARED_TOOLS = 64;
 
 function invalidDeclaration(message: string): never {
   throw new BoardValidationError("invalid_operation", message);
-}
-
-function hasControlCharacter(value: string): boolean {
-  for (let index = 0; index < value.length; index += 1) {
-    const code = value.charCodeAt(index);
-    if (code <= 31 || code === 127) {
-      return true;
-    }
-  }
-  return false;
 }
 
 function normalizeBoardNetOrigin(value: string): string {
@@ -58,11 +50,11 @@ function normalizeTool(value: string): string {
     tool.length === 0 ||
     tool.length > BOARD_WIDGET_TOOL_MAX_LENGTH ||
     tool !== value ||
-    hasControlCharacter(tool)
+    containsAsciiControlCharacter(tool)
   ) {
     return invalidDeclaration(`invalid board widget tool capability: ${value}`);
   }
-  return tool;
+  return normalizeGitHubActionsGrant(tool);
 }
 
 export function normalizeBoardWidgetDeclared(

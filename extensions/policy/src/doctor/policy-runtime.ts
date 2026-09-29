@@ -17,6 +17,7 @@ import {
   SUPPORTED_AUTH_PROFILE_METADATA,
   SUPPORTED_AUTH_PROFILE_MODES,
 } from "./policy-constants.js";
+import { isChannelDenyRule } from "./shape-helpers.js";
 import { readPolicyStringArray } from "./utils.js";
 
 export const normalizePolicyChannelId: (value: string) => string = normalizeLowercaseStringOrEmpty;
@@ -27,21 +28,8 @@ export async function readPolicyFile(
   ctx: HealthCheckContext,
 ): Promise<{ raw: string; path: string; displayName: string; ocDocName: string } | null> {
   const displayName = policyDisplayName(ctx);
-  const path = resolveWorkspacePath(ctx, policyPathSetting(ctx));
-  try {
-    const fs = await loadFsPromisesModule();
-    return {
-      raw: await fs.readFile(path, "utf-8"),
-      path,
-      displayName,
-      ocDocName: basename(displayName),
-    };
-  } catch (err) {
-    if (isNotFoundPathError(err)) {
-      return null;
-    }
-    throw err;
-  }
+  const file = await readWorkspaceFile(ctx, policyPathSetting(ctx));
+  return file === null ? null : { ...file, displayName, ocDocName: basename(displayName) };
 }
 
 export async function readExecApprovalsFile(
@@ -157,51 +145,17 @@ export function readChannelDenyRules(
   ) {
     return [];
   }
-  return policy.channels.denyRules
-    .map((rule, index) => ({ rule, index }))
-    .filter(
-      (
-        entry,
-      ): entry is {
-        readonly index: number;
-        readonly rule: {
-          readonly id?: string;
-          readonly when?: { readonly provider?: string };
-          readonly reason?: string;
-        };
-      } => isChannelDenyRule(entry.rule),
-    )
-    .map(({ rule, index }) => {
-      const next: {
-        id?: string;
-        when?: { readonly provider?: string };
-        reason?: string;
-        requirement: string;
-      } = {
-        when: rule.when,
-        requirement: `oc://${policyDocName}/channels/denyRules/#${index}`,
-      };
-      if (rule.id !== undefined) {
-        next.id = rule.id;
-      }
-      if (rule.reason !== undefined) {
-        next.reason = rule.reason;
-      }
-      return next;
-    });
-}
-
-export function isChannelDenyRule(value: unknown): value is {
-  readonly id?: string;
-  readonly when?: { readonly provider?: string };
-  readonly reason?: string;
-} {
-  return (
-    isRecord(value) &&
-    (value.id === undefined || typeof value.id === "string") &&
-    (value.reason === undefined || typeof value.reason === "string") &&
-    isRecord(value.when) &&
-    typeof value.when.provider === "string"
+  return policy.channels.denyRules.flatMap((rule, index) =>
+    isChannelDenyRule(rule)
+      ? [
+          {
+            when: rule.when,
+            requirement: `oc://${policyDocName}/channels/denyRules/#${index}`,
+            ...(rule.id === undefined ? {} : { id: rule.id }),
+            ...(rule.reason === undefined ? {} : { reason: rule.reason }),
+          },
+        ]
+      : [],
   );
 }
 

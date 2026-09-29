@@ -1,4 +1,3 @@
-// Openrouter plugin module implements video model catalog behavior.
 import type {
   UnifiedModelCatalogEntry,
   UnifiedModelCatalogProviderContext,
@@ -7,7 +6,7 @@ import { resolveApiKeyForProvider } from "openclaw/plugin-sdk/provider-auth-runt
 import { getCachedLiveCatalogValue } from "openclaw/plugin-sdk/provider-catalog-shared";
 import {
   assertOkOrThrowHttpError,
-  readProviderJsonResponse,
+  readProviderJsonArrayFieldResponse,
   resolveProviderHttpRequestConfig,
   sanitizeConfiguredModelProviderRequest,
 } from "openclaw/plugin-sdk/provider-http";
@@ -26,23 +25,6 @@ import { fetchOpenRouterVideoGet, type OpenRouterVideoDispatcherPolicy } from ".
 
 const DEFAULT_HTTP_TIMEOUT_MS = 60_000;
 
-type OpenRouterVideoModel = {
-  allowed_passthrough_parameters?: unknown;
-  canonical_slug?: unknown;
-  created?: unknown;
-  description?: unknown;
-  generate_audio?: unknown;
-  id?: unknown;
-  name?: unknown;
-  pricing_skus?: unknown;
-  seed?: unknown;
-  supported_aspect_ratios?: unknown;
-  supported_durations?: unknown;
-  supported_frame_images?: unknown;
-  supported_resolutions?: unknown;
-  supported_sizes?: unknown;
-};
-
 type OpenRouterVideoModelCatalogCapabilities = VideoGenerationProviderCapabilities & {
   allowedPassthroughParameters?: readonly string[];
   canonicalSlug?: string;
@@ -50,10 +32,6 @@ type OpenRouterVideoModelCatalogCapabilities = VideoGenerationProviderCapabiliti
   description?: string;
   pricingSkus?: Readonly<Record<string, string>>;
 };
-
-type OpenRouterVideoRequestPolicyCacheKey = ReturnType<
-  typeof sanitizeConfiguredModelProviderRequest
->;
 
 type OpenRouterVideoRequestConfig = Parameters<typeof sanitizeConfiguredModelProviderRequest>[0];
 
@@ -93,10 +71,6 @@ function normalizeStringRecord(value: unknown): Record<string, string> | undefin
   return Object.keys(record).length > 0 ? record : undefined;
 }
 
-function isOpenRouterVideoModel(value: unknown): value is OpenRouterVideoModel {
-  return isRecord(value);
-}
-
 function buildOpenRouterVideoModeCapabilities(params: {
   durations: number[];
   aspectRatios: string[];
@@ -130,7 +104,7 @@ function buildOpenRouterVideoModeCapabilities(params: {
 }
 
 function buildOpenRouterVideoModelCapabilities(
-  model: OpenRouterVideoModel,
+  model: Record<string, unknown>,
 ): OpenRouterVideoModelCatalogCapabilities {
   const aspectRatios = normalizeTrimmedStringList(model.supported_aspect_ratios);
   const durations = normalizeNumberArray(model.supported_durations);
@@ -149,7 +123,7 @@ function buildOpenRouterVideoModelCapabilities(
     sizes,
     supportsAudio,
   });
-  const base: VideoGenerationProviderCapabilities = {
+  const capabilities: OpenRouterVideoModelCatalogCapabilities = {
     providerOptions: {
       callback_url: "string",
       seed: "number",
@@ -163,9 +137,6 @@ function buildOpenRouterVideoModelCapabilities(
     videoToVideo: {
       enabled: false,
     },
-  };
-  const capabilities: OpenRouterVideoModelCatalogCapabilities = {
-    ...base,
   };
   const canonicalSlug = normalizeOptionalString(model.canonical_slug);
   if (canonicalSlug) {
@@ -189,13 +160,12 @@ function buildOpenRouterVideoModelCapabilities(
 }
 
 function projectOpenRouterVideoModelsToCatalogEntries(
-  payload: unknown,
+  models: unknown[],
 ): Array<UnifiedModelCatalogEntry<OpenRouterVideoModelCatalogCapabilities>> {
   const entries: Array<UnifiedModelCatalogEntry<OpenRouterVideoModelCatalogCapabilities>> = [];
   const seen = new Set<string>();
-  const models = isRecord(payload) && Array.isArray(payload.data) ? payload.data : [];
   for (const model of models) {
-    if (!isOpenRouterVideoModel(model)) {
+    if (!isRecord(model)) {
       continue;
     }
     const id = normalizeOptionalString(model.id);
@@ -234,10 +204,6 @@ function stableCacheKeyValue(value: unknown): unknown {
   );
 }
 
-function buildRequestPolicyCacheKey(request: OpenRouterVideoRequestPolicyCacheKey): unknown {
-  return stableCacheKeyValue(request ?? null);
-}
-
 function resolveOpenRouterVideoCatalogRequest(params: {
   apiKey: string;
   baseUrl: string | undefined;
@@ -257,7 +223,7 @@ function resolveOpenRouterVideoCatalogRequest(params: {
       },
       request,
     }),
-    requestPolicyCacheKey: buildRequestPolicyCacheKey(request),
+    requestPolicyCacheKey: stableCacheKeyValue(request ?? null),
   };
 }
 
@@ -269,7 +235,7 @@ async function fetchOpenRouterVideoModels(params: {
   timeoutMs: number;
   allowPrivateNetwork: boolean;
   dispatcherPolicy: OpenRouterVideoDispatcherPolicy;
-}): Promise<unknown> {
+}): Promise<unknown[]> {
   return await getCachedLiveCatalogValue({
     keyParts: [
       "openrouter",
@@ -290,9 +256,10 @@ async function fetchOpenRouterVideoModels(params: {
       });
       try {
         await assertOkOrThrowHttpError(response, "OpenRouter video models request failed");
-        return await readProviderJsonResponse<unknown>(
+        return await readProviderJsonArrayFieldResponse(
           response,
           "OpenRouter video models request failed",
+          "data",
         );
       } finally {
         await release();
@@ -353,7 +320,9 @@ export async function resolveOpenRouterVideoModelCapabilities(
     allowPrivateNetwork,
     dispatcherPolicy,
   });
-  return projectOpenRouterVideoModelsToCatalogEntries(payload).find(
-    (entry) => entry.model === ctx.model,
-  )?.capabilities;
+  const model = payload.find((row) => {
+    const id = isRecord(row) ? normalizeOptionalString(row.id) : undefined;
+    return id !== undefined && id === ctx.model;
+  });
+  return isRecord(model) ? buildOpenRouterVideoModelCapabilities(model) : undefined;
 }

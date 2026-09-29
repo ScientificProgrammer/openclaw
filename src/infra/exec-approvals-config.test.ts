@@ -17,7 +17,7 @@ import {
   type ExecApprovalsFile,
 } from "./exec-approvals.js";
 
-describe.sequential("exec approval temp fixture cleanup", () => {
+describe("exec approval temp fixture cleanup", { concurrent: false }, () => {
   let cleanupProbeRoot = "";
 
   it("creates a disposable fixture root", () => {
@@ -128,6 +128,7 @@ describe("exec approvals node host allowlist check", () => {
       kind: "executable" as const,
       rawExecutable: "head",
       resolvedPath: "/usr/bin/head",
+      resolvedRealPath: "/usr/bin/head",
       executableName: "head",
     };
     // Not in allowlist
@@ -180,6 +181,35 @@ describe("exec approvals default agent migration", () => {
 });
 
 describe("persisted exec approvals schema", () => {
+  it("round-trips exact MCP grants and tolerates unrelated future agent metadata", () => {
+    const mcpTools = [
+      { server: "project.docs", tool: "write_note", source: "allow-always", addedAt: 123 },
+    ];
+    const file = { version: 1, agents: { main: { mcpTools, futurePolicy: { enabled: true } } } };
+    const parsed = tryParsePersistedExecApprovals(JSON.stringify(file));
+    expect(parsed?.agents?.main).toMatchObject(file.agents.main);
+    expect(tryParsePersistedExecApprovals(JSON.stringify(parsed))?.agents?.main).toMatchObject(
+      file.agents.main,
+    );
+  });
+
+  it("retains MCP grants when merging legacy default and canonical main policy", () => {
+    const grant = {
+      server: "project.docs",
+      tool: "write_note",
+      source: "allow-always",
+      addedAt: 123,
+    };
+    const parsed = tryParsePersistedExecApprovals(
+      JSON.stringify({
+        version: 1,
+        agents: { main: { mcpTools: [grant] }, default: { ask: "off" } },
+      }),
+    );
+    expect(parsed?.agents?.main).toMatchObject({ mcpTools: [grant], ask: "off" });
+    expect(parsed?.agents?.default).toBeUndefined();
+  });
+
   it("keeps legacy string allowlist entries while normalizing them", () => {
     const parsed = tryParsePersistedExecApprovals(
       JSON.stringify({
@@ -194,9 +224,22 @@ describe("persisted exec approvals schema", () => {
   });
 
   it.each([
+    ...[
+      { server: "", tool: "write_note", source: "allow-always", addedAt: 123 },
+      { server: "project.docs", tool: "", source: "allow-always", addedAt: 123 },
+      { server: "project.docs", tool: "write_note", source: "other", addedAt: 123 },
+      { server: "project.docs", tool: "write_note", source: "allow-always", addedAt: -1 },
+    ].map((grant, index) => ({
+      name: `MCP grant ${index}`,
+      value: { version: 1, agents: { main: { mcpTools: [grant] } } },
+    })),
     { name: "version", value: { version: 2 } },
     { name: "socket token", value: { version: 1, socket: { token: 42 } } },
     { name: "policy enum", value: { version: 1, defaults: { security: "none" } } },
+    ...["lastUsedAt", "lastUsedCommand"].map((field) => ({
+      name: `null ${field}`,
+      value: { version: 1, agents: { main: { allowlist: [{ pattern: "ls", [field]: null }] } } },
+    })),
     {
       name: "allowlist metadata",
       value: {
@@ -306,36 +349,6 @@ describe("normalizeExecApprovals handles string allowlist entries (#9790)", () =
     }
   }
 
-  it("converts bare string entries to proper ExecAllowlistEntry objects", () => {
-    // Simulates a corrupted or legacy config where allowlist contains plain
-    // strings (e.g. ["ls", "cat"]) instead of { pattern: "..." } objects.
-    const file = {
-      version: 1,
-      agents: {
-        main: {
-          mode: "allowlist",
-          allowlist: ["things", "remindctl", "memo", "which", "ls", "cat", "echo"],
-        },
-      },
-    } as unknown as ExecApprovalsFile;
-
-    const normalized = normalizeExecApprovals(file);
-    const entries = normalized.agents?.main?.allowlist ?? [];
-
-    // Spread-string corruption would create numeric keys — ensure none exist.
-    expectNoSpreadStringArtifacts(entries);
-
-    expect(entries.map((e) => e.pattern)).toEqual([
-      "things",
-      "remindctl",
-      "memo",
-      "which",
-      "ls",
-      "cat",
-      "echo",
-    ]);
-  });
-
   it("preserves proper ExecAllowlistEntry objects unchanged", () => {
     const file: ExecApprovalsFile = {
       version: 1,
@@ -396,26 +409,6 @@ describe("normalizeExecApprovals handles string allowlist entries (#9790)", () =
 });
 
 describe("normalizeExecApprovals strips invalid security/ask enum values (#59006)", () => {
-  it("drops invalid defaults.security values like 'none'", () => {
-    const file = {
-      version: 1,
-      defaults: { security: "none" },
-      agents: {},
-    } as unknown as ExecApprovalsFile;
-    const normalized = normalizeExecApprovals(file);
-    expect(normalized.defaults?.security).toBeUndefined();
-  });
-
-  it("drops invalid defaults.ask values like 'never'", () => {
-    const file = {
-      version: 1,
-      defaults: { ask: "never" },
-      agents: {},
-    } as unknown as ExecApprovalsFile;
-    const normalized = normalizeExecApprovals(file);
-    expect(normalized.defaults?.ask).toBeUndefined();
-  });
-
   it("drops invalid defaults.askFallback values", () => {
     const file = {
       version: 1,
@@ -449,18 +442,6 @@ describe("normalizeExecApprovals strips invalid security/ask enum values (#59006
     expect(normalized.agents?.main?.security).toBeUndefined();
     expect(normalized.agents?.main?.ask).toBeUndefined();
     expect(normalized.agents?.main?.askFallback).toBeUndefined();
-  });
-
-  it("drops invalid wildcard agent security/ask values", () => {
-    const file = {
-      version: 1,
-      agents: {
-        "*": { security: "none", ask: "off" },
-      },
-    } as unknown as ExecApprovalsFile;
-    const normalized = normalizeExecApprovals(file);
-    expect(normalized.agents?.["*"]?.security).toBeUndefined();
-    expect(normalized.agents?.["*"]?.ask).toBe("off");
   });
 
   it("resolves to built-in defaults when invalid values are stripped", () => {

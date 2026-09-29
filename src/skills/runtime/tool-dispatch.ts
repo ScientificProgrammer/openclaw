@@ -1,8 +1,8 @@
 import { applyToolAvailabilityDescriptions } from "../../agents/agent-tools.deferred-followup.js";
-// Skill tool dispatch routes runtime skill tool calls through the active session context.
 import { resolveEffectiveToolPolicy } from "../../agents/agent-tools.policy.js";
 import type { AnyAgentTool } from "../../agents/agent-tools.types.js";
 import type { createOpenClawTools } from "../../agents/openclaw-tools.js";
+import { filterRequesterYieldTools } from "../../agents/openclaw-tools.requester-yield.js";
 import { resolveRequesterToolPolicies } from "../../agents/requester-tool-policy.js";
 import { resolveSandboxRuntimeStatus } from "../../agents/sandbox/runtime-status.js";
 import { buildDeclaredToolAllowlistContext } from "../../agents/tool-policy-declared-context.js";
@@ -26,7 +26,7 @@ import {
 import type { SessionEntry } from "../../config/sessions.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { logVerbose } from "../../globals.js";
-import { getPluginToolMeta } from "../../plugins/tools.js";
+import { getPluginToolMeta } from "../../plugins/tool-metadata.js";
 import { GATEWAY_OWNER_ONLY_CORE_TOOLS } from "../../security/dangerous-tools.js";
 import { resolveGatewayMessageChannel } from "../../utils/message-channel.js";
 import type { SkillCommandSpec } from "../types.js";
@@ -90,6 +90,7 @@ export function resolveSkillDispatchTools(
     providerProfile,
     profileAlsoAllow,
     providerProfileAlsoAllow,
+    gatewayConfigReadAllowed,
   } = resolveEffectiveToolPolicy({
     config: params.cfg,
     sessionKey: params.sessionKey,
@@ -124,6 +125,7 @@ export function resolveSkillDispatchTools(
   const { groupPolicy, senderPolicy, subagentPolicy, inheritedToolPolicy } = requesterPolicies;
   const sandboxRuntime = resolveSandboxRuntimeStatus({
     cfg: params.cfg,
+    agentId: resolvedAgentId,
     sessionKey: params.sessionKey,
   });
   const sandboxPolicy = sandboxRuntime.sandboxed ? sandboxRuntime.toolPolicy : undefined;
@@ -164,6 +166,7 @@ export function resolveSkillDispatchTools(
       }
     : undefined;
   const tools = dependencies.createOpenClawTools({
+    gatewayConfigReadAllowed,
     agentSessionKey: params.sessionKey,
     agentChannel: channel,
     agentAccountId: params.message.accountId,
@@ -196,7 +199,7 @@ export function resolveSkillDispatchTools(
   });
   const policyFiltered = applyToolPolicyPipeline({
     tools,
-    toolMeta: (tool) => getPluginToolMeta(tool),
+    toolMeta: getPluginToolMeta,
     warn: logVerbose,
     steps: [
       ...buildDefaultToolPolicyPipelineSteps({
@@ -225,12 +228,15 @@ export function resolveSkillDispatchTools(
       toolDenylist: explicitDenylist,
     }),
   });
-  const finalized = applyToolAvailabilityDescriptions(policyFiltered, { agentId: resolvedAgentId });
   if (explicitPolicyList.some(hasRestrictiveAllowPolicy)) {
-    replaceWithEffectiveToolAllowlist(inheritedToolAllowlist, finalized);
+    replaceWithEffectiveToolAllowlist(inheritedToolAllowlist, policyFiltered);
   }
-  replaceWithEffectiveCronCreatorToolAllowlist(cronCreatorToolAllowlist, finalized, (tool) =>
-    getPluginToolMeta(tool),
+  replaceWithEffectiveCronCreatorToolAllowlist(
+    cronCreatorToolAllowlist,
+    policyFiltered,
+    getPluginToolMeta,
   );
-  return finalized;
+  return applyToolAvailabilityDescriptions(
+    filterRequesterYieldTools(policyFiltered, params.sessionKey),
+  );
 }

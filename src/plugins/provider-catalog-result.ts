@@ -75,7 +75,7 @@ export function copyProviderCatalogResultProjection(
 
 /** Copies valid, secret-free provider outcomes out of a catalog hook result. */
 export function copyProviderCatalogOutcomes(
-  result: ProviderCatalogResult,
+  result: { outcomes?: readonly ProviderCatalogOutcome[] } | null | undefined,
 ): ProviderCatalogOutcome[] {
   return copyArrayEntries(readRecordValue(result, "outcomes")).flatMap((entry) => {
     if (!isRecordWithoutThrowing(entry)) {
@@ -85,6 +85,7 @@ export function copyProviderCatalogOutcomes(
     const profileId = readRecordValue(entry, "profileId");
     const rejectionScope = readRecordValue(entry, "rejectionScope");
     const status = readRecordValue(entry, "status");
+    const rawModelOrder = readRecordValue(entry, "modelOrder");
     if (
       typeof provider !== "string" ||
       provider.trim().length === 0 ||
@@ -96,12 +97,23 @@ export function copyProviderCatalogOutcomes(
     ) {
       return [];
     }
+    const modelOrder =
+      status === "ready" && rawModelOrder !== undefined
+        ? [
+            ...new Set(
+              copyArrayEntries(rawModelOrder).flatMap((value) =>
+                typeof value === "string" && value.trim() ? [value.trim()] : [],
+              ),
+            ),
+          ]
+        : [];
     return [
       {
         provider: provider.trim(),
         ...(typeof profileId === "string" ? { profileId: profileId.trim() } : {}),
         ...(rejectionScope === "catalog" ? { rejectionScope } : {}),
         status: status as ProviderCatalogOutcome["status"],
+        ...(modelOrder.length > 0 ? { modelOrder } : {}),
       },
     ];
   });
@@ -120,13 +132,17 @@ export function copyProviderCatalogResultEntries(params: {
 }
 
 /** Copies model definitions from provider catalog provider config. */
-export function copyProviderCatalogModels(
+function copyProviderCatalogModels(
   providerConfig: ModelProviderConfig,
 ): ModelProviderConfig["models"] {
-  return copyArrayEntries(readRecordValue(providerConfig, "models")).flatMap((entry) => {
+  const models: ModelDefinitionConfig[] = [];
+  for (const entry of copyArrayEntries(readRecordValue(providerConfig, "models"))) {
     const copied = copyProviderCatalogModel(entry);
-    return copied ? [copied] : [];
-  });
+    if (copied) {
+      models.push(copied);
+    }
+  }
+  return models;
 }
 
 function copyProviderCatalogModel(model: unknown): ModelDefinitionConfig | undefined {

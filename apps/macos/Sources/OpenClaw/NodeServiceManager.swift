@@ -5,7 +5,7 @@ enum NodeServiceManager {
     private static let logger = Logger(subsystem: "ai.openclaw", category: "node.service")
     private static let lifecycleQueue = LifecycleQueue()
     private static var launchdPlistURL: URL {
-        FileManager.default.homeDirectoryForCurrentUser
+        LaunchAgentPlist.homeDirectoryURL
             .appendingPathComponent("Library/LaunchAgents/\(nodeLaunchdLabel).plist")
     }
 
@@ -32,6 +32,7 @@ enum NodeServiceManager {
 
     static func waitUntilRunning(profile: AppProfile = .current) async -> Bool {
         if self.skipUnderProfile(profile, action: "status poll") { return false }
+        guard let arguments = self.launchdProgramArguments(profile: profile), !arguments.isEmpty else { return false }
         var consecutiveRunningChecks = 0
         for attempt in 0..<20 {
             let result = await self.runServiceCommandResult(
@@ -88,22 +89,18 @@ extension NodeServiceManager {
     }
 
     private static func serviceCommand(_ args: [String]) async -> [String] {
-        await CommandResolver.openclawCommand(
+        await CommandResolver.localOpenclawCommand(
             subcommand: "node",
-            extraArgs: self.withJsonFlag(args),
-            // Service management must always run locally, even if remote mode is configured.
-            configRoot: ["gateway": ["mode": "local"]])
+            extraArgs: self.withJsonFlag(args))
     }
 
     private struct CommandResult {
         let success: Bool
-        let payload: Data?
         let message: String?
         let parsed: ParsedServiceJson?
     }
 
     private struct ParsedServiceJson {
-        let text: String
         let object: [String: Any]
         let ok: Bool?
         let result: String?
@@ -117,6 +114,17 @@ extension NodeServiceManager {
         timeout: Double,
         quiet: Bool) async -> CommandResult
     {
+        // The bundled app worker is not a launchd service. Only a separate installed
+        // service owns CLI lifecycle work; an unreadable record must still fail closed.
+        guard let arguments = self.launchdProgramArguments() else {
+            return CommandResult(
+                success: false,
+                message: "Could not read the node service ownership record. Check the node LaunchAgent and retry.",
+                parsed: nil)
+        }
+        guard !arguments.isEmpty else {
+            return CommandResult(success: true, message: nil, parsed: nil)
+        }
         #if DEBUG
         self.testingServiceCommandCalls.append(args)
         #endif
@@ -127,23 +135,22 @@ extension NodeServiceManager {
         let parsed = self.parseServiceJson(from: response.stdout) ?? self.parseServiceJson(from: response.stderr)
         let ok = parsed?.ok
         let message = parsed?.error ?? parsed?.message
-        let payload = parsed?.text.data(using: .utf8)
-            ?? (response.stdout.isEmpty ? response.stderr : response.stdout).data(using: .utf8)
         let success = response.success && (ok ?? true)
         if success {
-            return CommandResult(success: true, payload: payload, message: nil, parsed: parsed)
+            return CommandResult(success: true, message: nil, parsed: parsed)
         }
 
         if quiet {
-            return CommandResult(success: false, payload: payload, message: message, parsed: parsed)
+            return CommandResult(success: false, message: message, parsed: parsed)
         }
 
-        let detail = message ?? self.summarize(response.stderr) ?? self.summarize(response.stdout)
+        let detail = message ?? TextSummarySupport.summarizeLastLine(response.stderr)
+            ?? TextSummarySupport.summarizeLastLine(response.stdout)
         let exit = response.exitCode.map { "exit \($0)" } ?? (response.errorMessage ?? "failed")
         let fullMessage = detail.map { "Node service command failed (\(exit)): \($0)" }
             ?? "Node service command failed (\(exit))"
         self.logger.error("\(fullMessage, privacy: .public)")
-        return CommandResult(success: false, payload: payload, message: detail, parsed: parsed)
+        return CommandResult(success: false, message: detail, parsed: parsed)
     }
 
     private static func errorMessage(from result: CommandResult, treatNotLoadedAsError: Bool) -> String? {
@@ -167,7 +174,6 @@ extension NodeServiceManager {
 
     private static func parseServiceJson(from raw: String) -> ParsedServiceJson? {
         guard let parsed = JSONObjectExtractionSupport.extract(from: raw) else { return nil }
-        let jsonText = parsed.text
         let object = parsed.object
         let ok = object["ok"] as? Bool
         let result = object["result"] as? String
@@ -175,7 +181,6 @@ extension NodeServiceManager {
         let error = object["error"] as? String
         let hints = (object["hints"] as? [String]) ?? []
         return ParsedServiceJson(
-            text: jsonText,
             object: object,
             ok: ok,
             result: result,
@@ -192,7 +197,10 @@ extension NodeServiceManager {
         self.testingOwnershipReadCount += 1
         #endif
         guard fileManager.fileExists(atPath: plistURL.path) else { return [] }
-        return LaunchAgentPlist.snapshot(url: plistURL)?.programArguments
+        guard let arguments = LaunchAgentPlist.snapshot(url: plistURL)?.programArguments,
+              !arguments.isEmpty
+        else { return nil }
+        return arguments
     }
 
     private static func runtimeIsRunning(in object: [String: Any]) -> Bool {
@@ -201,10 +209,6 @@ extension NodeServiceManager {
               let runtime = service["runtime"] as? [String: Any]
         else { return false }
         return runtime["status"] as? String == "running"
-    }
-
-    private static func summarize(_ text: String) -> String? {
-        TextSummarySupport.summarizeLastLine(text)
     }
 }
 

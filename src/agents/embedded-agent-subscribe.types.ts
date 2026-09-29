@@ -13,6 +13,7 @@ import type { OpenClawConfig } from "../config/types.openclaw.js";
 import type { HookRunner } from "../plugins/hooks.js";
 import type { BlockReplyPayload } from "./embedded-agent-payloads.js";
 import type { EmbeddedRunReplayState } from "./embedded-agent-runner/replay-state.js";
+import type { EmbeddedRunAttemptInternalParams } from "./embedded-agent-runner/run/internal-params.js";
 import type { EmbeddedRunAttemptParams } from "./embedded-agent-runner/run/types.js";
 import type { BlockReplyFlushContext } from "./embedded-agent-runner/types.js";
 import type {
@@ -21,9 +22,11 @@ import type {
   ToolProgressDetailMode,
   ToolResultFormat,
 } from "./embedded-agent-subscribe.shared-types.js";
+import type { PreparedProviderFailoverOwner } from "./failover/provider-patterns.js";
 import type { AgentInternalEvent } from "./internal-events.js";
 import type { AgentMessage } from "./runtime/index.js";
 import type { AgentSession } from "./sessions/index.js";
+import type { NormalizedUsage } from "./usage.js";
 export type { BlockReplyChunking } from "./embedded-agent-subscribe.shared-types.js";
 
 type ReasoningStreamPayload = Pick<
@@ -41,6 +44,7 @@ export type SubscribeEmbeddedAgentSessionParams = {
   /** Originating message channel used for subsystem log attribution. */
   messageChannel?: string;
   initialReplayState?: EmbeddedRunReplayState;
+  assistantErrorTranscript?: EmbeddedRunAttemptParams["assistantErrorTranscript"];
   hookRunner?: HookRunner;
   verboseLevel?: VerboseLevel;
   reasoningMode?: ReasoningLevel;
@@ -57,6 +61,8 @@ export type SubscribeEmbeddedAgentSessionParams = {
   onToolResult?: (payload: ReplyPayload) => void | Promise<void>;
   onAgentToolResult?: (event: { toolName: string; result: unknown; isError: boolean }) => void;
   observeToolTerminal?: EmbeddedRunAttemptParams["observeToolTerminal"];
+  /** Attempt-scoped trajectory recorder for runtime tool audit events. */
+  trajectoryRecorder?: EmbeddedRunAttemptParams["trajectoryRecorder"];
   onReasoningStream?: (payload: ReasoningStreamPayload) => void | Promise<void>;
   /** Expands window reasoning beyond "stream" mode for callers with their own display gate. */
   streamReasoningInNonStreamModes?: boolean;
@@ -69,6 +75,8 @@ export type SubscribeEmbeddedAgentSessionParams = {
   blockReplyChunking?: BlockReplyChunking;
   onPartialReply?: (payload: PartialReplyPayload) => boolean | void | Promise<boolean | void>;
   onAssistantMessageStart?: () => void | Promise<void>;
+  /** Assistant fragment usage before queued delivery; fragments may be intermediate. */
+  onModelUsage?: (usage: NormalizedUsage | undefined) => void;
   onExecutionPhase?: (info: {
     phase: "tool_execution_started";
     tool?: string;
@@ -84,6 +92,8 @@ export type SubscribeEmbeddedAgentSessionParams = {
   isTerminalAborted?: () => boolean | undefined;
   /** Override the terminal stop reason from the current abort owner. */
   resolveTerminalStopReason?: () => string | undefined;
+  /** Same-prompt checks can retain ordinary streaming instead of buffering a draft. */
+  deferTerminalDelivery?: boolean;
   /** Gate final block delivery/lifecycle after the natural answer is known. */
   onBeforeTerminalDelivery?: (event: {
     messages: AgentMessage[];
@@ -95,7 +105,11 @@ export type SubscribeEmbeddedAgentSessionParams = {
     isError: boolean;
     incompleteTerminalAssistant: boolean;
     hadDeterministicSideEffect: boolean;
-  }) => void | Promise<void | { suppressTerminalDelivery?: boolean }>;
+    hasPendingContinuation: boolean;
+  }) => void | Promise<void | {
+    suppressTerminalDelivery?: boolean;
+    continueCurrentTurn?: boolean;
+  }>;
   /** Best-effort hook invoked immediately before the terminal lifecycle event is emitted. */
   onBeforeLifecycleTerminal?: () => void | Promise<void>;
   enforceFinalTag?: boolean;
@@ -108,6 +122,11 @@ export type SubscribeEmbeddedAgentSessionParams = {
    */
   suppressLiveStreamOutput?: boolean;
   config?: OpenClawConfig;
+  /** Prepared endpoint ownership can differ from the assistant's provider route ID. */
+  providerOwner?: PreparedProviderFailoverOwner;
+  compactionCountOwner?: EmbeddedRunAttemptInternalParams["compactionCountOwner"];
+  onContextAccountingEvent?: EmbeddedRunAttemptInternalParams["onContextAccountingEvent"];
+  sessionPersistence?: EmbeddedRunAttemptParams["sessionPersistence"];
   sessionKey?: string;
   /** Current transport channel resolved for this run. */
   currentChannelId?: string;

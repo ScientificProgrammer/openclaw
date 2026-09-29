@@ -1,6 +1,24 @@
 // Tier-eval config compatibility migration and its scoped traversal helpers.
 import { ensureRecord, getRecord } from "../../../config/legacy.shared.js";
-import { deleteRetiredPath, visitChannelEntries } from "./legacy-config-record-shared.js";
+import { resolveExactExecModeFromPolicy } from "../../../infra/exec-approvals-core.js";
+import {
+  deleteRetiredPath,
+  visitAgentConfigScopes,
+  visitChannelEntries,
+} from "./legacy-config-record-shared.js";
+
+const TIER_EVAL_RETIRED_MEMORY_PATHS = [
+  ["memory", "search", "remote", "nonBatchConcurrency"],
+  ["memory", "search", "remote", "batch", "wait"],
+  ["memory", "search", "remote", "batch", "concurrency"],
+  ["memory", "search", "remote", "batch", "pollIntervalMs"],
+  ["memory", "search", "remote", "batch", "timeoutMinutes"],
+  ["memory", "search", "local", "contextSize"],
+  ["memory", "search", "local", "modelCacheDir"],
+  ["memory", "search", "store", "driver"],
+  ["memory", "search", "sync"],
+  ["memory", "search", "query", "hybrid"],
+] as const;
 
 const TIER_EVAL_RETIRED_ROOT_PATHS = [
   ["cloudWorkers", "profiles", "*", "lifetime"],
@@ -12,64 +30,18 @@ const TIER_EVAL_RETIRED_ROOT_PATHS = [
   ["logging", "redactSensitive"],
   ["commands", "useAccessGroups"],
   ["gateway", "controlUi", "allowInsecureAuth"],
-  ["memory", "search", "remote", "nonBatchConcurrency"],
-  ["memory", "search", "remote", "batch", "wait"],
-  ["memory", "search", "remote", "batch", "concurrency"],
-  ["memory", "search", "remote", "batch", "pollIntervalMs"],
-  ["memory", "search", "remote", "batch", "timeoutMinutes"],
-  ["memory", "search", "local", "contextSize"],
-  ["memory", "search", "local", "modelCacheDir"],
-  ["memory", "search", "store", "driver"],
-  ["memory", "search", "sync"],
-  ["memory", "search", "query", "hybrid"],
+  ...TIER_EVAL_RETIRED_MEMORY_PATHS,
 ] as const;
 
 const TIER_EVAL_RETIRED_AGENT_PATHS = [
   ["groupChat", "visibleReplies"],
-  ["memory", "search", "remote", "nonBatchConcurrency"],
-  ["memory", "search", "remote", "batch", "wait"],
-  ["memory", "search", "remote", "batch", "concurrency"],
-  ["memory", "search", "remote", "batch", "pollIntervalMs"],
-  ["memory", "search", "remote", "batch", "timeoutMinutes"],
-  ["memory", "search", "local", "contextSize"],
-  ["memory", "search", "local", "modelCacheDir"],
-  ["memory", "search", "store", "driver"],
-  ["memory", "search", "sync"],
-  ["memory", "search", "query", "hybrid"],
+  ...TIER_EVAL_RETIRED_MEMORY_PATHS,
   ["heartbeat", "ackMaxChars"],
   ["heartbeat", "includeReasoning"],
   ["heartbeat", "includeSystemPromptSection"],
   ["heartbeat", "skipWhenBusy"],
   ["heartbeat", "suppressToolErrorWarnings"],
 ] as const;
-
-export function visitAgentConfigScopes(
-  raw: Record<string, unknown>,
-  visitor: (scope: Record<string, unknown>, path: string) => void,
-): void {
-  const agents = getRecord(raw.agents);
-  const defaults = getRecord(agents?.defaults);
-  if (defaults) {
-    visitor(defaults, "agents.defaults");
-  }
-  const entries = getRecord(agents?.entries);
-  if (entries) {
-    for (const [agentId, value] of Object.entries(entries)) {
-      const entry = getRecord(value);
-      if (entry) {
-        visitor(entry, `agents.entries.${agentId}`);
-      }
-    }
-  }
-  if (Array.isArray(agents?.list)) {
-    agents.list.forEach((value, index) => {
-      const entry = getRecord(value);
-      if (entry) {
-        visitor(entry, `agents.list[${index}]`);
-      }
-    });
-  }
-}
 
 type LegacyExecPolicy = {
   security: "deny" | "allowlist" | "full";
@@ -117,31 +89,28 @@ function migrateExecMode(
     delete exec.ask;
     return;
   }
-  const securityValid =
-    exec.security === "deny" || exec.security === "allowlist" || exec.security === "full";
-  const askValid = exec.ask === "on-miss" || exec.ask === "always" || exec.ask === "off";
+  const ownSecurity =
+    exec.security === "deny" || exec.security === "allowlist" || exec.security === "full"
+      ? exec.security
+      : undefined;
+  const ownAsk =
+    exec.ask === "on-miss" || exec.ask === "always" || exec.ask === "off" ? exec.ask : undefined;
   if (
-    (Object.hasOwn(exec, "security") && !securityValid) ||
-    (Object.hasOwn(exec, "ask") && !askValid)
+    (Object.hasOwn(exec, "security") && !ownSecurity) ||
+    (Object.hasOwn(exec, "ask") && !ownAsk)
   ) {
     return;
   }
-  const security = securityValid ? exec.security : inheritedPolicy?.security;
-  const ask = askValid ? exec.ask : inheritedPolicy?.ask;
+  const security = ownSecurity ?? inheritedPolicy?.security;
+  const ask = ownAsk ?? inheritedPolicy?.ask;
   if (!security || !ask) {
     return;
   }
-  if (ask === "always" || (security === "full" && ask === "on-miss")) {
+  const mode = resolveExactExecModeFromPolicy({ security, ask });
+  if (!mode) {
     return;
   }
-  exec.mode =
-    security === "deny"
-      ? "deny"
-      : security === "allowlist" && ask === "off"
-        ? "allowlist"
-        : security === "full"
-          ? "full"
-          : "ask";
+  exec.mode = mode;
   changes.push(`Moved ${path}.tools.exec.security/ask → ${path}.tools.exec.mode.`);
   delete exec.security;
   delete exec.ask;
@@ -312,26 +281,18 @@ function migrateMessagesResponsePrefix(raw: Record<string, unknown>, changes: st
 }
 
 function migratePresenceEnabled(raw: Record<string, unknown>, changes: string[]): boolean {
-  let changed = false;
   const wideArea = getRecord(getRecord(raw.discovery)?.wideArea);
-  if (wideArea && Object.hasOwn(wideArea, "enabled")) {
-    if (
-      wideArea.enabled === false &&
-      typeof wideArea.domain === "string" &&
-      wideArea.domain.trim()
-    ) {
-      delete wideArea.enabled;
-      delete wideArea.domain;
-      changes.push(
-        "Removed disabled discovery.wideArea activation fields; domain presence now enables wide-area discovery.",
-      );
-      changed = true;
-    } else {
-      delete wideArea.enabled;
-      changed = true;
-    }
+  if (!wideArea || !Object.hasOwn(wideArea, "enabled")) {
+    return false;
   }
-  return changed;
+  if (wideArea.enabled === false && typeof wideArea.domain === "string" && wideArea.domain.trim()) {
+    delete wideArea.domain;
+    changes.push(
+      "Removed disabled discovery.wideArea activation fields; domain presence now enables wide-area discovery.",
+    );
+  }
+  delete wideArea.enabled;
+  return true;
 }
 
 function migrateWebEnabled(raw: Record<string, unknown>, changes: string[]): boolean {

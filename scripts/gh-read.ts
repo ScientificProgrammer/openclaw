@@ -5,7 +5,7 @@ import { pathToFileURL } from "node:url";
 import { readSecretFileSync } from "@openclaw/fs-safe/secret";
 import { expectDefined } from "../packages/normalization-core/src/expect.js";
 import { truncateUtf16Safe } from "../packages/normalization-core/src/utf16-slice.js";
-import { readBoundedResponseText } from "./lib/bounded-response.mjs";
+import { cancelResponseReaderSoon, readBoundedResponseText } from "./lib/bounded-response.mjs";
 import { parseStrictIntegerOption } from "./lib/dev-tooling-safety.ts";
 import {
   normalizeGitHubRepo as normalizeRepo,
@@ -144,24 +144,18 @@ function resolveRepo(args: string[]): string | null {
   }
 }
 
-function base64UrlEncode(value: string | Uint8Array) {
-  return Buffer.from(value)
-    .toString("base64")
-    .replace(/\+/g, "-")
-    .replace(/\//g, "_")
-    .replace(/=+$/g, "");
-}
-
 function createAppJwt(appId: string, privateKeyPem: string) {
   const now = Math.floor(Date.now() / 1000);
-  const header = base64UrlEncode(JSON.stringify({ alg: "RS256", typ: "JWT" }));
-  const payload = base64UrlEncode(JSON.stringify({ iat: now - 60, exp: now + 9 * 60, iss: appId }));
+  const header = Buffer.from(JSON.stringify({ alg: "RS256", typ: "JWT" })).toString("base64url");
+  const payload = Buffer.from(
+    JSON.stringify({ iat: now - 60, exp: now + 9 * 60, iss: appId }),
+  ).toString("base64url");
   const signingInput = `${header}.${payload}`;
   const signer = createSign("RSA-SHA256");
   signer.update(signingInput);
   signer.end();
   const signature = signer.sign(createPrivateKey(privateKeyPem));
-  return `${signingInput}.${base64UrlEncode(signature)}`;
+  return `${signingInput}.${signature.toString("base64url")}`;
 }
 
 async function withGitHubFetchTimeout<T>(
@@ -187,12 +181,6 @@ async function withGitHubFetchTimeout<T>(
   }
 }
 
-function cancelReaderSoon(reader: ReadableStreamDefaultReader<Uint8Array>): void {
-  void Promise.resolve()
-    .then(() => reader.cancel())
-    .catch(() => undefined);
-}
-
 async function readGitHubErrorChunk(
   reader: ReadableStreamDefaultReader<Uint8Array>,
   timeoutPromise: Promise<never> | undefined,
@@ -206,7 +194,7 @@ async function readGitHubErrorChunk(
     read,
     timeoutPromise.catch((error: unknown) => {
       markCanceled();
-      cancelReaderSoon(reader);
+      cancelResponseReaderSoon(reader);
       throw error;
     }),
   ]);
@@ -320,10 +308,9 @@ async function resolveInstallation(
   if (installationId) {
     return githubJson<InstallationResponse>(`/app/installations/${installationId}`, appJwt);
   }
-  fail(
+  return fail(
     `missing repo context; pass -R owner/repo, set GH_REPO, or set ${INSTALLATION_ID_ENV} for a direct installation lookup`,
   );
-  throw new Error("unreachable");
 }
 
 async function createInstallationToken(

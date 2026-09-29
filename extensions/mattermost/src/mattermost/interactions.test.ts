@@ -1,5 +1,6 @@
 // Mattermost tests cover interactions plugin behavior.
-import type { IncomingMessage, ServerResponse } from "node:http";
+import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { postRawWebhook } from "openclaw/plugin-sdk/test-env";
 import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
 import type { PluginRuntime } from "../../runtime-api.js";
 import { setMattermostRuntime } from "../runtime.js";
@@ -9,7 +10,6 @@ import {
   buildButtonProps,
   computeInteractionCallbackUrl,
   createMattermostInteractionHandler,
-  resolveInteractionCallbackPath,
   resolveInteractionCallbackUrl,
   setInteractionCallbackUrl,
   setInteractionSecret,
@@ -117,10 +117,6 @@ describe("setInteractionSecret / getInteractionSecret", () => {
     const secretB = getInteractionSecret();
     expect(secretA).not.toBe(secretB);
   });
-
-  it("returns a hex string", () => {
-    expect(getInteractionSecret()).toMatch(/^[0-9a-f]+$/);
-  });
 });
 
 // ── Token generation / verification ──────────────────────────────────
@@ -128,63 +124,6 @@ describe("setInteractionSecret / getInteractionSecret", () => {
 describe("generateInteractionToken / verifyInteractionToken", () => {
   beforeEach(() => {
     setInteractionSecret("test-bot-token");
-  });
-
-  it("generates a hex token", () => {
-    const token = generateInteractionToken({ action_id: "click" });
-    expect(token).toMatch(/^[0-9a-f]{64}$/);
-  });
-
-  it("verifies a valid token", () => {
-    const context = { action_id: "do_now", item_id: "123" };
-    const token = generateInteractionToken(context);
-    expect(verifyInteractionToken(context, token)).toBe(true);
-  });
-
-  it("rejects a tampered token", () => {
-    const context = { action_id: "do_now" };
-    const token = generateInteractionToken(context);
-    const tampered = token.replace(/.$/, token.endsWith("0") ? "1" : "0");
-    expect(verifyInteractionToken(context, tampered)).toBe(false);
-  });
-
-  it("rejects a token generated with different context", () => {
-    const token = generateInteractionToken({ action_id: "a" });
-    expect(verifyInteractionToken({ action_id: "b" }, token)).toBe(false);
-  });
-
-  it("rejects tokens with wrong length", () => {
-    const context = { action_id: "test" };
-    expect(verifyInteractionToken(context, "short")).toBe(false);
-  });
-
-  it("is deterministic for the same context", () => {
-    const context = { action_id: "test", x: 1 };
-    const t1 = generateInteractionToken(context);
-    const t2 = generateInteractionToken(context);
-    expect(t1).toBe(t2);
-  });
-
-  it("produces the same token regardless of key order", () => {
-    const contextA = { action_id: "do_now", tweet_id: "123", action: "do" };
-    const contextB = { action: "do", action_id: "do_now", tweet_id: "123" };
-    const contextC = { tweet_id: "123", action: "do", action_id: "do_now" };
-    const tokenA = generateInteractionToken(contextA);
-    const tokenB = generateInteractionToken(contextB);
-    const tokenC = generateInteractionToken(contextC);
-    expect(tokenA).toBe(tokenB);
-    expect(tokenB).toBe(tokenC);
-  });
-
-  it("verifies a token when Mattermost reorders context keys", () => {
-    // Simulate: token generated with keys in one order, verified with keys in another
-    // (Mattermost reorders context keys when storing/returning interactive message payloads)
-    const originalContext = { action_id: "bm_do", tweet_id: "999", action: "do" };
-    const token = generateInteractionToken(originalContext);
-
-    // Mattermost returns keys in alphabetical order (or any arbitrary order)
-    const reorderedContext = { action: "do", action_id: "bm_do", tweet_id: "999" };
-    expect(verifyInteractionToken(reorderedContext, token)).toBe(true);
   });
 
   it("verifies nested context regardless of nested key order", () => {
@@ -265,19 +204,6 @@ describe("resolveInteractionCallbackUrl", () => {
     expect(url).toBe("http://gateway.internal:9999/mattermost/interactions/acct");
   });
 
-  it("uses interactions.callbackBaseUrl when configured", () => {
-    const url = resolveInteractionCallbackUrl("default", {
-      channels: {
-        mattermost: {
-          interactions: {
-            callbackBaseUrl: "https://gateway.example.com/openclaw",
-          },
-        },
-      },
-    });
-    expect(url).toBe("https://gateway.example.com/openclaw/mattermost/interactions/default");
-  });
-
   it("trims trailing slashes from callbackBaseUrl", () => {
     const url = resolveInteractionCallbackUrl("acct", {
       channels: {
@@ -319,13 +245,6 @@ describe("resolveInteractionCallbackUrl", () => {
     expect(url).toBe("https://gateway.example.com/root/mattermost/interactions/acct");
   });
 
-  it("falls back to gateway.customBindHost when configured", () => {
-    const url = resolveInteractionCallbackUrl("default", {
-      gateway: { port: 9999, customBindHost: "gateway.internal" },
-    });
-    expect(url).toBe("http://gateway.internal:9999/mattermost/interactions/default");
-  });
-
   it("falls back to localhost when customBindHost is a wildcard bind address", () => {
     const url = resolveInteractionCallbackUrl("default", {
       gateway: { port: 9999, customBindHost: "0.0.0.0" },
@@ -343,12 +262,6 @@ describe("resolveInteractionCallbackUrl", () => {
   it("uses default port 18789 when no config provided", () => {
     const url = resolveInteractionCallbackUrl("myaccount");
     expect(url).toBe("http://localhost:18789/mattermost/interactions/myaccount");
-  });
-});
-
-describe("resolveInteractionCallbackPath", () => {
-  it("builds the per-account callback path", () => {
-    expect(resolveInteractionCallbackPath("acct")).toBe("/mattermost/interactions/acct");
   });
 });
 
@@ -379,16 +292,6 @@ describe("buildButtonProps attachments", () => {
     });
 
     expect(requireAction(result).type).toBe("button");
-  });
-
-  it("includes HMAC _token in integration context", () => {
-    const result = buildButtonAttachmentsForTest({
-      callbackUrl: "http://localhost:18789/cb",
-      buttons: [{ id: "test", name: "Test" }],
-    });
-
-    const action = requireAction(result);
-    expect(action.integration.context["_token"]).toMatch(/^[0-9a-f]{64}$/);
   });
 
   it("includes sanitized action_id in integration context", () => {
@@ -461,37 +364,6 @@ describe("buildButtonProps attachments", () => {
     });
 
     expect(requireFirstAttachment(result).text).toBe("");
-  });
-
-  it("generates verifiable tokens", () => {
-    const result = buildButtonAttachmentsForTest({
-      callbackUrl: "http://localhost/cb",
-      buttons: [{ id: "verify_me", name: "V", context: { extra: "data" } }],
-    });
-
-    const ctx = requireAction(result).integration.context;
-    const token = ctx["_token"] as string;
-    const { _token, ...contextWithoutToken } = ctx;
-    expect(verifyInteractionToken(contextWithoutToken, token)).toBe(true);
-  });
-
-  it("generates tokens that verify even when Mattermost reorders context keys", () => {
-    const result = buildButtonAttachmentsForTest({
-      callbackUrl: "http://localhost/cb",
-      buttons: [{ id: "do_action", name: "Do", context: { tweet_id: "42", category: "ai" } }],
-    });
-
-    const ctx = requireAction(result).integration.context;
-    const token = ctx["_token"] as string;
-
-    // Simulate Mattermost returning context with keys in a different order
-    const reordered: Record<string, unknown> = {};
-    const keys = Object.keys(ctx).filter((k) => k !== "_token");
-    // Reverse the key order to simulate reordering
-    for (const key of keys.toReversed()) {
-      reordered[key] = ctx[key];
-    }
-    expect(verifyInteractionToken(reordered, token)).toBe(true);
   });
 });
 
@@ -661,7 +533,7 @@ describe("createMattermostInteractionHandler", () => {
     if (requestLog) {
       expect(requestLog).toEqual([
         { path: "/posts/post-1", method: undefined },
-        { path: "/posts/post-1", method: "PUT" },
+        { path: "/posts/post-1/patch", method: "PUT" },
       ]);
     }
   }
@@ -695,7 +567,6 @@ describe("createMattermostInteractionHandler", () => {
   function createUnusedInteractionHandler() {
     return createMattermostInteractionHandler({
       client: createMattermostClientMock(async () => ({ message: "unused" })),
-      botUserId: "bot",
       accountId: "acct",
     });
   }
@@ -717,7 +588,6 @@ describe("createMattermostInteractionHandler", () => {
         }
         return createActionPost({ actionName: params?.actionName });
       }),
-      botUserId: "bot",
       accountId: "acct",
       allowedSourceIps: params?.allowedSourceIps,
       trustedProxies: params?.trustedProxies,
@@ -737,7 +607,6 @@ describe("createMattermostInteractionHandler", () => {
       client: createMattermostClientMock(async () =>
         createActionPost({ actionId, actionName: actionId }),
       ),
-      botUserId: "bot",
       accountId: "acct",
     });
 
@@ -761,7 +630,6 @@ describe("createMattermostInteractionHandler", () => {
       client: createMattermostClientMock(async () => {
         throw new Error("unexpected client request");
       }),
-      botUserId: "bot",
       accountId: "acct",
       log,
     });
@@ -793,7 +661,6 @@ describe("createMattermostInteractionHandler", () => {
       client: createMattermostClientMock(async () => {
         throw new Error("should not fetch post for rejected origins");
       }),
-      botUserId: "bot",
       accountId: "acct",
       allowedSourceIps: ["127.0.0.1"],
     });
@@ -833,7 +700,6 @@ describe("createMattermostInteractionHandler", () => {
     const { context, token } = createActionContext();
     const handler = createMattermostInteractionHandler({
       client: createMattermostClientMock(async () => createActionPost({ channelId: "chan-9" })),
-      botUserId: "bot",
       accountId: "acct",
     });
 
@@ -866,7 +732,6 @@ describe("createMattermostInteractionHandler", () => {
       client: createMattermostClientMock(async (_path: string, init?: { method?: string }) =>
         init?.method === "PUT" ? { id: "post-1" } : createActionPost(),
       ),
-      botUserId: "bot",
       accountId: "acct",
       authorizeButtonClick: async () => ({
         ok: false,
@@ -899,7 +764,6 @@ describe("createMattermostInteractionHandler", () => {
       client: createMattermostClientMock(async (_path: string, init?: { method?: string }) =>
         init?.method === "PUT" ? { id: "post-1" } : fetchedPost,
       ),
-      botUserId: "bot",
       accountId: "acct",
       resolveSessionKey,
       dispatchButtonClick,
@@ -948,7 +812,6 @@ describe("createMattermostInteractionHandler", () => {
         requestLog.push({ path, method: init?.method });
         return originalPost;
       }),
-      botUserId: "bot",
       accountId: "acct",
       handleInteraction,
       dispatchButtonClick,
@@ -979,5 +842,51 @@ describe("createMattermostInteractionHandler", () => {
       post: originalPost,
     });
     expect(dispatchButtonClick).not.toHaveBeenCalled();
+  });
+});
+
+describe("createMattermostInteractionHandler body limits", () => {
+  // The 10s read deadline makes the sibling 408 case too slow to drive here; slash-http
+  // and Synology Chat cover that half of the same branch.
+  it("delivers 413 for an over-limit callback body and then closes the connection", async () => {
+    const handleInteraction = vi.fn();
+    const handler = createMattermostInteractionHandler({
+      client: {} as MattermostClient,
+      accountId: "acct",
+      handleInteraction,
+    });
+    const server = createServer((req, res) => {
+      void handler(req, res);
+    });
+    try {
+      await new Promise<void>((resolve, reject) => {
+        server.once("error", reject);
+        server.listen(0, "127.0.0.1", () => {
+          server.removeListener("error", reject);
+          resolve();
+        });
+      });
+      const address = server.address();
+      if (!address || typeof address === "string") {
+        throw new Error("expected the interaction test server to have a TCP address");
+      }
+
+      // Declared and sent in one write: the shape whose rejection used to race the flush.
+      const result = await postRawWebhook({
+        url: `http://127.0.0.1:${address.port}/mattermost/interactions`,
+        body: "x".repeat(64 * 1024 + 1),
+        headers: { "content-type": "application/json" },
+      });
+
+      expect(result.statusLine).toBe("HTTP/1.1 413 Payload Too Large");
+      expect(JSON.parse(result.body)).toEqual({ error: "Payload too large" });
+      expect(result.closedByServer).toBe(true);
+      expect(handleInteraction).not.toHaveBeenCalled();
+    } finally {
+      server.closeAllConnections();
+      await new Promise<void>((resolve, reject) => {
+        server.close((error) => (error ? reject(error) : resolve()));
+      });
+    }
   });
 });

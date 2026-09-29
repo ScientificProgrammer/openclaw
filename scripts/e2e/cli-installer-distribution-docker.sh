@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# Bash 5.3+ can deadlock writing heredoc pipes on macOS before the reader starts.
+if [[ ${OSTYPE:-} == darwin* && $BASH != /bin/bash ]] && ((BASH_VERSINFO[0] > 5 || (BASH_VERSINFO[0] == 5 && BASH_VERSINFO[1] >= 3))); then
+  exec /bin/bash "$0" "$@"
+fi
 # Proves hosted npm installation plus dedicated-prefix source installation.
 set -euo pipefail
 
@@ -10,6 +14,7 @@ IMAGE_NAME="$(docker_e2e_resolve_image "openclaw-cli-installer-distribution:loca
 PACKAGE_TGZ="$(
   docker_e2e_prepare_package_tgz cli-installer-distribution "${OPENCLAW_CURRENT_PACKAGE_TGZ:-}"
 )"
+docker_e2e_package_mount_args "$PACKAGE_TGZ"
 HOSTED_PROOF_CONTAINER="openclaw-hosted-installer-proof-$$"
 SOURCE_PROOF_CONTAINER="openclaw-source-installer-proof-$$"
 SOURCE_BUNDLE="$(mktemp "${TMPDIR:-/tmp}/openclaw-source.XXXXXX.bundle")"
@@ -42,7 +47,7 @@ bash /tmp/openclaw-source/scripts/install-cli.sh \
   --version "$OPENCLAW_SOURCE_SHA" \
   --no-git-update \
   --prefix /tmp/openclaw-prefix \
-  --node-version 24.19.0 \
+  --node-version 24.21.0 \
   --no-onboard
 
 prefix_node=/tmp/openclaw-prefix/tools/node/bin/node
@@ -86,7 +91,7 @@ docker_e2e_docker_run_cmd run -d \
   -e HOME=/tmp/openclaw-hosted-home \
   -e OPENCLAW_NO_ONBOARD=1 \
   -e OPENCLAW_NO_PROMPT=1 \
-  -v "$PACKAGE_TGZ:/tmp/openclaw-current.tgz:ro" \
+  "${DOCKER_E2E_PACKAGE_ARGS[@]}" \
   -v "$SOURCE_ROOT/scripts/install.sh:/tmp/install.sh:ro" \
   "$IMAGE_NAME" \
   bash -lc '
@@ -129,6 +134,7 @@ docker_e2e_docker_run_cmd run -d \
   "$IMAGE_NAME" \
   bash -lc '
     set -euo pipefail
+    rm -f -- /node_modules
     apt-get update
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends curl
     rm -rf /var/lib/apt/lists/*
@@ -143,23 +149,8 @@ docker_e2e_docker_run_cmd run -d \
       bash /tmp/source-proof.sh
   ' >/dev/null
 
-wait_for_proof() {
-  local container_name="$1"
-  for _ in $(seq 1 1200); do
-    if docker exec "$container_name" test -f /tmp/openclaw-proof-ready; then
-      docker logs "$container_name"
-      return 0
-    fi
-    if [ "$(docker inspect --format '{{.State.Running}}' "$container_name")" != "true" ]; then
-      docker logs "$container_name" >&2
-      return 1
-    fi
-    sleep 1
-  done
-  docker logs "$container_name" >&2
-  return 1
-}
-
-wait_for_proof "$HOSTED_PROOF_CONTAINER"
-wait_for_proof "$SOURCE_PROOF_CONTAINER"
+docker_e2e_wait_for_proof "$HOSTED_PROOF_CONTAINER" 1200
+docker logs "$HOSTED_PROOF_CONTAINER"
+docker_e2e_wait_for_proof "$SOURCE_PROOF_CONTAINER" 1200
+docker logs "$SOURCE_PROOF_CONTAINER"
 echo "CLI installer distribution proof passed."

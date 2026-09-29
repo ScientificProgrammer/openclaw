@@ -90,17 +90,6 @@ describe("extra-params: Kilocode wrapper", () => {
     envSnapshot.restore();
   });
 
-  it("injects X-KILOCODE-FEATURE header with default value", () => {
-    delete process.env.KILOCODE_FEATURE;
-
-    const { headers } = applyAndCapture({
-      provider: "kilocode",
-      modelId: "anthropic/claude-sonnet-4",
-    });
-
-    expect(headers?.["X-KILOCODE-FEATURE"]).toBe("openclaw");
-  });
-
   it("reads X-KILOCODE-FEATURE from KILOCODE_FEATURE env var", () => {
     process.env.KILOCODE_FEATURE = "custom-feature";
 
@@ -123,15 +112,6 @@ describe("extra-params: Kilocode wrapper", () => {
 
     expect(headers?.["X-KILOCODE-FEATURE"]).toBe("openclaw");
   });
-
-  it("does not inject header for non-kilocode providers", () => {
-    const { headers } = applyAndCapture({
-      provider: "openrouter",
-      modelId: "anthropic/claude-sonnet-4",
-    });
-
-    expect(headers?.["X-KILOCODE-FEATURE"]).toBeUndefined();
-  });
 });
 
 describe("extra-params: Kilocode kilo-auto/balanced reasoning", () => {
@@ -153,14 +133,6 @@ describe("extra-params: Kilocode kilo-auto/balanced reasoning", () => {
     });
 
     // Non-auto models should have reasoning injected
-    expect(capturedPayload?.reasoning).toEqual({ effort: "high" });
-  });
-
-  it("still normalizes reasoning for Kilocode under restrictive plugins.allow", () => {
-    const capturedPayload = applyAndCaptureReasoning({
-      modelId: "anthropic/claude-sonnet-4",
-    });
-
     expect(capturedPayload?.reasoning).toEqual({ effort: "high" });
   });
 

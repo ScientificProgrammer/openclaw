@@ -1,6 +1,5 @@
-// Provider operation retry helpers run retryable provider operations with backoff.
 import { sleepWithAbort } from "../infra/backoff.js";
-import { formatErrorMessage } from "../infra/errors.js";
+import { formatErrorMessage, readErrorCause } from "../infra/errors.js";
 import { hasRetryableConnectionErrorCode } from "../infra/retryable-network-errors.js";
 
 export type ProviderOperationRetryStage = "read" | "poll" | "download" | "create";
@@ -47,17 +46,11 @@ export function resolveTransientProviderRetryOptions(
   return options;
 }
 
-function defaultTransientProviderRetryForStage(
-  stage: ProviderOperationRetryStage,
-): TransientProviderRetryConfig | undefined {
-  return stage === "create" ? undefined : true;
-}
-
 export function providerOperationRetryConfig(
   stage: ProviderOperationRetryStage,
   options?: TransientProviderRetryConfig,
 ): TransientProviderRetryConfig | undefined {
-  return options ?? defaultTransientProviderRetryForStage(stage);
+  return options ?? (stage === "create" ? undefined : true);
 }
 
 function readErrorName(error: unknown): string | undefined {
@@ -95,13 +88,6 @@ function readErrorCode(error: unknown): string | undefined {
   }
   const code = (error as { code?: unknown }).code;
   return typeof code === "string" ? code : undefined;
-}
-
-function readErrorCause(error: unknown): unknown {
-  if (typeof error !== "object" || error === null) {
-    return undefined;
-  }
-  return (error as { cause?: unknown }).cause;
 }
 
 // Provider reads get one bounded retry for negative DNS responses. Gateway
@@ -179,13 +165,7 @@ function isTransientProviderOperationError(error: unknown, message: string): boo
   if (hasTransientNetworkSignal(error, message)) {
     return true;
   }
-  if (hasTimeoutSignal(error, message)) {
-    return true;
-  }
-  if (/\bfetch failed\b/i.test(message)) {
-    return hasTransientNetworkSignal(error, message);
-  }
-  return false;
+  return hasTimeoutSignal(error, message);
 }
 
 export function resolveTransientProviderAttempts(options?: TransientProviderRetryOptions): number {

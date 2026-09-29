@@ -1,6 +1,8 @@
 // Builds deterministic metadata scopes for startup planning.
+import { getConfiguredDecisionProviderIds } from "../agents/decision-model-setting.js";
 import type { AmbientEnvTriggerPolicy } from "../channels/config-presence.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
+import { normalizePluginsConfigWithResolverCore } from "./config-normalization-shared.js";
 import { addRequiredAgentHarnessPluginIds } from "./gateway-startup-plugin-activation.js";
 import {
   addConfiguredActivationPathPluginIds,
@@ -8,15 +10,13 @@ import {
   addPluginConfigEntryIds,
   collectConfiguredProviderIds,
   collectConfiguredStartupChannelIds,
-  collectValidationConfiguredProviderIds,
+  collectValidationConfiguredRefs,
   collectValidationConfiguredShorthandModelIds,
-  normalizePluginsConfigForInstalledIndex,
   readStartupBundledDiscoveryMode,
   resolveAuthorizedGatewayStartupDreamingPluginIds,
   resolveMemorySlotStartupPluginId,
 } from "./gateway-startup-plugin-config.js";
 import { sortUniquePluginIds } from "./gateway-startup-plugin-contracts.js";
-import { hashJson } from "./installed-plugin-index-hash.js";
 import { createInstalledPluginIndexScopeLookup } from "./installed-plugin-index-scope-lookup.js";
 import type { InstalledPluginIndex } from "./installed-plugin-index.js";
 import type { PluginMetadataSnapshotPluginIdScope } from "./plugin-metadata-snapshot.types.js";
@@ -34,11 +34,17 @@ export function resolveGatewayStartupMetadataPluginIds(params: {
 }): string[] | undefined {
   const lookup = createInstalledPluginIndexScopeLookup(params.index);
   const activationSourceConfig = params.activationSourceConfig ?? params.config;
-  const pluginsConfig = normalizePluginsConfigForInstalledIndex(params.config.plugins, lookup);
-  const activationSourcePlugins = normalizePluginsConfigForInstalledIndex(
-    activationSourceConfig.plugins,
-    lookup,
+  const sameConfig = activationSourceConfig === params.config;
+  const pluginsConfig = normalizePluginsConfigWithResolverCore(
+    params.config.plugins,
+    lookup.normalizePluginId,
   );
+  const activationSourcePlugins = sameConfig
+    ? pluginsConfig
+    : normalizePluginsConfigWithResolverCore(
+        activationSourceConfig.plugins,
+        lookup.normalizePluginId,
+      );
   if (!pluginsConfig.enabled || !activationSourcePlugins.enabled) {
     return [];
   }
@@ -52,9 +58,13 @@ export function resolveGatewayStartupMetadataPluginIds(params: {
     return undefined;
   }
 
-  const scope = new Set<string>([...pluginsConfig.allow, ...activationSourcePlugins.allow]);
-  addPluginConfigEntryIds(scope, pluginsConfig);
-  addPluginConfigEntryIds(scope, activationSourcePlugins);
+  // Facts belong to this invocation; raw activation and effective configs can differ.
+  const configs = sameConfig ? [params.config] : [params.config, activationSourceConfig];
+  const pluginConfigs = sameConfig ? [pluginsConfig] : [pluginsConfig, activationSourcePlugins];
+  const scope = new Set(pluginConfigs.flatMap((plugins) => plugins.allow));
+  for (const plugins of pluginConfigs) {
+    addPluginConfigEntryIds(scope, plugins);
+  }
 
   const memorySlotStartupPluginId = resolveMemorySlotStartupPluginId({
     activationSourceConfig,
@@ -89,8 +99,7 @@ export function resolveGatewayStartupMetadataPluginIds(params: {
   });
 
   const configuredChannelIds = collectConfiguredStartupChannelIds({
-    config: params.config,
-    activationSourceConfig,
+    configs,
     env: params.env,
     ambientEnvTriggers: params.ambientEnvTriggers,
     includePersistedAuthState: false,
@@ -100,20 +109,25 @@ export function resolveGatewayStartupMetadataPluginIds(params: {
   }
   lookup.addDirectChannelOwners(scope, configuredChannelIds);
 
+  const providerIds = configs.flatMap(collectConfiguredProviderIds);
+  const validationRefs = configs.map(collectValidationConfiguredRefs);
   const configuredProviderIds = sortUniquePluginIds([
-    ...collectConfiguredProviderIds(params.config),
-    ...collectConfiguredProviderIds(activationSourceConfig),
-    ...collectValidationConfiguredProviderIds(params.config),
-    ...collectValidationConfiguredProviderIds(activationSourceConfig),
+    ...providerIds,
+    ...validationRefs.flatMap((refs) => refs.providerIds),
   ]);
   if (!lookup.canResolveDirectProviderIds(configuredProviderIds, scope)) {
     return undefined;
   }
   lookup.addDirectProviderOwners(scope, configuredProviderIds);
 
+  const decisionProviderIds = configs.flatMap(getConfiguredDecisionProviderIds);
+  if (!lookup.hasProviderContributionOwners(decisionProviderIds)) {
+    return undefined;
+  }
+  lookup.addProviderContributionOwners(scope, decisionProviderIds);
+
   const workerProviderIds = normalizeWorkerProviderIds([
-    ...collectConfiguredWorkerProviderIds(params.config),
-    ...collectConfiguredWorkerProviderIds(activationSourceConfig),
+    ...configs.flatMap(collectConfiguredWorkerProviderIds),
     ...(params.workerProviderIds ?? []),
   ]);
   if (!lookup.hasProviderContributionOwners(workerProviderIds)) {
@@ -121,10 +135,11 @@ export function resolveGatewayStartupMetadataPluginIds(params: {
   }
   lookup.addProviderContributionOwners(scope, workerProviderIds);
 
-  const configuredShorthandModelIds = sortUniquePluginIds([
-    ...collectValidationConfiguredShorthandModelIds(params.config),
-    ...collectValidationConfiguredShorthandModelIds(activationSourceConfig),
-  ]);
+  const configuredShorthandModelIds = sortUniquePluginIds(
+    validationRefs.flatMap((refs) =>
+      collectValidationConfiguredShorthandModelIds(refs.shorthandModelRefs),
+    ),
+  );
   if (!lookup.hasShorthandModelOwners(configuredShorthandModelIds)) {
     return undefined;
   }
@@ -143,18 +158,15 @@ export function resolveGatewayStartupMetadataPluginIds(params: {
     platform: params.platform,
   });
 
-  const deniedPluginIds = new Set([...pluginsConfig.deny, ...activationSourcePlugins.deny]);
+  const deniedPluginIds = new Set(pluginConfigs.flatMap((plugins) => plugins.deny));
   for (const pluginId of deniedPluginIds) {
     scope.delete(pluginId);
   }
-  for (const [pluginId, entry] of Object.entries(pluginsConfig.entries)) {
-    if (entry?.enabled === false) {
-      scope.delete(pluginId);
-    }
-  }
-  for (const [pluginId, entry] of Object.entries(activationSourcePlugins.entries)) {
-    if (entry?.enabled === false) {
-      scope.delete(pluginId);
+  for (const plugins of pluginConfigs) {
+    for (const [pluginId, entry] of Object.entries(plugins.entries)) {
+      if (entry?.enabled === false) {
+        scope.delete(pluginId);
+      }
     }
   }
   if (!lookup.hasInstalledPluginIds(scope)) {
@@ -171,24 +183,8 @@ export function createGatewayStartupMetadataPluginIdScope(params: {
   platform?: NodeJS.Platform;
   ambientEnvTriggers?: AmbientEnvTriggerPolicy;
 }): PluginMetadataSnapshotPluginIdScope {
-  const configuredChannelIds = collectConfiguredStartupChannelIds({
-    config: params.config,
-    activationSourceConfig: params.activationSourceConfig ?? params.config,
-    env: params.env,
-    ambientEnvTriggers: params.ambientEnvTriggers,
-    includePersistedAuthState: false,
-  });
   const workerProviderIds = normalizeWorkerProviderIds(params.workerProviderIds ?? []);
   return {
-    key: hashJson({
-      kind: "gateway-startup",
-      config: params.config,
-      activationSourceConfig: params.activationSourceConfig ?? null,
-      configuredChannelIds,
-      workerProviderIds,
-      platform: params.platform ?? null,
-      ambientEnvTriggers: params.ambientEnvTriggers ?? "allow",
-    }),
     resolve: ({ index }) =>
       resolveGatewayStartupMetadataPluginIds({
         config: params.config,

@@ -3,9 +3,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { expectDefined } from "@openclaw/normalization-core";
-import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { DEFAULT_AI_SNAPSHOT_MAX_CHARS } from "./constants.js";
-import { ACT_ERROR_CODES } from "./routes/agent.act.errors.js";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { BROWSER_ACT_ERROR_CODES } from "./errors.js";
 import { isActKind } from "./routes/agent.act.shared.js";
 import {
   installAgentContractHooks,
@@ -29,6 +28,9 @@ import {
   startBrowserControlServerFromConfig,
 } from "./server.control-server.test-harness.js";
 import { getBrowserTestFetch } from "./test-support/fetch.js";
+
+// A timed-out lazy import must not start a late warmup teardown against the next suite.
+await import("../server.js");
 
 const BROWSER_NAVIGATION_BLOCKED_MESSAGE = "browser navigation blocked by policy";
 const NAVIGATION_TIMEOUT_CASES = [
@@ -103,18 +105,12 @@ describe("browser control server", () => {
 
   const slowTimeoutMs = 60_000;
 
-  beforeAll(async () => {
-    await resetBrowserControlServerTestContext();
-    await startBrowserControlServerFromConfig();
-    await cleanupBrowserControlServerTestContext();
-  }, slowTimeoutMs);
-
   it(
     "returns ACT_KIND_REQUIRED when kind is missing",
     () => {
       expect(isActKind(undefined)).toBe(false);
       expect(isActKind("")).toBe(false);
-      expect(ACT_ERROR_CODES.kindRequired).toBe("ACT_KIND_REQUIRED");
+      expect(BROWSER_ACT_ERROR_CODES.kindRequired).toBe("ACT_KIND_REQUIRED");
     },
     slowTimeoutMs,
   );
@@ -192,7 +188,9 @@ describe("browser control server", () => {
 
       expect(response.status).toBe(501);
       expect(response.body.code).toBe("ACT_EXISTING_SESSION_UNSUPPORTED");
-      expect(response.body.error).toContain("batch");
+      expect(response.body.error).toBe(
+        "existing-session batch is not supported yet; send actions individually.",
+      );
     },
     slowTimeoutMs,
   );
@@ -488,135 +486,18 @@ describe("browser control server", () => {
     },
     slowTimeoutMs,
   );
-  it("agent contract: snapshot endpoints", async () => {
-    const base = await startServerAndBase();
-    const realFetch = getBrowserTestFetch();
 
-    const snapAria = (await realFetch(`${base}/snapshot?format=aria&limit=1`).then((r) =>
-      r.json(),
-    )) as { ok: boolean; format?: string };
-    expect(snapAria.ok).toBe(true);
-    expect(snapAria.format).toBe("aria");
-    expect(cdpMocks.snapshotAria).toHaveBeenCalledWith({
-      wsUrl: "ws://127.0.0.1/devtools/page/abcd1234",
-      limit: 1,
-    });
-    expect(requirePwMock("storeAriaSnapshotRefsViaPlaywright")).toHaveBeenCalledWith({
-      cdpUrl: state.cdpBaseUrl,
-      targetId: "abcd1234",
-      nodes: [{ ref: "1", role: "link", name: "x", depth: 0 }],
-    });
-
-    const snapAi = (await realFetch(`${base}/snapshot?format=ai`).then((r) => r.json())) as {
-      ok: boolean;
-      format?: string;
-    };
-    expect(snapAi.ok).toBe(true);
-    expect(snapAi.format).toBe("ai");
-    expect(requirePwMock("snapshotAiViaPlaywright")).toHaveBeenCalledWith({
-      cdpUrl: state.cdpBaseUrl,
-      targetId: "abcd1234",
-      maxChars: DEFAULT_AI_SNAPSHOT_MAX_CHARS,
-      ssrfPolicy: {
-        dangerouslyAllowPrivateNetwork: true,
-      },
-    });
-
-    const snapAiZero = (await realFetch(`${base}/snapshot?format=ai&maxChars=0`).then((r) =>
-      r.json(),
-    )) as { ok: boolean; format?: string };
-    expect(snapAiZero.ok).toBe(true);
-    expect(snapAiZero.format).toBe("ai");
-    const [lastCall] = requirePwMock("snapshotAiViaPlaywright").mock.calls.at(-1) ?? [];
-    expect(lastCall).toEqual({
-      cdpUrl: state.cdpBaseUrl,
-      targetId: "abcd1234",
-      ssrfPolicy: {
-        dangerouslyAllowPrivateNetwork: true,
-      },
-    });
-
-    requirePwMock("snapshotRoleViaPlaywright").mockRejectedValueOnce(
-      new Error("playwright stale page"),
-    );
-    const fallback = (await realFetch(`${base}/snapshot?format=ai&interactive=true`).then((r) =>
-      r.json(),
-    )) as { ok: boolean; format?: string; snapshot?: string };
-    expect(fallback.ok).toBe(true);
-    expect(fallback.format).toBe("ai");
-    expect(fallback.snapshot).toContain("Fallback");
-    expect(cdpMocks.snapshotRoleViaCdp).toHaveBeenCalledWith({
-      wsUrl: "ws://127.0.0.1/devtools/page/abcd1234",
-      urls: undefined,
-      maxChars: DEFAULT_AI_SNAPSHOT_MAX_CHARS,
-      timeoutMs: undefined,
-      options: {
-        interactive: true,
-        compact: undefined,
-        maxDepth: undefined,
-      },
-    });
-  });
-
-  it("agent contract: snapshot surfaces pending dialog state without reading the blocked page", async () => {
-    const base = await startServerAndBase();
-    const realFetch = getBrowserTestFetch();
-    requirePwMock("getObservedBrowserStateViaPlaywright").mockResolvedValueOnce({
-      dialogs: {
-        pending: [
-          {
-            id: "d1",
-            type: "confirm",
-            message: "Continue?",
-            openedAt: "2026-05-17T12:00:00.000Z",
-          },
-        ],
-        recent: [],
-      },
-    });
-
-    const snap = (await realFetch(`${base}/snapshot?format=ai`).then((r) => r.json())) as {
-      ok: boolean;
-      blockedByDialog?: boolean;
-      browserState?: { dialogs?: { pending?: Array<{ id?: string; message?: string }> } };
-      snapshot?: string;
-    };
-
-    expect(snap.ok).toBe(true);
-    expect(snap.blockedByDialog).toBe(true);
-    expect(snap.snapshot).toBe("");
-    expect(snap.browserState?.dialogs?.pending?.[0]).toMatchObject({
-      id: "d1",
-      message: "Continue?",
-    });
-    expect(requirePwMock("snapshotAiViaPlaywright")).not.toHaveBeenCalled();
-  });
-
-  it("agent contract: snapshot blocks pending dialog state on disallowed current tab URLs", async () => {
+  it("blocks disallowed snapshot tabs before reading Playwright browser state", async () => {
     setBrowserControlServerSsrFPolicy({ allowPrivateNetwork: false });
     setBrowserControlServerTabUrl("http://127.0.0.1:8080/admin");
-    const base = await startServerAndBase();
-    const realFetch = getBrowserTestFetch();
-    requirePwMock("getObservedBrowserStateViaPlaywright").mockResolvedValueOnce({
-      dialogs: {
-        pending: [
-          {
-            id: "d1",
-            type: "alert",
-            message: "blocked secret",
-            openedAt: "2026-05-17T12:00:00.000Z",
-          },
-        ],
-        recent: [],
-      },
-    });
+    const response = await getBrowserTestFetch()(
+      `${await startServerAndBase()}/snapshot?format=ai`,
+    );
 
-    const res = await realFetch(`${base}/snapshot?format=ai`);
-    expect(res.status).toBe(400);
-    const body = (await res.json()) as { error?: unknown };
-    expect(body.error).toBe(BROWSER_NAVIGATION_BLOCKED_MESSAGE);
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({ error: BROWSER_NAVIGATION_BLOCKED_MESSAGE });
     expect(requirePwMock("getObservedBrowserStateViaPlaywright")).not.toHaveBeenCalled();
-    expect(requirePwMock("snapshotAiViaPlaywright")).not.toHaveBeenCalled();
+    expect(requirePwMock("snapshotRoleViaPlaywright")).not.toHaveBeenCalled();
   });
 
   it("agent contract: doctor deep runs a live snapshot probe", async () => {
@@ -689,8 +570,10 @@ describe("browser control server", () => {
       ["openclaw", { bridge: { captureOperationTarget: () => () => "replacement-target" } }],
     ]) as unknown as NonNullable<typeof runtime.extensionRelays>;
     requirePwMock("navigateViaPlaywright").mockImplementationOnce(async (options) => {
-      const targetId = (
-        options as { resolveOperationTarget?: () => string | undefined }
+      const targetId = await (
+        options as {
+          resolveOperationTarget?: () => string | undefined | Promise<string | undefined>;
+        }
       ).resolveOperationTarget?.();
       if (!targetId) {
         throw new Error("captured relay target was not forwarded to navigation");

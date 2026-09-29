@@ -8,7 +8,13 @@ import {
 } from "../../agents/admitted-run-context.js";
 import { runEmbeddedAgent as runEmbeddedAgentCore } from "../../agents/embedded-agent.js";
 import { recordRuntimeActionDecision } from "../../audit/runtime-action-decision.js";
+import {
+  getReplyPayloadMetadata,
+  isFastModeAutoProgressPayload,
+  isReplyPayloadTerminalContent,
+} from "../../auto-reply/reply-payload.js";
 import { getRuntimeConfig } from "../../config/config.js";
+import { resolveSendableOutboundReplyParts } from "../../infra/outbound/reply-payload-parts.js";
 import { getPluginRuntimeGatewayRequestScope } from "./gateway-request-scope.js";
 import type { PluginRuntime } from "./types.js";
 
@@ -22,16 +28,21 @@ export const runPluginEmbeddedAgent: PluginRuntime["agent"]["runEmbeddedAgent"] 
   if (
     "admittedRunContext" in params ||
     "preparedRunAdmission" in params ||
+    "compactionCountOwner" in params ||
+    "onCompactionAccounting" in params ||
+    "onContextAccountingEvent" in params ||
     "onDeferredLifecycleOwner" in params ||
-    "onDeferredLifecycleAbort" in params
+    "onDeferredLifecycleAbort" in params ||
+    "onRetryWait" in params
   ) {
     throw new Error("Plugin embedded-agent execution cannot supply host run authority.");
   }
   params.abortSignal?.throwIfAborted();
   const decisionOccurrenceId = randomUUID();
   let admittedRunContext: AdmittedRunContext | undefined;
+  const config = params.config ?? getRuntimeConfig();
   const preparedRunAdmission = prepareAgentRunAdmission({
-    cfg: params.config ?? getRuntimeConfig(),
+    cfg: config,
     operationalRunInstance: createOperationalRunInstanceRef(params.runId),
     facts: {
       runId: params.runId,
@@ -63,9 +74,12 @@ export const runPluginEmbeddedAgent: PluginRuntime["agent"]["runEmbeddedAgent"] 
     },
   });
   let closed = false;
+  let legacyReplyCustodyIndex = -1;
+  let minimumReplyMessageIndex = 0;
   const close = () => {
     if (!closed) {
       closed = true;
+      legacyReplyCustodyIndex = -1;
       preparedRunAdmission.close();
     }
   };
@@ -74,7 +88,34 @@ export const runPluginEmbeddedAgent: PluginRuntime["agent"]["runEmbeddedAgent"] 
   params.abortSignal?.addEventListener("abort", close, { once: true });
   try {
     params.abortSignal?.throwIfAborted();
-    const result = await runEmbeddedAgentCore({ ...params, preparedRunAdmission });
+    const { githubPublicationAvailable: _, ...runParams } = params;
+    const onBlockReply = runParams.onBlockReply;
+    if (onBlockReply && !runParams.resolveReplyDelivery) {
+      // Shipped block callbacks own normal channel messages, unlike partial
+      // previews. Handoff retains caller custody, not proof of delivery: a
+      // callback can throw after sending. Only its observer can prove no send.
+      runParams.onBlockReply = async (payload, context) => {
+        const messageIndex =
+          context?.assistantMessageIndex ??
+          getReplyPayloadMetadata(payload)?.assistantMessageIndex ??
+          0;
+        const retainsCustody =
+          isReplyPayloadTerminalContent(payload) &&
+          !isFastModeAutoProgressPayload(payload) &&
+          resolveSendableOutboundReplyParts(payload).hasContent;
+        if (!closed && retainsCustody && messageIndex >= minimumReplyMessageIndex) {
+          legacyReplyCustodyIndex = Math.max(legacyReplyCustodyIndex, messageIndex);
+        }
+        await onBlockReply(payload, context);
+      };
+      runParams.resolveReplyDelivery = async (minimumAssistantMessageIndex = 0) => {
+        minimumReplyMessageIndex = Math.max(minimumReplyMessageIndex, minimumAssistantMessageIndex);
+        return !closed && legacyReplyCustodyIndex >= minimumReplyMessageIndex
+          ? "pending"
+          : "missing";
+      };
+    }
+    const result = await runEmbeddedAgentCore({ ...runParams, config, preparedRunAdmission });
     if (admittedRunContext && getAdmittedRunDelegatedAuthority(admittedRunContext)) {
       recordRuntimeActionDecision({
         token: admittedRunContext.executionIdentityToken,

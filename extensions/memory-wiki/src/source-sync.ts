@@ -1,6 +1,5 @@
-// Memory Wiki plugin module implements source sync behavior.
 import type { OpenClawConfig } from "../api.js";
-import { syncMemoryWikiBridgeSources, type BridgeMemoryWikiResult } from "./bridge.js";
+import { syncMemoryWikiBridgeSources } from "./bridge.js";
 import {
   refreshMemoryWikiIndexesAfterImport,
   type RefreshMemoryWikiIndexesResult,
@@ -10,7 +9,9 @@ import {
   resolveMemoryWikiVaultMutationKey,
   withMemoryWikiVaultMutation,
 } from "./mutation-coordinator.js";
+import { emptySourceImportResult, type BridgeMemoryWikiResult } from "./source-import.js";
 import { syncMemoryWikiUnsafeLocalSources } from "./unsafe-local.js";
+import { initializeMemoryWikiVault } from "./vault.js";
 
 export type MemoryWikiImportedSourceSyncResult = BridgeMemoryWikiResult & {
   indexesRefreshed: boolean;
@@ -21,11 +22,13 @@ export type MemoryWikiImportedSourceSyncResult = BridgeMemoryWikiResult & {
 type SyncMemoryWikiImportedSourcesParams = {
   config: ResolvedMemoryWikiConfig;
   appConfig?: OpenClawConfig;
+  signal?: AbortSignal;
 };
 
 type ActiveImportedSourceSync = {
   requestKey: string;
   appConfig?: OpenClawConfig;
+  signal?: AbortSignal;
   promise: Promise<MemoryWikiImportedSourceSyncResult>;
 };
 
@@ -47,25 +50,27 @@ function resolveImportedSourceSyncRequestKey(
 async function syncMemoryWikiImportedSourcesOnce(
   params: SyncMemoryWikiImportedSourcesParams,
 ): Promise<MemoryWikiImportedSourceSyncResult> {
+  params.signal?.throwIfAborted();
   let syncResult: BridgeMemoryWikiResult;
   if (params.config.vaultMode === "bridge") {
     syncResult = await syncMemoryWikiBridgeSources(params);
   } else if (params.config.vaultMode === "unsafe-local") {
-    syncResult = await syncMemoryWikiUnsafeLocalSources(params.config);
+    syncResult = params.signal
+      ? await syncMemoryWikiUnsafeLocalSources(params.config, { signal: params.signal })
+      : await syncMemoryWikiUnsafeLocalSources(params.config);
   } else {
-    syncResult = {
-      importedCount: 0,
-      updatedCount: 0,
-      skippedCount: 0,
-      removedCount: 0,
-      artifactCount: 0,
-      workspaces: 0,
-      pagePaths: [],
-    };
+    // Local mode has no importer to activate the cache before readiness is checked.
+    await initializeMemoryWikiVault(
+      params.config,
+      params.signal ? { signal: params.signal } : undefined,
+    );
+    syncResult = emptySourceImportResult();
   }
+  params.signal?.throwIfAborted();
   const refreshResult = await refreshMemoryWikiIndexesAfterImport({
     config: params.config,
     syncResult,
+    ...(params.signal ? { signal: params.signal } : {}),
   });
   return {
     ...syncResult,
@@ -82,7 +87,10 @@ export async function syncMemoryWikiImportedSources(
   const requestKey = resolveImportedSourceSyncRequestKey(params, vaultKey);
   const active = activeImportedSourceSyncs.get(vaultKey) ?? [];
   const matching = active.find(
-    (entry) => entry.requestKey === requestKey && entry.appConfig === params.appConfig,
+    (entry) =>
+      entry.requestKey === requestKey &&
+      entry.appConfig === params.appConfig &&
+      entry.signal === params.signal,
   );
   if (matching) {
     return await matching.promise;
@@ -90,12 +98,14 @@ export async function syncMemoryWikiImportedSources(
 
   // Equivalent polls share the whole source-and-index flight. Different
   // snapshots still queue on the common vault transaction boundary.
-  const promise = withMemoryWikiVaultMutation(params.config.vault.path, () =>
-    syncMemoryWikiImportedSourcesOnce(params),
-  );
+  const promise = withMemoryWikiVaultMutation(params.config.vault.path, () => {
+    params.signal?.throwIfAborted();
+    return syncMemoryWikiImportedSourcesOnce(params);
+  });
   const entry: ActiveImportedSourceSync = {
     requestKey,
     ...(params.appConfig ? { appConfig: params.appConfig } : {}),
+    ...(params.signal ? { signal: params.signal } : {}),
     promise,
   };
   active.push(entry);
@@ -112,4 +122,12 @@ export async function syncMemoryWikiImportedSources(
       activeImportedSourceSyncs.delete(vaultKey);
     }
   }
+}
+
+export async function waitForMemoryWikiImportedSourceSyncs(): Promise<void> {
+  await Promise.allSettled(
+    [...activeImportedSourceSyncs.values()].flatMap((entries) =>
+      entries.map((entry) => entry.promise),
+    ),
+  );
 }

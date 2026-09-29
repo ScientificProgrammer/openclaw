@@ -123,7 +123,7 @@ enum QuickChatFocusedTextCollector {
             // repeated lines) is real document content and must be preserved.
             var ownTexts: [String] = []
             for rawCandidate in [next.node.stringValue(), next.node.computedName()] {
-                guard let candidate = Self.normalized(rawCandidate),
+                guard let candidate = rawCandidate?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty,
                       !next.parentTexts.contains(candidate),
                       !ownTexts.contains(candidate)
                 else { continue }
@@ -155,7 +155,7 @@ enum QuickChatFocusedTextCollector {
             if childResult.wasTruncated {
                 wasStructurallyTruncated = true
             }
-            let descendantTexts = next.parentTexts + ownTexts.filter { !next.parentTexts.contains($0) }
+            let descendantTexts = next.parentTexts + ownTexts
             for child in childResult.nodes.reversed() {
                 stack.append((child, next.depth + 1, descendantTexts))
             }
@@ -173,12 +173,6 @@ enum QuickChatFocusedTextCollector {
             visitedElementCount: visitedElementCount,
             textEntryCount: textEntryCount,
             wasTruncated: wasTruncated)
-    }
-
-    private static func normalized(_ value: String?) -> String? {
-        guard let value else { return nil }
-        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? nil : trimmed
     }
 
     private static func appendingTruncationMarker(to text: String, maximumCharacters: Int) -> String {
@@ -218,15 +212,15 @@ enum QuickChatFocusedTextCaptureService {
 
         let hasPermission = await PermissionManager.grantedStatus([.accessibility])[.accessibility] == true
         guard !Task.isCancelled else { return .cancelled }
-        guard hasPermission else {
+        if !hasPermission {
             guard self.confirmAccessibilityRequest(appName: appName) else { return .cancelled }
             guard !Task.isCancelled else { return .cancelled }
             let result = await PermissionManager.ensure([.accessibility], interactive: true)
             guard !Task.isCancelled else { return .cancelled }
             guard result[.accessibility] == true else {
-                return .failed(String(localized: "Accessibility access is required to attach text from \(appName)."))
+                return .failed(String(
+                    format: String(localized: "Accessibility access is required to attach text from %@."), appName))
             }
-            return await self.capture(application: application, appName: appName)
         }
         return await self.capture(application: application, appName: appName)
     }
@@ -249,7 +243,7 @@ enum QuickChatFocusedTextCaptureService {
               let focusedWindowValue,
               CFGetTypeID(focusedWindowValue) == AXUIElementGetTypeID()
         else {
-            return .failed(String(localized: "No focused window is available in \(appName)."))
+            return .failed(String(format: String(localized: "No focused window is available in %@."), appName))
         }
         let focusedWindow = unsafeDowncast(focusedWindowValue, to: AXUIElement.self)
         // A hung target app would otherwise block each AX message for the system default
@@ -296,10 +290,11 @@ enum QuickChatFocusedTextCaptureService {
             return .cancelled
         case .timedOut:
             walk.cancel()
-            return .failed(String(localized: "\(appName) is not responding to Accessibility requests."))
+            return .failed(String(
+                format: String(localized: "%@ is not responding to Accessibility requests."), appName))
         case let .snapshot(title, collection):
             guard collection.textEntryCount > 0 else {
-                return .failed(String(localized: "No readable text was found in \(appName)."))
+                return .failed(String(format: String(localized: "No readable text was found in %@."), appName))
             }
             return .captured(QuickChatTextContext(
                 appName: appName,
@@ -310,7 +305,7 @@ enum QuickChatFocusedTextCaptureService {
 
     private static func confirmAccessibilityRequest(appName: String) -> Bool {
         let alert = NSAlert()
-        alert.messageText = String(localized: "Allow OpenClaw to read text from \(appName)")
+        alert.messageText = String(format: String(localized: "Allow OpenClaw to read text from %@"), appName)
         alert.informativeText = String(localized: "Attaching focused-window text uses macOS Accessibility access.")
         alert.addButton(withTitle: String(localized: "Grant Access"))
         alert.addButton(withTitle: String(localized: "Cancel"))
