@@ -415,4 +415,94 @@ describe("googlechat monitor thread reply delivery", () => {
       });
     },
   );
+
+  it("reconciles direct delivery and durable metadata without a typing message", async () => {
+    const messageTarget = "spaces/CLASSIFY/messages/1";
+    const observeDurableOptions = vi.fn();
+    const runTurn = vi.fn(
+      async (params: {
+        adapter: {
+          resolveTurn: () => {
+            delivery: {
+              preparePayload: (payload: { text: string; replyToId?: string }) => {
+                text: string;
+                replyToId?: string;
+              };
+              durable: (
+                payload: { text: string; replyToId?: string },
+                info: { kind: string },
+              ) => unknown;
+              deliver: (payload: { text: string; replyToId?: string }) => Promise<void>;
+            };
+          };
+        };
+      }) => {
+        const turn = params.adapter.resolveTurn();
+        const payload = turn.delivery.preparePayload({
+          text: "threaded reply",
+          replyToId: messageTarget,
+        });
+        observeDurableOptions(turn.delivery.durable(payload, { kind: "final" }));
+        await turn.delivery.deliver(payload);
+      },
+    );
+
+    const { account, requestedThread } = await processGoogleChatThreadReplyTest({
+      runTurn,
+      typingIndicator: "none",
+    });
+
+    expect(observeDurableOptions).toHaveBeenCalledWith({
+      to: "spaces/CLASSIFY",
+      replyToId: requestedThread,
+      threadId: requestedThread,
+    });
+    expect(apiMocks.sendGoogleChatMessage).toHaveBeenCalledExactlyOnceWith({
+      account,
+      space: "spaces/CLASSIFY",
+      text: "threaded reply",
+      thread: requestedThread,
+    });
+  });
+
+  it("replaces the typing message when a reply retargets another same-space thread", async () => {
+    const retargetThread = "spaces/CLASSIFY/threads/Explicit";
+    const runTurn = vi.fn(
+      async (params: {
+        adapter: {
+          resolveTurn: () => {
+            delivery: {
+              preparePayload: (payload: { text: string; replyToId?: string }) => {
+                text: string;
+                replyToId?: string;
+              };
+              deliver: (payload: { text: string; replyToId?: string }) => Promise<void>;
+            };
+          };
+        };
+      }) => {
+        const turn = params.adapter.resolveTurn();
+        await turn.delivery.deliver(
+          turn.delivery.preparePayload({ text: "explicit reply", replyToId: retargetThread }),
+        );
+      },
+    );
+
+    const { account } = await processGoogleChatThreadReplyTest({
+      runTurn,
+      typingIndicator: "message",
+    });
+
+    expect(apiMocks.updateGoogleChatMessage).not.toHaveBeenCalled();
+    expect(apiMocks.deleteGoogleChatMessage).toHaveBeenCalledWith({
+      account,
+      messageName: "spaces/CLASSIFY/messages/typing",
+    });
+    expect(apiMocks.sendGoogleChatMessage).toHaveBeenLastCalledWith({
+      account,
+      space: "spaces/CLASSIFY",
+      text: "explicit reply",
+      thread: retargetThread,
+    });
+  });
 });
