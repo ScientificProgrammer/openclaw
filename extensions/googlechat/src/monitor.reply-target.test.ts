@@ -154,6 +154,63 @@ async function processEvent(params: {
 }
 
 describe("Google Chat automatic reply target reconciliation", () => {
+  it.each([undefined, "off"] as const)(
+    "keeps automatic replies top-level with reply mode %s",
+    async (replyToMode) => {
+      const account = createAccount({ replyToMode });
+      const payload = { text: "top-level reply", replyToId: "spaces/CLASSIFY/messages/1" };
+      const core = createCore({
+        run: async (delivery) => {
+          await delivery.deliver(payload);
+          expect(delivery.durable(payload, { kind: "final" })).toEqual({
+            to: "spaces/CLASSIFY",
+            replyToId: null,
+          });
+        },
+      });
+      apiMocks.sendGoogleChatMessage.mockResolvedValueOnce({
+        messageName: "spaces/CLASSIFY/messages/typing",
+        threadName: "spaces/CLASSIFY/threads/typing",
+      });
+
+      await processEvent({ account, core });
+
+      expect(apiMocks.updateGoogleChatMessage).toHaveBeenCalledWith({
+        account,
+        messageName: "spaces/CLASSIFY/messages/typing",
+        text: "top-level reply",
+      });
+      expect(apiMocks.deleteGoogleChatMessage).not.toHaveBeenCalled();
+      expect(apiMocks.sendGoogleChatMessage).toHaveBeenCalledOnce();
+    },
+  );
+
+  it.each([undefined, "off"] as const)(
+    "keeps automatic replies top-level without typing with reply mode %s",
+    async (replyToMode) => {
+      const account = createAccount({ replyToMode, typingIndicator: "none" });
+      const core = createCore({
+        run: async (delivery) => {
+          const payload = { text: "top-level reply", replyToId: "spaces/CLASSIFY/messages/1" };
+          expect(delivery.durable(payload, { kind: "final" })).toEqual({
+            to: "spaces/CLASSIFY",
+            replyToId: null,
+          });
+          await delivery.deliver(payload);
+        },
+      });
+
+      await processEvent({ account, core });
+
+      expect(apiMocks.sendGoogleChatMessage).toHaveBeenCalledWith({
+        account,
+        space: "spaces/CLASSIFY",
+        text: "top-level reply",
+        thread: undefined,
+      });
+    },
+  );
+
   it("keeps the typing thread when automatic delivery supplies the source message name", async () => {
     const sourceMessageName = "spaces/CLASSIFY/messages/1";
     const requestedThread = "spaces/CLASSIFY/threads/requested";

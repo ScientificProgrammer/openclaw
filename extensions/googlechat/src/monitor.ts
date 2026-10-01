@@ -297,7 +297,7 @@ async function processGoogleChatEvent(
     typingIndicator = "message";
   }
   let typingMessage: GoogleChatTypingMessage | undefined;
-  const typingMessageThreadName =
+  const effectiveReplyThreadName =
     account.config.replyToMode && account.config.replyToMode !== "off"
       ? replyThreadName
       : undefined;
@@ -313,12 +313,12 @@ async function processGoogleChatEvent(
         account,
         space: spaceId,
         text: `_${botName} is typing..._`,
-        thread: typingMessageThreadName,
+        thread: effectiveReplyThreadName,
       });
       if (result?.messageName) {
         typingMessage = createGoogleChatTypingMessage({
           messageName: result.messageName,
-          requestedThreadName: typingMessageThreadName,
+          requestedThreadName: effectiveReplyThreadName,
           deliveredThreadName: result.threadName,
         });
       }
@@ -353,7 +353,7 @@ async function processGoogleChatEvent(
               payload: normalizeGoogleChatReplyTarget({
                 payload,
                 sourceMessageName: message.name,
-                replyThreadName,
+                replyThreadName: effectiveReplyThreadName,
               }),
               infoKind: info.kind,
               spaceId,
@@ -364,7 +364,7 @@ async function processGoogleChatEvent(
               payload: normalizeGoogleChatReplyTarget({
                 payload,
                 sourceMessageName: message.name,
-                replyThreadName,
+                replyThreadName: effectiveReplyThreadName,
               }),
               account,
               spaceId,

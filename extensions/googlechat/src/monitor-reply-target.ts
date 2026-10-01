@@ -6,8 +6,8 @@ import type { ReplyPayload } from "openclaw/plugin-sdk/reply-runtime";
  * target. The automatic reply pipeline supplies the inbound *message* resource
  * (`spaces/x/messages/y`) instead, which delivery would read as an intentional
  * retarget and use to discard the typing placeholder. Reconcile that exact
- * source-message target back to the inbound thread before delivery, and leave
- * every other target untouched so explicit retargeting still works.
+ * source-message target to the effective reply-mode target before delivery,
+ * leaving other targets untouched so explicit retargeting still works.
  */
 export function normalizeGoogleChatReplyTarget(params: {
   payload: ReplyPayload;
