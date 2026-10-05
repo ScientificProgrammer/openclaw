@@ -497,7 +497,7 @@ describe("memory plugin e2e", () => {
 
     expect(registerMemoryCapabilityForPlugin).toHaveBeenCalledOnce();
     const capability = getMemoryCapabilityRegistration()?.capability;
-    expect(capability?.providerRuntime?.open).toBeTypeOf("function");
+    expect(capability?.providerRuntime).toMatchObject({ open: expect.any(Function) });
     // No file-shaped runtime, and Active Memory keeps its existing recall-tool defaults.
     expect(capability?.runtime).toBeUndefined();
     expect(capability?.recallToolNames).toBeUndefined();
