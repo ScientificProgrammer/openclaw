@@ -169,15 +169,16 @@ export function createLanceDbMemoryProviderRuntime(
                 currentCfg.embedding,
                 timeoutMs(),
               ),
-            // Authority may lapse while the query embeds; never read rows under a stale grant.
-            beforeSearch: assertCurrent,
+            // Authority may lapse while the query embeds or while the store prepares its
+            // table; never dispatch a read under a stale grant.
+            beforeSearch: assertReadAllowed,
             search: (vector, timeoutMs) =>
               deps.db.search(
                 agentId,
                 vector,
                 maxResults + PROVIDER_SEARCH_OVERFETCH_EXTRA,
                 minScore,
-                { timeoutMs },
+                { timeoutMs, beforeRead: assertReadAllowed },
               ),
           });
           let recall: Awaited<typeof recallOperation.result>;
@@ -229,6 +230,7 @@ export function createLanceDbMemoryProviderRuntime(
             columns: ["id", "text"],
             filter: { column: "id", operator: "=", value: id },
             limit: 1,
+            beforeRead: assertReadAllowed,
           });
           assertCurrent();
           const text = rows[0]?.text;

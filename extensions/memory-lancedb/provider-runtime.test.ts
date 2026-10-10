@@ -1,3 +1,4 @@
+import * as lancedb from "@lancedb/lancedb";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import type { MemoryPluginCapability } from "openclaw/plugin-sdk/memory-host-core";
 import { describe, expect, test, vi } from "vitest";
@@ -248,7 +249,8 @@ describe("memory-lancedb provider runtime", () => {
       await db.store("alpha", { text: "kept", vector: [1, 0], importance: 0.5, category: "fact" });
       const provider = await open("alpha", OPERATOR);
 
-      const error = `No API key found for provider "openai". Auth store: ${getDbPath()}/auth-profiles.json`;
+      // Shape of the host's missing-provider-auth error, which names both locations.
+      const error = `No API key found for provider "openai". Auth store: ${getDbPath()}/auth-profiles.json (agentDir: ${getDbPath()}).`;
       embed.mockRejectedValueOnce(new Error(error));
       await expect(provider.search({ query: "anything" })).rejects.toThrow(
         'memory search embedding failed: No API key found for provider "openai"',
@@ -258,7 +260,6 @@ describe("memory-lancedb provider runtime", () => {
       expect(degraded.message).toBe(
         "The last memory embedding request failed. Check the Gateway log. If credential resolution failed, run openclaw secrets reload, then retry memory search.",
       );
-      expect(JSON.stringify(degraded)).not.toContain(getDbPath());
       expect(degraded.details).toMatchObject({ memories: 1 });
       const deniedSession = await open("alpha", {
         kind: "session",
@@ -267,7 +268,12 @@ describe("memory-lancedb provider runtime", () => {
       });
       const deniedHealth = await deniedSession.health();
       expect(deniedHealth.status).toBe("degraded");
-      expect(JSON.stringify(deniedHealth)).not.toContain(getDbPath());
+      for (const health of [degraded, deniedHealth]) {
+        const serialized = JSON.stringify(health);
+        expect(serialized).not.toContain(getDbPath());
+        expect(serialized).not.toContain("Auth store");
+        expect(serialized).not.toContain("agentDir");
+      }
       expect(deniedHealth.details).not.toHaveProperty("memories");
       expect(warn).toHaveBeenCalledWith(expect.stringContaining(error));
 
@@ -324,6 +330,75 @@ describe("memory-lancedb provider runtime", () => {
       db.close();
     }
   });
+
+  // Revocation lands inside the store's own preparation await, after the provider's
+  // pre-read check has already passed, on the real LanceDB table.
+  test.each(["a retained table handle", "a first open"] as const)(
+    "does not dispatch a read when the owner audience is revoked while the store prepares %s",
+    async (preparation) => {
+      const seed = new MemoryDB(getDbPath(), 2);
+      const stored = await seed.store("alpha", {
+        text: "alpha private preference",
+        vector: [1, 0],
+        importance: 0.8,
+        category: "preference",
+      });
+      seed.close();
+      const connection = await lancedb.connect(getDbPath());
+      const probe = await connection.openTable("memories");
+      const tablePrototype = Object.getPrototypeOf(probe) as lancedb.Table;
+      probe.close();
+      connection.close();
+
+      const { db, open } = createHarness();
+      const firstOpen = preparation === "a first open";
+      let current = true;
+      const original = firstOpen ? tablePrototype.schema : tablePrototype.checkoutLatest;
+      const prepare = vi
+        .spyOn(tablePrototype, firstOpen ? "schema" : "checkoutLatest")
+        .mockImplementation(async function (this: lancedb.Table, ...args: never[]) {
+          current = false;
+          return await Reflect.apply(original, this, args);
+        } as never);
+      const vectorSearch = vi.spyOn(tablePrototype, "vectorSearch");
+      const query = vi.spyOn(tablePrototype, "query");
+      // Each read starts with live authority and the store in the state under test.
+      const arrange = async () => {
+        db.close();
+        if (!firstOpen) {
+          await db.query("alpha", { columns: ["id"] });
+        }
+        current = true;
+        prepare.mockClear();
+        query.mockClear();
+      };
+      try {
+        const provider = await open("alpha", ownerSession("alpha"), () => {
+          if (!current) {
+            throw new Error("authority is no longer active");
+          }
+        });
+
+        await arrange();
+        await expect(provider.search({ query: "preference" })).rejects.toThrow(
+          "authority is no longer active",
+        );
+        expect(prepare).toHaveBeenCalled();
+
+        await arrange();
+        await expect(
+          provider.get({ reference: { providerId: PROVIDER_ID, id: stored.id } }),
+        ).rejects.toThrow("authority is no longer active");
+        expect(prepare).toHaveBeenCalled();
+
+        expect(vectorSearch).not.toHaveBeenCalled();
+        expect(query).not.toHaveBeenCalled();
+      } finally {
+        vi.restoreAllMocks();
+        db.close();
+      }
+    },
+  );
 
   test("does not open a provider for an agent with memory disabled", async () => {
     const { db, runtime } = createHarness({ resolveEnabledAgentId: () => undefined });

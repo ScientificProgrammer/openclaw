@@ -32,6 +32,6 @@ Use the memory plugin docs for embedding provider setup, storage paths, indexing
 - Plugin id: `memory-lancedb`
 - Package: `@openclaw/memory-lancedb`
 - Enforced minimum OpenClaw host (`openclaw.install.minHostVersion`): `>=2026.5.31`
-- Enforced plugin API compatibility (`openclaw.compat.pluginApi`): `>=2026.9.8`
+- Enforced plugin API compatibility (`openclaw.compat.pluginApi`): `>=2026.9.9`
 
 The installer checks these ranges independently. Both must be satisfied.
