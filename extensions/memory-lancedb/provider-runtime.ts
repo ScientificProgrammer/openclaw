@@ -26,7 +26,8 @@ const PROVIDER_SEARCH_OVERFETCH_EXTRA = 10;
 const DEFAULT_PROVIDER_MIN_SCORE = 0.1;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-type EmbeddingFailure = { message: string; atMs: number };
+// Only the time is kept: provider error text can name host paths and health reaches every caller.
+type EmbeddingFailure = { atMs: number };
 
 /** Records the latest embedding outcome per agent so health never spends a provider call. */
 export function createEmbeddingHealthTracker<T extends Embeddings>(inner: T) {
@@ -39,7 +40,7 @@ export function createEmbeddingHealthTracker<T extends Embeddings>(inner: T) {
         failures.delete(agentId);
         return vector;
       } catch (error) {
-        failures.set(agentId, { message: formatErrorMessage(error), atMs: Date.now() });
+        failures.set(agentId, { atMs: Date.now() });
         throw error;
       }
     },
@@ -277,8 +278,7 @@ export function createLanceDbMemoryProviderRuntime(
           }
           const cooldown = deps.readRecallCooldown(agentId);
           const failure = deps.lastEmbeddingFailure(agentId);
-          const embeddingError = cooldown?.error ?? failure?.message;
-          if (embeddingError) {
+          if (cooldown || failure) {
             return {
               status: "degraded",
               message:

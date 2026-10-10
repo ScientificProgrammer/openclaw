@@ -354,25 +354,28 @@ describe("memory-lancedb provider runtime", () => {
       const firstOpen = preparation === "a first open";
       let current = true;
       const original = firstOpen ? tablePrototype.schema : tablePrototype.checkoutLatest;
-      const prepare = vi
-        .spyOn(tablePrototype, firstOpen ? "schema" : "checkoutLatest")
-        .mockImplementation(async function (this: lancedb.Table, ...args: never[]) {
-          current = false;
-          return await Reflect.apply(original, this, args);
-        } as never);
-      const vectorSearch = vi.spyOn(tablePrototype, "vectorSearch");
-      const query = vi.spyOn(tablePrototype, "query");
-      // Each read starts with live authority and the store in the state under test.
-      const arrange = async () => {
-        db.close();
-        if (!firstOpen) {
-          await db.query("alpha", { columns: ["id"] });
-        }
-        current = true;
-        prepare.mockClear();
-        query.mockClear();
-      };
       try {
+        const prepare = vi
+          .spyOn(tablePrototype, firstOpen ? "schema" : "checkoutLatest")
+          .mockImplementation(async function (this: lancedb.Table, ...args: never[]) {
+            current = false;
+            return await Reflect.apply(original, this, args);
+          } as never);
+        const vectorSearch = vi.spyOn(tablePrototype, "vectorSearch");
+        const query = vi.spyOn(tablePrototype, "query");
+        // The spies sit on the prototype the store's reads go through.
+        await db.query("alpha", { columns: ["id"] });
+        expect(query).toHaveBeenCalled();
+        // Each read starts with live authority and the store in the state under test.
+        const arrange = async () => {
+          db.close();
+          if (!firstOpen) {
+            await db.query("alpha", { columns: ["id"] });
+          }
+          current = true;
+          prepare.mockClear();
+          query.mockClear();
+        };
         const provider = await open("alpha", ownerSession("alpha"), () => {
           if (!current) {
             throw new Error("authority is no longer active");
