@@ -242,19 +242,34 @@ describe("memory-lancedb provider runtime", () => {
   });
 
   test("turns an embedding failure into a search error and degraded health", async () => {
-    const { db, embed, open } = createHarness();
+    const warn = vi.fn();
+    const { db, embed, open } = createHarness({ logger: { warn } });
     try {
       await db.store("alpha", { text: "kept", vector: [1, 0], importance: 0.5, category: "fact" });
       const provider = await open("alpha", OPERATOR);
 
-      embed.mockRejectedValueOnce(new Error('No API key found for provider "openai"'));
+      const error = `No API key found for provider "openai". Auth store: ${getDbPath()}/auth-profiles.json`;
+      embed.mockRejectedValueOnce(new Error(error));
       await expect(provider.search({ query: "anything" })).rejects.toThrow(
         'memory search embedding failed: No API key found for provider "openai"',
       );
       const degraded = await provider.health();
       expect(degraded.status).toBe("degraded");
-      expect(degraded.message).toContain('No API key found for provider "openai"');
+      expect(degraded.message).toBe(
+        "The last memory embedding request failed. Check the Gateway log. If credential resolution failed, run openclaw secrets reload, then retry memory search.",
+      );
+      expect(JSON.stringify(degraded)).not.toContain(getDbPath());
       expect(degraded.details).toMatchObject({ memories: 1 });
+      const deniedSession = await open("alpha", {
+        kind: "session",
+        sessionKey: "s",
+        sandboxed: false,
+      });
+      const deniedHealth = await deniedSession.health();
+      expect(deniedHealth.status).toBe("degraded");
+      expect(JSON.stringify(deniedHealth)).not.toContain(getDbPath());
+      expect(deniedHealth.details).not.toHaveProperty("memories");
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining(error));
 
       // The next successful embedding clears the recorded failure.
       await expect(provider.search({ query: "anything" })).resolves.toMatchObject({

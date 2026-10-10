@@ -188,6 +188,7 @@ export function createLanceDbMemoryProviderRuntime(
               throw error;
             }
             const message = formatErrorMessage(error.originalError);
+            deps.logger.warn?.(`memory-lancedb: memory search embedding failed: ${message}`);
             if (deps.isRecallTimeoutError(error.originalError)) {
               deps.recordRecallCooldown(agentId, message);
             }
@@ -278,7 +279,8 @@ export function createLanceDbMemoryProviderRuntime(
           if (embeddingError) {
             return {
               status: "degraded",
-              message: `The last memory embedding request failed: ${embeddingError}`,
+              message:
+                "The last memory embedding request failed. Check the Gateway log. If credential resolution failed, run openclaw secrets reload, then retry memory search.",
               details: failure ? { ...details, embeddingFailedAtMs: failure.atMs } : details,
             };
           }
