@@ -352,15 +352,9 @@ describe("memory-lancedb provider runtime", () => {
 
       const { db, open } = createHarness();
       const firstOpen = preparation === "a first open";
-      let current = true;
-      const original = firstOpen ? tablePrototype.schema : tablePrototype.checkoutLatest;
       try {
-        const prepare = vi
-          .spyOn(tablePrototype, firstOpen ? "schema" : "checkoutLatest")
-          .mockImplementation(async function (this: lancedb.Table, ...args: never[]) {
-            current = false;
-            return await Reflect.apply(original, this, args);
-          } as never);
+        // The audience counts as revoked from the moment the table's preparation call starts.
+        const prepare = vi.spyOn(tablePrototype, firstOpen ? "schema" : "checkoutLatest");
         const vectorSearch = vi.spyOn(tablePrototype, "vectorSearch");
         const query = vi.spyOn(tablePrototype, "query");
         // The spies sit on the prototype the store's reads go through.
@@ -372,12 +366,11 @@ describe("memory-lancedb provider runtime", () => {
           if (!firstOpen) {
             await db.query("alpha", { columns: ["id"] });
           }
-          current = true;
           prepare.mockClear();
           query.mockClear();
         };
         const provider = await open("alpha", ownerSession("alpha"), () => {
-          if (!current) {
+          if (prepare.mock.calls.length > 0) {
             throw new Error("authority is no longer active");
           }
         });
