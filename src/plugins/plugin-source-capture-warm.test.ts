@@ -1,6 +1,5 @@
 import fs from "node:fs";
 import path from "node:path";
-import * as fsSafeAdvanced from "@openclaw/fs-safe/advanced";
 import { afterEach, expect, it, vi } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
 import { withPluginInstallRoots } from "./install-root-context.js";
@@ -12,10 +11,6 @@ import {
   resolveWarmPluginSourceCapturesDirectory,
   WARM_PLUGIN_SOURCE_CAPTURE_MANIFEST,
 } from "./plugin-source-capture-warm.js";
-
-vi.mock("@openclaw/fs-safe/advanced", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("@openclaw/fs-safe/advanced")>()),
-}));
 
 const temp = useAutoCleanupTempDirTracker(afterEach);
 const artifacts: ReturnType<typeof capturePluginGenerationArtifact>[] = [];
@@ -100,21 +95,17 @@ function fixture(options: { generation?: boolean } = {}) {
   };
 }
 
-function countFileCopies() {
-  const createBatch = fsSafeAdvanced.createRootFileCopyBatchSync;
-  const copies = vi.fn();
-  vi.spyOn(fsSafeAdvanced, "createRootFileCopyBatchSync").mockImplementation(() => {
-    const batch = createBatch();
-    const copyFile = batch.copyFile.bind(batch);
-    return {
-      ...batch,
-      copyFile: (options) => {
-        copies(options);
-        return copyFile(options);
-      },
-    };
-  });
-  return copies;
+/** The published entry file's inode: adoption renames it in place, a fresh copy cannot reuse it. */
+function publishedEntryInode(warm: string): bigint {
+  const published = path.join(warm, fs.readdirSync(warm)[0]!);
+  const manifest = JSON.parse(
+    fs.readFileSync(path.join(published, WARM_PLUGIN_SOURCE_CAPTURE_MANIFEST), "utf8"),
+  );
+  const entry = (manifest.files as Array<[string, unknown]>).find(([rel]) =>
+    rel.endsWith(path.join("demo", "index.js")),
+  );
+  expect(entry).toBeDefined();
+  return fs.statSync(path.join(published, entry![0]), { bigint: true }).ino;
 }
 
 it("recognizes managed npm generation roots", () => {
@@ -150,12 +141,12 @@ it("publishes a released generation capture and adopts it without copying again"
   expect(manifest.files.length).toBeGreaterThan(0);
   expect(fs.existsSync(firstEntry)).toBe(false);
 
-  const copies = countFileCopies();
+  const publishedInode = publishedEntryInode(demo.warm);
   const second = demo.capture();
   expect(second.sourceDigest).toBe(firstDigest);
   expect(fs.readFileSync(second.resolve(demo.entry), "utf8")).toContain("export const value");
   expect(fs.readdirSync(demo.warm)).toHaveLength(0);
-  expect(copies).not.toHaveBeenCalled();
+  expect(fs.statSync(second.resolve(demo.entry), { bigint: true }).ino).toBe(publishedInode);
   demo.dispose(second);
   expect(fs.readdirSync(demo.warm)).toHaveLength(1);
 });
@@ -184,9 +175,12 @@ it("does not adopt a capture whose generation directory was replaced", () => {
   fs.cpSync(demo.generation, replacement, { recursive: true });
   fs.rmSync(demo.generation, { recursive: true, force: true });
   fs.renameSync(replacement, demo.generation);
-  const copies = countFileCopies();
-  demo.dispose(demo.capture());
-  expect(copies).toHaveBeenCalled();
+  const publishedInode = publishedEntryInode(demo.warm);
+  const fresh = demo.capture();
+  expect(fs.statSync(fresh.resolve(demo.entry), { bigint: true }).ino).not.toBe(publishedInode);
+  expect(fs.readdirSync(demo.warm)).toHaveLength(0);
+  demo.dispose(fresh);
+  expect(fs.readdirSync(demo.warm)).toHaveLength(1);
 });
 
 it("keeps ordinary captures and disabled hosts on the removal path", () => {
