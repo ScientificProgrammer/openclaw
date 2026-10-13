@@ -14,6 +14,7 @@ import {
   retainPluginSourceCaptureInstance,
 } from "./plugin-source-capture-directory.js";
 import { PLUGIN_SOURCE_CAPTURE_PREFIX } from "./plugin-source-capture-path.js";
+import { publishWarmPluginSourceCapture } from "./plugin-source-capture-warm.js";
 import { isPluginSourceEntry } from "./plugin-source-file.js";
 
 export type PluginDependencyResolution = { root: string; lookupDirectory: string };
@@ -707,14 +708,20 @@ export function createPluginSourceCapture() {
     },
     dispose() {
       beginDisposal();
-      if (!retainLoadedPluginSourceCapture(directory)) {
+      if (
+        !retainLoadedPluginSourceCapture(directory) &&
+        !publishWarmPluginSourceCapture(directory)
+      ) {
         fs.rmSync(directory, { recursive: true, force: true });
       }
       instance?.release();
     },
     async disposeAsync() {
       beginDisposal();
-      if (!retainLoadedPluginSourceCapture(directory)) {
+      if (
+        !retainLoadedPluginSourceCapture(directory) &&
+        !publishWarmPluginSourceCapture(directory)
+      ) {
         await fsPromises.rm(directory, { recursive: true, force: true });
       }
       await instance?.releaseAsync();

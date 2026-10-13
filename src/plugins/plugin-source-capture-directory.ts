@@ -32,6 +32,11 @@ import {
   resolvePluginSourceCaptureFallbackPrefix,
   resolvePluginSourceCapturesDirectory,
 } from "./plugin-source-capture-path.js";
+import {
+  publishWarmPluginSourceCapturesUnder,
+  reclaimWarmPluginSourceCaptures,
+  WARM_PLUGIN_SOURCE_CAPTURE_DIR_NAME,
+} from "./plugin-source-capture-warm.js";
 
 const CAPTURE_GRACE_MS = 60 * 60 * 1_000;
 
@@ -131,6 +136,7 @@ function removeInstanceSync(root: string, pendingNative: Iterable<string> = []):
   if (retainLoadedPluginSourceCapture(root)) {
     return;
   }
+  publishWarmPluginSourceCapturesUnder(root);
   // A sharing violation must leave the custody token beside any retained payload.
   fs.rmSync(path.join(root, "captures"), { recursive: true, force: true });
   for (const directory of pendingNative) {
@@ -173,7 +179,8 @@ async function reclaimInstances(
     if (
       !entry.isDirectory() ||
       (legacy && !isLegacyPluginSourceCaptureName(entry.name)) ||
-      (fallbackPrefix && !entry.name.startsWith(fallbackPrefix))
+      (fallbackPrefix && !entry.name.startsWith(fallbackPrefix)) ||
+      (!legacy && !fallbackPrefix && entry.name === WARM_PLUGIN_SOURCE_CAPTURE_DIR_NAME)
     ) {
       continue;
     }
@@ -245,7 +252,11 @@ export async function hasPluginNativeCaptureCleanupCandidates(stateDir: string):
       continue;
     }
     for (const entry of entries) {
-      if (!entry.isDirectory() || (prefix && !entry.name.startsWith(prefix))) {
+      if (
+        !entry.isDirectory() ||
+        (prefix && !entry.name.startsWith(prefix)) ||
+        (!prefix && entry.name === WARM_PLUGIN_SOURCE_CAPTURE_DIR_NAME)
+      ) {
         continue;
       }
       try {
@@ -303,6 +314,8 @@ function sweepPluginSourceCaptureDirectories(stateDir: string): Promise<void> {
       }
     };
     sweep = reclaimInstances(root, recordFailure)
+      .catch(recordFailure)
+      .then(() => reclaimWarmPluginSourceCaptures(root, recordFailure))
       .catch(recordFailure)
       .then(() =>
         reclaimInstances(
@@ -555,6 +568,7 @@ export function retainPluginSourceCaptureInstance(
       }
       if (root) {
         try {
+          publishWarmPluginSourceCapturesUnder(root);
           await fsPromises.rm(path.join(root, "captures"), { recursive: true, force: true });
           for (const directory of retained.pendingNative) {
             await fsPromises.rm(directory, { recursive: true, force: true });

@@ -38,6 +38,14 @@ import {
   isPluginPackageFile as inPackage,
   findPluginCapturedPackage,
 } from "./plugin-package-metadata-capture.js";
+import {
+  adoptWarmPluginSourceCapture,
+  createWarmPluginRecoverySource,
+  createWarmPluginSourceCaptureManifest,
+  registerWarmPluginSourceCapturePublisher,
+  resolveWarmEligibleGenerationRoot,
+  resolveWarmPluginSourceCaptureKey,
+} from "./plugin-source-capture-warm.js";
 import { isPluginSourceEntry } from "./plugin-source-file.js";
 import {
   capturedPluginModuleUrl,
@@ -96,6 +104,34 @@ function createPluginGenerationArtifact(
   }
   const sourceCapture = retained?.source.sourceCapture ?? createPluginSourceCapture();
   const directory = sourceCapture.directory;
+  // Immutable managed npm generations may adopt the capture a previous process
+  // published at shutdown instead of copying the same tree again.
+  const warmGenerationRoot =
+    !retained && execute && !nativeRecovery && !dependencyLookupBoundary && !captureForCustody
+      ? resolveWarmEligibleGenerationRoot(rootDir)
+      : undefined;
+  const warmKey = resolveWarmPluginSourceCaptureKey(rootDir, entryFiles);
+  const warmManifest =
+    warmGenerationRoot && sourceCapture.outputRoot
+      ? adoptWarmPluginSourceCapture({
+          managedRoot: sourceCapture.outputRoot,
+          key: warmKey,
+          generationRoot: warmGenerationRoot,
+          directory,
+        })
+      : undefined;
+  const retainedCustody =
+    retained ??
+    (warmManifest
+      ? {
+          source: createWarmPluginRecoverySource({
+            sourceCapture,
+            directory,
+            manifest: warmManifest,
+          }),
+          files: new Map(warmManifest.files),
+        }
+      : undefined);
   const packages = new Map<string, PluginPackageCapture>();
   const packageForFile = (filename: string) =>
     findPluginCapturedPackage(packages, filename, directory)?.owner;
@@ -116,7 +152,10 @@ function createPluginGenerationArtifact(
     resolveSource: nativeAdmission.resolvePreparedSource,
   });
   const sourceAliases: Record<string, string> = {};
-  const sourceFacts = createPluginSourceFacts(dependencyLookupBoundary, captureForCustody);
+  const sourceFacts = createPluginSourceFacts(
+    dependencyLookupBoundary,
+    captureForCustody || warmGenerationRoot !== undefined,
+  );
   const receipt = createPluginGenerationReceipt(nativeAdmission.prepared);
   const { additions, capture: acquireSources, assertModuleAvailable } = sourceCapture;
   const captureAdmitted = <T>(run: () => T) => {
@@ -216,7 +255,7 @@ function createPluginGenerationArtifact(
       deferExternalLinks: Boolean(execute),
       nativeAdmission,
       receipt,
-      retained,
+      retained: retainedCustody,
       sourceFacts: sourceFacts.files,
       onPackageMetadata(source, target) {
         metadataCapture.record(target, (manifest) => {
@@ -650,7 +689,27 @@ function createPluginGenerationArtifact(
     nativeAdmission.finish(initialReceipt);
     additions.clear();
     const captures = [moduleCaptures, hardlinkedSources, metadataCapture, packages, resolution];
-    const clearCaptures = () => captures.forEach((capture) => capture.clear());
+    let unregisterWarmPublisher: (() => void) | undefined;
+    if (warmGenerationRoot && sourceCapture.outputRoot && sourceFacts.files) {
+      const files = sourceFacts.files;
+      unregisterWarmPublisher = registerWarmPluginSourceCapturePublisher(directory, {
+        managedRoot: sourceCapture.outputRoot,
+        manifest: () =>
+          createWarmPluginSourceCaptureManifest({
+            key: warmKey,
+            generationRoot: warmGenerationRoot,
+            receipt: initialReceipt,
+            directory,
+            capturedRoot: root,
+            capturedPaths,
+            files,
+          }),
+      });
+    }
+    const clearCaptures = () => {
+      unregisterWarmPublisher?.();
+      captures.forEach((capture) => capture.clear());
+    };
     const sourceLookup = createPluginGenerationSourceLookup({
       rootDir,
       sourceRoot,
