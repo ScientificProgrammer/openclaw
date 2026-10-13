@@ -39,13 +39,31 @@ function fixture(options: { generation?: boolean } = {}) {
   const root = fs.realpathSync(temp.make("plugin-warm-capture-"));
   const npmDir = path.join(root, "npm");
   const projects = path.join(npmDir, "projects");
-  const generation = path.join(projects, options.generation === false ? "plain" : GENERATION_DIR_NAME);
+  const generation = path.join(
+    projects,
+    options.generation === false ? "plain" : GENERATION_DIR_NAME,
+  );
   const pluginRoot = path.join(generation, "node_modules", "demo");
   const entry = path.join(pluginRoot, "index.js");
-  writeFile(path.join(pluginRoot, "package.json"), JSON.stringify({ name: "demo", version: "1.0.0", type: "module", main: "index.js", dependencies: { dep: "1.0.0" } }));
+  writeFile(
+    path.join(pluginRoot, "package.json"),
+    JSON.stringify({
+      name: "demo",
+      version: "1.0.0",
+      type: "module",
+      main: "index.js",
+      dependencies: { dep: "1.0.0" },
+    }),
+  );
   writeFile(entry, 'import { dep } from "dep";\nexport const value = dep;\n');
-  writeFile(path.join(generation, "node_modules", "dep", "package.json"), JSON.stringify({ name: "dep", version: "1.0.0", type: "module", main: "index.js" }));
-  writeFile(path.join(generation, "node_modules", "dep", "index.js"), 'export const dep = "dep";\n');
+  writeFile(
+    path.join(generation, "node_modules", "dep", "package.json"),
+    JSON.stringify({ name: "dep", version: "1.0.0", type: "module", main: "index.js" }),
+  );
+  writeFile(
+    path.join(generation, "node_modules", "dep", "index.js"),
+    'export const dep = "dep";\n',
+  );
   const captures = path.join(root, "captures");
   fs.mkdirSync(captures);
   const roots = Object.freeze({
