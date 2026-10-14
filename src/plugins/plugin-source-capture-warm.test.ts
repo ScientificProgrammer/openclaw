@@ -134,7 +134,6 @@ it("publishes a released generation capture and adopts it without copying again"
   // Native admission links captured files to the capturing process's namespace.
   const staleLink = path.join(path.dirname(firstEntry), "native-link");
   fs.symlinkSync(demo.entry, staleLink);
-  const firstDirectory = first.directory;
   demo.dispose(first);
 
   const published = fs.readdirSync(demo.warm);
@@ -143,7 +142,10 @@ it("publishes a released generation capture and adopts it without copying again"
   const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
   expect(manifest.receipt.sourceDigest).toBe(firstDigest);
   expect(manifest.files.length).toBeGreaterThan(0);
-  expect(manifest.symlinks).toEqual([path.relative(firstDirectory, staleLink)]);
+  expect(manifest.symlinks).toHaveLength(1);
+  const publishedLink = path.join(path.dirname(manifestPath), manifest.symlinks[0]);
+  expect(path.basename(publishedLink)).toBe("native-link");
+  expect(fs.lstatSync(publishedLink).isSymbolicLink()).toBe(true);
   expect(fs.existsSync(firstEntry)).toBe(false);
 
   const publishedInode = publishedEntryInode(demo.warm);
