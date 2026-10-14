@@ -131,6 +131,10 @@ it("publishes a released generation capture and adopts it without copying again"
   const firstDigest = first.sourceDigest;
   const firstEntry = first.resolve(demo.entry);
   expect(fs.readFileSync(firstEntry, "utf8")).toContain("export const value");
+  // Native admission links captured files to the capturing process's namespace.
+  const staleLink = path.join(path.dirname(firstEntry), "native-link");
+  fs.symlinkSync(demo.entry, staleLink);
+  const firstDirectory = first.directory;
   demo.dispose(first);
 
   const published = fs.readdirSync(demo.warm);
@@ -139,6 +143,7 @@ it("publishes a released generation capture and adopts it without copying again"
   const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
   expect(manifest.receipt.sourceDigest).toBe(firstDigest);
   expect(manifest.files.length).toBeGreaterThan(0);
+  expect(manifest.symlinks).toEqual([path.relative(firstDirectory, staleLink)]);
   expect(fs.existsSync(firstEntry)).toBe(false);
 
   const publishedInode = publishedEntryInode(demo.warm);
@@ -147,6 +152,9 @@ it("publishes a released generation capture and adopts it without copying again"
   expect(fs.readFileSync(second.resolve(demo.entry), "utf8")).toContain("export const value");
   expect(fs.readdirSync(demo.warm)).toHaveLength(0);
   expect(fs.statSync(second.resolve(demo.entry), { bigint: true }).ino).toBe(publishedInode);
+  expect(fs.existsSync(path.join(path.dirname(second.resolve(demo.entry)), "native-link"))).toBe(
+    false,
+  );
   demo.dispose(second);
   expect(fs.readdirSync(demo.warm)).toHaveLength(1);
 });

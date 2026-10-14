@@ -48,6 +48,13 @@ export type WarmPluginSourceCaptureManifest = {
   sources: Array<[string, string]>;
   /** Captured path relative to the capture directory -> recorded content fact. */
   files: Array<[string, PluginCapturedSourceFact]>;
+  /**
+   * Symbolic links inside the capture, relative to the capture directory. Native
+   * admission links captured native files to the publishing process's own
+   * admission namespace; adoption removes them so the adopting process admits
+   * its own.
+   */
+  symlinks: string[];
   publishedAt: string;
 };
 
@@ -217,7 +224,8 @@ function readManifestSync(directory: string): WarmPluginSourceCaptureManifest | 
     !manifest.generationRoot ||
     !manifest.receipt ||
     !Array.isArray(manifest.sources) ||
-    !Array.isArray(manifest.files)
+    !Array.isArray(manifest.files) ||
+    !Array.isArray(manifest.symlinks)
   ) {
     return undefined;
   }
@@ -280,6 +288,19 @@ export function adoptWarmPluginSourceCapture(params: {
       process.emitWarning(`Warm plugin source capture adoption skipped: ${String(error)}`);
     }
     return undefined;
+  }
+  for (const relative of manifest.symlinks) {
+    const link = path.join(params.directory, relative);
+    if (!isPathInside(params.directory, link)) {
+      continue;
+    }
+    try {
+      fs.unlinkSync(link);
+    } catch (error) {
+      if (!hasErrnoCode(error, "ENOENT")) {
+        process.emitWarning(`Warm plugin source capture link removal failed: ${String(error)}`);
+      }
+    }
   }
   try {
     fs.rmSync(path.join(params.directory, WARM_PLUGIN_SOURCE_CAPTURE_MANIFEST), { force: true });
@@ -359,8 +380,19 @@ export function createWarmPluginSourceCaptureManifest(params: {
     capturedRoot: path.relative(params.directory, params.capturedRoot),
     sources,
     files: [...params.files],
+    symlinks: listSymbolicLinksSync(params.directory),
     publishedAt: new Date().toISOString(),
   };
+}
+
+function listSymbolicLinksSync(directory: string): string[] {
+  const links: string[] = [];
+  for (const entry of fs.readdirSync(directory, { recursive: true, withFileTypes: true })) {
+    if (entry.isSymbolicLink()) {
+      links.push(path.relative(directory, path.join(entry.parentPath, entry.name)));
+    }
+  }
+  return links;
 }
 
 /** Removes warm entries whose generation root is gone or whose age exceeds the limit. */
