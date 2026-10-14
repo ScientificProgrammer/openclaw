@@ -2,8 +2,10 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import fsPromises from "node:fs/promises";
 import path from "node:path";
+import { isMainThread } from "node:worker_threads";
 import { isTruthyEnvValue } from "../infra/env.js";
 import { hasErrnoCode } from "../infra/errno.js";
+import { createSubsystemLogger } from "../logging/subsystem.js";
 import { resolvePluginNpmProjectsDir } from "./install-paths.js";
 import { isPathInside } from "./path-safety.js";
 import type { PluginRecoverySource } from "./plugin-generation-source-lookup.js";
@@ -55,6 +57,7 @@ type WarmPublisher = {
 };
 
 const publishers = new Map<string, WarmPublisher>();
+const log = createSubsystemLogger("plugins/warm-captures");
 
 export function isWarmPluginSourceCaptureDisabled(env: NodeJS.ProcessEnv = process.env): boolean {
   return isTruthyEnvValue(env[WARM_PLUGIN_SOURCE_CAPTURE_DISABLE_ENV]);
@@ -143,6 +146,7 @@ function writeManifestSync(directory: string, manifest: WarmPluginSourceCaptureM
 export function publishWarmPluginSourceCapture(directory: string): boolean {
   const publisher = publishers.get(directory);
   if (!publisher) {
+    log.debug(`warm plugin source capture publication skipped: no publisher for ${directory}`);
     return false;
   }
   publishers.delete(directory);
@@ -152,10 +156,12 @@ export function publishWarmPluginSourceCapture(directory: string): boolean {
   let manifest: WarmPluginSourceCaptureManifest | undefined;
   try {
     manifest = publisher.manifest();
-  } catch {
+  } catch (error) {
+    log.debug(`warm plugin source capture publication skipped: manifest failed: ${String(error)}`);
     return false;
   }
   if (!manifest || manifest.files.length === 0) {
+    log.debug(`warm plugin source capture publication skipped: no recorded files for ${directory}`);
     return false;
   }
   const warmRoot = resolveWarmPluginSourceCapturesDirectory(publisher.managedRoot);
@@ -165,6 +171,9 @@ export function publishWarmPluginSourceCapture(directory: string): boolean {
     writeManifestSync(directory, manifest);
     fs.rmSync(target, { recursive: true, force: true });
     fs.renameSync(directory, target);
+    log.info(
+      `warm plugin source capture published: ${manifest.files.length} files for ${manifest.key}`,
+    );
     return true;
   } catch (error) {
     // Publication is best effort: a failed move leaves the capture where the
@@ -236,6 +245,7 @@ export function adoptWarmPluginSourceCapture(params: {
   );
   const manifest = readManifestSync(candidate);
   if (!manifest || manifest.key !== params.key) {
+    log.debug(`warm plugin source capture not found for ${params.key}`);
     return undefined;
   }
   let current: ReturnType<typeof describeGenerationRoot>;
@@ -249,6 +259,7 @@ export function adoptWarmPluginSourceCapture(params: {
     current.dev !== manifest.generationRoot.dev ||
     current.ino !== manifest.generationRoot.ino
   ) {
+    log.debug(`warm plugin source capture discarded: generation changed for ${params.key}`);
     discardWarmEntrySync(candidate);
     return undefined;
   }
@@ -275,6 +286,9 @@ export function adoptWarmPluginSourceCapture(params: {
   } catch {
     // The manifest is advisory once adopted; the receipt verifies file content.
   }
+  log.info(
+    `warm plugin source capture adopted: ${manifest.files.length} files for ${manifest.key} (mainThread=${isMainThread})`,
+  );
   return manifest;
 }
 
