@@ -49,10 +49,10 @@ export type WarmPluginSourceCaptureManifest = {
   /** Captured path relative to the capture directory -> recorded content fact. */
   files: Array<[string, PluginCapturedSourceFact]>;
   /**
-   * Symbolic links inside the capture, relative to the capture directory. Native
-   * admission links captured native files to the publishing process's own
-   * admission namespace; adoption removes them so the adopting process admits
-   * its own.
+   * Symbolic links inside the capture, relative to the capture directory.
+   * Adoption removes them: native admission links point into the publishing
+   * process's own admission namespace, and dependency links are recreated when
+   * the adopting process prepares the dependency again.
    */
   symlinks: string[];
   publishedAt: string;

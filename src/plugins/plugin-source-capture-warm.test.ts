@@ -142,10 +142,12 @@ it("publishes a released generation capture and adopts it without copying again"
   const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
   expect(manifest.receipt.sourceDigest).toBe(firstDigest);
   expect(manifest.files.length).toBeGreaterThan(0);
-  expect(manifest.symlinks).toHaveLength(1);
-  const publishedLink = path.join(path.dirname(manifestPath), manifest.symlinks[0]);
-  expect(path.basename(publishedLink)).toBe("native-link");
-  expect(fs.lstatSync(publishedLink).isSymbolicLink()).toBe(true);
+  // The native-style link and the prepared dependency link are both recorded.
+  const linkNames = (manifest.symlinks as string[]).map((rel) => path.basename(rel)).toSorted();
+  expect(linkNames).toEqual(["dep", "native-link"]);
+  for (const rel of manifest.symlinks as string[]) {
+    expect(fs.lstatSync(path.join(path.dirname(manifestPath), rel)).isSymbolicLink()).toBe(true);
+  }
   expect(fs.existsSync(firstEntry)).toBe(false);
 
   const publishedInode = publishedEntryInode(demo.warm);
@@ -154,9 +156,10 @@ it("publishes a released generation capture and adopts it without copying again"
   expect(fs.readFileSync(second.resolve(demo.entry), "utf8")).toContain("export const value");
   expect(fs.readdirSync(demo.warm)).toHaveLength(0);
   expect(fs.statSync(second.resolve(demo.entry), { bigint: true }).ino).toBe(publishedInode);
-  expect(fs.existsSync(path.join(path.dirname(second.resolve(demo.entry)), "native-link"))).toBe(
-    false,
-  );
+  const secondRoot = path.dirname(second.resolve(demo.entry));
+  expect(fs.existsSync(path.join(secondRoot, "native-link"))).toBe(false);
+  // Preparing the dependency again recreated its link inside the adopted capture.
+  expect(fs.lstatSync(path.join(path.dirname(secondRoot), "dep")).isSymbolicLink()).toBe(true);
   demo.dispose(second);
   expect(fs.readdirSync(demo.warm)).toHaveLength(1);
 });
